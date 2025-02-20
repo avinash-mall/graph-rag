@@ -1,4 +1,4 @@
-# GraphRag: Document Processing & Graph Analysis
+# GraphRag: Document Processing & Graph Analysis With API
 
 GraphRag is a Python-based application that processes documents, extracts entities and relationships using an OpenAI chat completion API, generates embeddings, and builds a graph in a Neo4j database. It then uses centrality measures computed via Neo4j Graph Data Science (GDS) to answer queries about the graph.
 
@@ -58,7 +58,7 @@ GraphRag is a Python-based application that processes documents, extracts entiti
       neo4j:latest
   ```
 
-4. **(Optionally) Run Embedding and Chat Completion LLMs** 
+4. **(Optionally) Run Embedding and Chat Completion LLMs using LLamafile** 
   ```bash 
     ./Llama-3.2-3B-Instruct.Q6_K.llamafile --server -c 0 --mlock --host 0.0.0.0 --port 8080 --nobrowser
     ./mxbai-embed-large-v1-f16.llamafile --server --nobrowser --embedding --host 0.0.0.0 --port 8081
