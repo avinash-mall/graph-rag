@@ -56,7 +56,7 @@ GraphRag is a Python-based application that processes documents, extracts entiti
       --env NEO4J_AUTH=none 
       --env NEO4J_PLUGINS='["graph-data-science"]' 
       neo4j:latest
-  ```
+   ```
 
 4. **(Optionally) Run Embedding and Chat Completion LLMs using LLamafile** 
   ```bash 
@@ -139,8 +139,8 @@ Start the FastAPI server. For example, if you're using Uvicorn:
 - **Timeouts:**  
   If chat completion API calls time out, consider increasing the timeout value in the \`call_chat_completion\` method of the \`OpenAIClient\` class.
 
-- **Neo4j Connection Issues:**  
-  If you encounter errors like "Unable to retrieve routing information," verify that your \`DB_URL\` is correctly configured. For single-node setups, a \`bolt://\` URL is recommended.
+- **LLM Issues:**  
+  If you encounter LLM unable to process your request, use a larger model as the instruction might be too complex for smaller models.
 
 ## Contributing
 
