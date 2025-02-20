@@ -1,0 +1,8 @@
+fastapi
+fastapi_offline
+neo4j
+requests
+python-dotenv
+python-docx
+PyPDF2
+uvicorn
