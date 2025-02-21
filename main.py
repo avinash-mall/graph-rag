@@ -13,6 +13,7 @@ import requests
 import docx
 import PyPDF2
 from functools import lru_cache
+import string
 
 # Load environment variables
 load_dotenv()
@@ -91,7 +92,7 @@ class OpenAIClient:
                 request_url,
                 headers={"Authorization": f"Bearer {self.api_key}"},
                 json=request_payload,
-                timeout=300  # Timeout in seconds
+                timeout=1200  # Timeout in seconds
             )
             response.raise_for_status()
             self.logger.debug(f"Chat completion response: {response.text}")
@@ -143,6 +144,18 @@ class DocumentProcessor:
 
     def __init__(self, client: OpenAIClient):
         self.client = client
+        
+    def clean_text(self, text: str) -> str:
+        """
+        Clean up the input text by trimming whitespace and normalizing spaces.
+        """
+        # Strip leading/trailing whitespace
+        cleaned = text.strip()
+        # Replace multiple whitespace characters (including newlines) with a single space
+        cleaned = re.sub(r'\s+', ' ', cleaned)
+        # Remove non-printable characters
+        cleaned = ''.join(filter(lambda x: x in string.printable, cleaned))
+        return cleaned
 
     def split_documents(self, documents: List[str], chunk_size: int = 600, overlap_size: int = 100) -> List[str]:
         self.logger.info("Starting document splitting into chunks...")
@@ -261,6 +274,24 @@ class GraphManager:
         if clear_on_startup:
             self.logger.info("Clearing the graph database on startup...")
             self.db_connection.clear_database()
+            
+    def vector_search(self, query_embedding: List[float], limit: int = 5) -> List[Dict[str, Any]]:
+        """
+        Perform a vector search on Chunk nodes by computing cosine similarity
+        between each chunk's embedding and the provided query embedding.
+        """
+        self.logger.info("Starting vector search using cosine similarity...")
+        with self.db_connection.get_session() as session:
+            query = """
+            MATCH (c:Chunk)
+            WITH c, gds.similarity.cosine(c.embedding, $query_embedding) AS similarity
+            RETURN c.text AS text, similarity
+            ORDER BY similarity DESC
+            LIMIT $limit
+            """
+            result = session.run(query, query_embedding=query_embedding, limit=limit).data()
+        self.logger.info("Vector search completed.")
+        return result
 
     def build_graph(self, chunks: List[str], embeddings: List[List[float]], summaries: List[str]) -> None:
         self.logger.info("Starting graph construction...")
@@ -379,11 +410,29 @@ class QueryHandler:
     def ask_question(self, query: str) -> str:
         self.logger.info("Starting query processing...")
         try:
+            # 1. Calculate centrality measures using GDS.
             centrality_data = self.graph_manager.calculate_centrality_measures()
             centrality_summary = self.summarize_centrality_measures(centrality_data)
+
+            # 2. Get the embedding for the question and perform vector search.
+            question_embedding = self.client.get_embeddings(query)
+            vector_results = self.graph_manager.vector_search(question_embedding, limit=5)
+            vector_context = "\n".join([
+                f"Chunk: {record['text']}\nSimilarity: {record['similarity']}"
+                for record in vector_results
+            ])
+
+            # 3. Combine the information into a prompt.
+            prompt = (
+                f"Query: {query}\n\n"
+                f"Centrality Summary:\n{centrality_summary}\n\n"
+                f"Relevant Chunks from vector search:\n{vector_context}"
+            )
+
+            # 4. Call the chat completion API with both sets of context.
             response = self.client.call_chat_completion([
-                {"role": "system", "content": "Use the centrality measures to answer the following query."},
-                {"role": "user", "content": f"Query: {query} Centrality Summary: {centrality_summary}"}
+                {"role": "system", "content": "Use the provided centrality measures and vector search results to answer the query."},
+                {"role": "user", "content": prompt}
             ])
             self.logger.info("Finished query processing.")
             return response
@@ -433,17 +482,24 @@ async def upload_documents(files: List[UploadFile]) -> JSONResponse:
                 global_logger.info("Reading PDF file")
                 reader = PyPDF2.PdfReader(file.file)
                 text = " ".join([page.extract_text() for page in reader.pages])
+                # Clean the extracted text
+                text = document_processor.clean_text(text)
                 document_texts.append(text)
                 global_logger.info("Finished reading PDF file")
             elif file.filename.endswith(".docx"):
                 global_logger.info("Reading DOCX file")
                 doc = docx.Document(file.file)
                 text = "\n".join([para.text for para in doc.paragraphs])
+                # Clean the extracted text
+                text = document_processor.clean_text(text)
                 document_texts.append(text)
                 global_logger.info("Finished reading DOCX file")
             elif file.filename.endswith(".txt"):
                 global_logger.info("Reading TXT file")
-                document_texts.append(file.file.read().decode("utf-8"))
+                text = file.file.read().decode("utf-8")
+                # Clean the extracted text
+                text = document_processor.clean_text(text)
+                document_texts.append(text)
                 global_logger.info("Finished reading TXT file")
             else:
                 raise HTTPException(status_code=400, detail=f"Unsupported file format: {file.filename}")
