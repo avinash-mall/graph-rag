@@ -431,9 +431,7 @@ class QueryHandler:
         prompt = (
             f"Given the relationship query:\n{query}\n\n"
             f"and the following document snippets:\n{candidates_text}\n\n"
-            "Please re-rank these snippets by their relevance to answering the relationship between the entities mentioned in the query. "
-            "Exclude any snippet that is not directly relevant. Return only the ordered list of numbers separated by commas "
-            "(for example, '2,1,3,4,5'), where the first number corresponds to the most relevant snippet."
+            "Please order these snippets (returning just a comma-separated list of numbers) based solely on their relevance to the query"
         )
 
         self.logger.info("Requesting re-ranking from LLM...")
