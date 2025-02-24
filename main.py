@@ -7,7 +7,7 @@ from fastapi_offline import FastAPIOffline
 from fastapi import UploadFile, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple
 from dotenv import load_dotenv
 import requests
 import docx
@@ -81,7 +81,6 @@ class OpenAIClient:
             "temperature": self.temperature,
             "stop": self.stop
         }
-        # Use the base URL directly
         request_url = f"{self.base_url}"
         self.logger.info("Calling OpenAI chat completion API...")
         self.logger.debug(f"Request URL: {request_url}")
@@ -92,18 +91,14 @@ class OpenAIClient:
                 request_url,
                 headers={"Authorization": f"Bearer {self.api_key}"},
                 json=request_payload,
-                timeout=1200  # Timeout in seconds
+                timeout=600  # Timeout in seconds
             )
             response.raise_for_status()
             self.logger.debug(f"Chat completion response: {response.text}")
-    
             output = response.json()["choices"][0]["message"]["content"]
             # Remove any lingering stop sequences
             output = output.replace("<|eot_id|>", "")
-            
-            # Sleep for the duration specified in .env
             time.sleep(SLEEP_DURATION)
-    
             self.logger.info("Completed OpenAI chat completion API call.")
             return output
         except requests.exceptions.RequestException as e:
@@ -111,8 +106,6 @@ class OpenAIClient:
                 self.logger.error(f"Error response from OpenAI chat completion API: {e.response.text}")
             self.logger.error(f"Error in OpenAI chat completion request: {e}")
             raise HTTPException(status_code=500, detail="Error in OpenAI chat completion request")
-
-
 
     def get_embeddings(self, text: str) -> List[float]:
         """
@@ -147,13 +140,11 @@ class DocumentProcessor:
         
     def clean_text(self, text: str) -> str:
         """
-        Clean up the input text by trimming whitespace and normalizing spaces.
+        Clean up the input text by trimming whitespace, normalizing spaces,
+        and removing non-printable characters.
         """
-        # Strip leading/trailing whitespace
         cleaned = text.strip()
-        # Replace multiple whitespace characters (including newlines) with a single space
         cleaned = re.sub(r'\s+', ' ', cleaned)
-        # Remove non-printable characters
         cleaned = ''.join(filter(lambda x: x in string.printable, cleaned))
         return cleaned
 
@@ -182,11 +173,9 @@ class DocumentProcessor:
                     {"role": "system",
                      "content": "Extract entities, relationships, and their strength from the following text. "
                                 "Use common terms such as 'related to', 'depends on', 'influences', etc., "
-                                "for relationships, and estimate a strength between 0.0 (very weak) and 1.0 ("
-                                "very strong). Format: Parsed relationship: Entity1 -> Relationship -> Entity2 "
-                                "[strength: X.X]. Do not include any other text in your response. Use this "
-                                "exact format: Parsed relationship: Entity1 -> Relationship -> Entity2 ["
-                                "strength: X.X]."},
+                                "for relationships, and estimate a strength between 0.0 (very weak) and 1.0 (very strong). "
+                                "Format: Parsed relationship: Entity1 -> Relationship -> Entity2 [strength: X.X]. "
+                                "Do not include any other text in your response. Use this exact format."},
                     {"role": "user", "content": chunk}
                 ])
                 self.logger.info(f"Completed extraction for chunk {index + 1}")
@@ -208,10 +197,9 @@ class DocumentProcessor:
             try:
                 summary = self.client.call_chat_completion([
                     {"role": "system",
-                     "content": "Summarize the following entities and relationships in a structured "
-                                "format. Use common terms such as 'related to', 'depends on', "
-                                "'influences', etc., for relationships. Use '->' to represent "
-                                "relationships after the 'Relationships:' word."},
+                     "content": "Summarize the following entities and relationships in a structured format. "
+                                "Use common terms such as 'related to', 'depends on', 'influences', etc., for relationships. "
+                                "Use '->' to represent relationships after the 'Relationships:' word."},
                     {"role": "user", "content": element}
                 ])
                 self.logger.info(f"Completed summarization for element {index + 1}")
@@ -262,34 +250,57 @@ class GraphDatabaseConnection:
             session.run("MATCH (n) DETACH DELETE n")
 
 
-# Graph Manager Class with Graph Data Science (GDS) Integration
+# Graph Manager Class with Graph Data Science (GDS) Integration and Vector Index Management
 class GraphManager:
     logger = Logger('GraphManager').get_logger()
 
     def __init__(self, db_connection, clear_on_startup: bool = False):
         """
         Initialize graph manager and optionally clear the database.
+        Also ensures the vector index exists.
         """
         self.db_connection = db_connection
         if clear_on_startup:
             self.logger.info("Clearing the graph database on startup...")
             self.db_connection.clear_database()
-            
+        self.ensure_vector_index_exists()
+
+    def ensure_vector_index_exists(self) -> None:
+        """
+        Check if the vector index 'chunk-embeddings' exists on Chunk nodes.
+        If not, create it with 1024 dimensions and cosine similarity.
+        """
+        with self.db_connection.get_session() as session:
+            result = session.run("SHOW INDEXES YIELD name WHERE name = 'chunk-embeddings' RETURN name").data()
+            if not result:
+                self.logger.info("Vector index 'chunk-embeddings' does not exist. Creating index.")
+                session.run(
+                    """
+                    CREATE VECTOR INDEX `chunk-embeddings`
+                    FOR (n:Chunk) ON (n.embedding)
+                    OPTIONS {indexConfig: {`vector.dimensions`: 1024, `vector.similarity_function`: 'cosine'}}
+                    """
+                )
+                self.logger.info("Vector index created.")
+            else:
+                self.logger.info("Vector index 'chunk-embeddings' already exists.")
+
     def vector_search(self, query_embedding: List[float], limit: int = 5) -> List[Dict[str, Any]]:
         """
-        Perform a vector search on Chunk nodes by computing cosine similarity
-        between each chunk's embedding and the provided query embedding.
+        Use Neo4j’s vector index to query for similar Chunk nodes.
+        Only returns chunks with a similarity score above a threshold.
         """
-        self.logger.info("Starting vector search using cosine similarity...")
+        self.logger.info("Starting vector search using vector index...")
         with self.db_connection.get_session() as session:
             query = """
-            MATCH (c:Chunk)
-            WITH c, gds.similarity.cosine(c.embedding, $query_embedding) AS similarity
-            RETURN c.text AS text, similarity
-            ORDER BY similarity DESC
-            LIMIT $limit
+            CALL db.index.vector.queryNodes('chunk-embeddings', $limit, $query_embedding)
+            YIELD node AS chunk, score
+            WHERE score > $threshold
+            RETURN chunk.text AS text, score
+            ORDER BY score DESC
             """
-            result = session.run(query, query_embedding=query_embedding, limit=limit).data()
+            threshold = 0.8  # Adjustable threshold for relevance
+            result = session.run(query, query_embedding=query_embedding, limit=limit, threshold=threshold).data()
         self.logger.info("Vector search completed.")
         return result
 
@@ -303,7 +314,8 @@ class GraphManager:
         with self.db_connection.get_session() as session:
             for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
                 self.logger.debug(f"Creating node for chunk {i}")
-                session.run("MERGE (c:Chunk {id: $id}) SET c.text = $text, c.embedding = $embedding", id=i, text=chunk, embedding=embedding)
+                session.run("MERGE (c:Chunk {id: $id}) SET c.text = $text, c.embedding = $embedding", 
+                            id=i, text=chunk, embedding=embedding)
 
             for summary in summaries:
                 lines = summary.split("\n")
@@ -407,6 +419,51 @@ class QueryHandler:
         self.graph_manager = graph_manager
         self.client = client
 
+    def rerank_vector_results(self, query: str, vector_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Use the language model to re-rank the vector search results based on their relevance to the relationship query.
+        The prompt explicitly instructs the LLM to focus solely on the relationship query and to exclude any unrelated content.
+        """
+        # Build a numbered list of candidate snippets.
+        candidates_text = "\n".join([
+            f"{i+1}. {record['text']}" for i, record in enumerate(vector_results)
+        ])
+        prompt = (
+            f"Given the relationship query:\n{query}\n\n"
+            f"and the following document snippets:\n{candidates_text}\n\n"
+            "Please re-rank these snippets by their relevance to answering the relationship between the entities mentioned in the query. "
+            "Exclude any snippet that is not directly relevant. Return only the ordered list of numbers separated by commas "
+            "(for example, '2,1,3,4,5'), where the first number corresponds to the most relevant snippet."
+        )
+
+        self.logger.info("Requesting re-ranking from LLM...")
+        response = self.client.call_chat_completion([
+            {"role": "system", "content": "You are a helpful assistant that re-ranks document snippets based solely on their relevance to a relationship query."},
+            {"role": "user", "content": prompt}
+        ])
+        self.logger.debug(f"Reranking response: {response}")
+
+        try:
+            # Use regex to extract all numbers from the response
+            ranking_order = [int(num) for num in re.findall(r'\d+', response)]
+        except Exception as e:
+            self.logger.error(f"Error parsing re-ranking response: {e}")
+            ranking_order = list(range(1, len(vector_results) + 1))
+
+        # Build a new list of re-ranked results.
+        reranked_results = []
+        seen_indices = set()
+        for pos in ranking_order:
+            index = pos - 1  # convert from 1-indexed to 0-indexed
+            if 0 <= index < len(vector_results) and index not in seen_indices:
+                reranked_results.append(vector_results[index])
+                seen_indices.add(index)
+        # Append any results not mentioned in the ranking_order.
+        for i, item in enumerate(vector_results):
+            if i not in seen_indices:
+                reranked_results.append(item)
+        return reranked_results
+
     def ask_question(self, query: str) -> str:
         self.logger.info("Starting query processing...")
         try:
@@ -414,24 +471,26 @@ class QueryHandler:
             centrality_data = self.graph_manager.calculate_centrality_measures()
             centrality_summary = self.summarize_centrality_measures(centrality_data)
 
-            # 2. Get the embedding for the question and perform vector search.
+            # 2. Get the embedding for the query and perform vector search using the vector index.
             question_embedding = self.client.get_embeddings(query)
             vector_results = self.graph_manager.vector_search(question_embedding, limit=5)
+
+            # 3. Re-rank the vector search results.
+            reranked_results = self.rerank_vector_results(query, vector_results)
             vector_context = "\n".join([
-                f"Chunk: {record['text']}\nSimilarity: {record['similarity']}"
-                for record in vector_results
+                f"Chunk: {record['text']}\nRelevance Score: {record.get('score', 'N/A')}"
+                for record in reranked_results
             ])
 
-            # 3. Combine the information into a prompt.
+            # 4. Combine context and query for the final answer.
             prompt = (
                 f"Query: {query}\n\n"
                 f"Centrality Summary:\n{centrality_summary}\n\n"
-                f"Relevant Chunks from vector search:\n{vector_context}"
+                f"Relevant Chunks (re-ranked):\n{vector_context}"
             )
 
-            # 4. Call the chat completion API with both sets of context.
             response = self.client.call_chat_completion([
-                {"role": "system", "content": "Use the provided centrality measures and vector search results to answer the query."},
+                {"role": "system", "content": "Use the provided centrality measures and re-ranked vector search results to answer the query."},
                 {"role": "user", "content": prompt}
             ])
             self.logger.info("Finished query processing.")
@@ -482,7 +541,6 @@ async def upload_documents(files: List[UploadFile]) -> JSONResponse:
                 global_logger.info("Reading PDF file")
                 reader = PyPDF2.PdfReader(file.file)
                 text = " ".join([page.extract_text() for page in reader.pages])
-                # Clean the extracted text
                 text = document_processor.clean_text(text)
                 document_texts.append(text)
                 global_logger.info("Finished reading PDF file")
@@ -490,14 +548,12 @@ async def upload_documents(files: List[UploadFile]) -> JSONResponse:
                 global_logger.info("Reading DOCX file")
                 doc = docx.Document(file.file)
                 text = "\n".join([para.text for para in doc.paragraphs])
-                # Clean the extracted text
                 text = document_processor.clean_text(text)
                 document_texts.append(text)
                 global_logger.info("Finished reading DOCX file")
             elif file.filename.endswith(".txt"):
                 global_logger.info("Reading TXT file")
                 text = file.file.read().decode("utf-8")
-                # Clean the extracted text
                 text = document_processor.clean_text(text)
                 document_texts.append(text)
                 global_logger.info("Finished reading TXT file")
