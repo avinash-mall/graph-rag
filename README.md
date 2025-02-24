@@ -64,6 +64,16 @@ GraphRag is a Python-based application that processes documents, extracts entiti
     ./mxbai-embed-large-v1-f16.llamafile --server --nobrowser --embedding --host 0.0.0.0 --port 8081
   ```
 
+5. **Run the uvicorn python app**
+   ```bash
+     uvicorn main:app --reload --host 0.0.0.0
+   ```
+
+6. **Open the swagger-ui docs URL to test**
+   ```
+     http://<your-ip-address>:8000/docs#
+   ```
+
 ## Configuration
 
 Create a `.env` file in the project root with the following environment variables:
