@@ -136,7 +136,9 @@ Start the FastAPI server. For example, if you're using Uvicorn:
   }
   ```
 ## Flowchart
-![alt text](https://github.com/avinash-mall/graph-rag/blob/main/flowchart.svg?raw=true)
+![Alt text](https://raw.githubusercontent.com/avinash-mall/graph-rag/refs/heads/main/flowchart.svg?sanitize=true)
+<img src="https://raw.githubusercontent.com/avinash-mall/graph-rag/refs/heads/main/flowchart.svg?sanitize=true">
+
 
 
 ## Logging & Debugging
