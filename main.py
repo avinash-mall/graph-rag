@@ -2,28 +2,28 @@ import os
 import time
 import re
 import logging
-from neo4j import GraphDatabase
+import string
+import uuid
+from datetime import datetime
+from functools import lru_cache
+from typing import List, Dict, Any, Tuple
+
+import requests
+import docx
+import PyPDF2
+import blingfire
+from dotenv import load_dotenv
 from fastapi_offline import FastAPIOffline
 from fastapi import UploadFile, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from typing import List, Dict, Any, Tuple
-from dotenv import load_dotenv
-import requests
-import docx
-import PyPDF2
-from functools import lru_cache
-import string
-import uuid
-from datetime import datetime
-from semantic_text_splitter import TextSplitter
-from tokenizers import Tokenizer
-from sentence_transformers import SentenceTransformer
+from neo4j import GraphDatabase
 
-# Load configuration from .env file
+# ------------------------------------------------------------------------------
+# Configuration & Environment Variables
+# ------------------------------------------------------------------------------
 load_dotenv()
 
-# Application and API configuration constants
 SLEEP_DURATION = float(os.getenv("SLEEP_DURATION", "0.5"))
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 MODEL = os.getenv("OPENAI_MODEL")
@@ -32,21 +32,12 @@ OPENAI_STOP = os.getenv("OPENAI_STOP")
 OPENAI_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", 0.0))
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "512"))
 
-# Initialize tokenizer and text splitter for document processing
-tokenizer = Tokenizer.from_pretrained("bert-base-multilingual-cased")
-splitter = TextSplitter.from_huggingface_tokenizer(tokenizer, CHUNK_SIZE)
-
-# Vector search configuration
 VECTOR_INDEX_NAME = os.getenv("VECTOR_INDEX_NAME", "chunk-embeddings")
 VECTOR_DIMENSIONS = int(os.getenv("VECTOR_DIMENSIONS", "1024"))
 VECTOR_SIMILARITY_FUNCTION = os.getenv("VECTOR_SIMILARITY_FUNCTION", "cosine")
 VECTOR_SEARCH_THRESHOLD = float(os.getenv("VECTOR_SEARCH_THRESHOLD", "0.8"))
-
-# Additional constant to limit fulltext search results
 FULLTEXT_SEARCH_LIMIT = int(os.getenv("FULLTEXT_SEARCH_LIMIT", "2"))
 
-
-# Graph database configuration and logging settings
 GRAPH_NAME = os.getenv("GRAPH_NAME", "entityGraph")
 LOG_DIR = os.getenv("LOG_DIR", "logs")
 LOG_FILE = os.getenv("LOG_FILE", "app.log")
@@ -56,7 +47,36 @@ DB_USERNAME = os.getenv("DB_USERNAME")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 FULLTEXT_INDEX_NAME = os.getenv("FULLTEXT_INDEX_NAME", "chunkFulltext")
 
-# --------------------- Logger Class ---------------------
+# Embedding API Configuration
+EMBEDDING_API_URL = os.getenv("EMBEDDING_API_URL", "http://localhost:8081/embedding")
+
+# ------------------------------------------------------------------------------
+# Utility Functions
+# ------------------------------------------------------------------------------
+def sentence_based_chunker(text: str, max_chunk_size: int) -> List[str]:
+    """
+    Splits text into sentences using Blingfire, then greedily packs sentences into chunks.
+    Each chunk is filled as close as possible to max_chunk_size without splitting any sentence.
+    """
+    # Blingfire returns a string with sentences separated by newlines.
+    sentences = [s.strip() for s in blingfire.text_to_sentences(text).splitlines() if s.strip()]
+    
+    chunks = []
+    current_chunk = ""
+    for sentence in sentences:
+        # Check if adding this sentence (plus a space) would exceed the chunk size.
+        if current_chunk and (len(current_chunk) + len(sentence) + 1) > max_chunk_size:
+            chunks.append(current_chunk.strip())
+            current_chunk = sentence
+        else:
+            current_chunk = sentence if not current_chunk else current_chunk + " " + sentence
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+    return chunks
+
+# ------------------------------------------------------------------------------
+# Logger Class
+# ------------------------------------------------------------------------------
 class Logger:
     """
     Custom logger that outputs to both file and console.
@@ -83,22 +103,49 @@ class Logger:
 
 global_logger = Logger("AppLogger").get_logger()
 
-# --------------------- SentenceTransformerClient ---------------------
-class SentenceTransformerClient:
+# ------------------------------------------------------------------------------
+# Clients
+# ------------------------------------------------------------------------------
+class EmbeddingAPIClient:
     """
-    Client to generate text embeddings using SentenceTransformer.
+    Client to generate text embeddings using an external embedding API.
     """
-    def __init__(self, model_name: str = 'intfloat/multilingual-e5-large'):
-        self.model = SentenceTransformer(model_name)
+    def __init__(self):
+        self.embedding_api_url = EMBEDDING_API_URL
+        self.logger = Logger("EmbeddingAPIClient").get_logger()
+
+    def get_embedding(self, text: str) -> List[float]:
+        """
+        Get embeddings for a given text using the embedding API.
+        """
+        self.logger.info("Requesting embeddings for text...")
+        try:
+            response = requests.post(
+                self.embedding_api_url,
+                json={"input": text, "model": "mxbai-embed-large"},
+                timeout=30
+            )
+            response.raise_for_status()
+            full_response = response.json()
+            self.logger.debug(f"Embedding API response: {full_response}")
+            embedding = full_response.get("embedding", [])
+            if not embedding:
+                raise ValueError("Received empty embedding from API")
+            self.logger.info("Received embeddings successfully.")
+            return embedding
+        except requests.exceptions.RequestException as e:
+            self.logger.error(f"Error in embedding API request: {e}")
+            raise HTTPException(status_code=500, detail="Error in embedding API request")
 
     def get_embeddings(self, texts: List[str]) -> List[List[float]]:
-        """Encode texts into normalized embeddings."""
-        return self.model.encode(texts, normalize_embeddings=True)
+        embeddings = []
+        for text in texts:
+            emb = self.get_embedding(text)
+            embeddings.append(emb)
+        return embeddings
 
-# Use environment variable for embedding model if provided
-embedding_client = SentenceTransformerClient(os.getenv("EMBEDDING_API_MODEL", "intfloat/multilingual-e5-large"))
+embedding_client = EmbeddingAPIClient()
 
-# --------------------- OpenAIClient ---------------------
 class OpenAIClient:
     """
     Client for interacting with the OpenAI chat completion API.
@@ -112,28 +159,23 @@ class OpenAIClient:
         self.logger = Logger("OpenAIClient").get_logger()
 
     def call_chat_completion(self, messages: List[Dict[str, str]]) -> str:
-        """
-        Call the OpenAI API to generate a response based on a list of messages.
-        """
         request_payload = {
             "model": self.model,
             "messages": messages,
             "temperature": self.temperature,
             "stop": self.stop
         }
-        request_url = self.base_url
         self.logger.info("Calling OpenAI chat completion API...")
-        self.logger.debug(f"Request URL: {request_url}")
+        self.logger.debug(f"Request URL: {self.base_url}")
         self.logger.debug(f"Request payload: {request_payload}")
         try:
             response = requests.post(
-                request_url,
+                self.base_url,
                 headers={"Authorization": f"Bearer {self.api_key}"},
                 json=request_payload,
                 timeout=600
             )
             response.raise_for_status()
-            self.logger.debug(f"Chat completion response: {response.text}")
             output = response.json()["choices"][0]["message"]["content"]
             output = output.replace("<|eot_id|>", "")
             time.sleep(SLEEP_DURATION)
@@ -145,10 +187,12 @@ class OpenAIClient:
             self.logger.error(f"Error in OpenAI API request: {e}")
             raise HTTPException(status_code=500, detail="Error in OpenAI chat completion request")
 
-# --------------------- DocumentProcessor ---------------------
+# ------------------------------------------------------------------------------
+# Document Processing
+# ------------------------------------------------------------------------------
 class DocumentProcessor:
     """
-    Processes documents by cleaning text, splitting into chunks,
+    Processes documents by cleaning text, splitting into chunks using sentence boundaries,
     extracting and summarizing elements, and generating embeddings.
     """
     logger = Logger("DocumentProcessor").get_logger()
@@ -157,19 +201,16 @@ class DocumentProcessor:
         self.client = client
 
     def clean_text(self, text: str) -> str:
-        """Clean input text by normalizing spaces and filtering non-printable characters."""
         cleaned = text.strip()
         cleaned = re.sub(r'\s+', ' ', cleaned)
         return ''.join(filter(lambda x: x in string.printable, cleaned))
 
     def split_documents(self, documents: List[str]) -> List[str]:
-        """
-        Split documents into semantic chunks using the pre-configured text splitter.
-        """
-        self.logger.info("Starting document chunking...")
+        self.logger.info("Starting document chunking using sentence_based_chunker...")
         chunks = []
         for document in documents:
-            document_chunks = splitter.chunks(document)
+            # Use CHUNK_SIZE from the environment as the maximum chunk size
+            document_chunks = sentence_based_chunker(document, CHUNK_SIZE)
             chunks.extend(document_chunks)
             self.logger.debug(f"Document split into {len(document_chunks)} chunks.")
         self.logger.info(f"Completed chunking; produced {len(chunks)} chunks.")
@@ -177,10 +218,6 @@ class DocumentProcessor:
 
     @lru_cache(maxsize=1024)
     def extract_elements(self, chunks: Tuple[str, ...]) -> List[str]:
-        """
-        Extract entities and relationships from each text chunk using OpenAI.
-        Caching is applied to avoid redundant processing.
-        """
         self.logger.info("Starting extraction of elements from chunks...")
         start_time = time.time()
         elements = []
@@ -189,10 +226,12 @@ class DocumentProcessor:
             try:
                 response = self.client.call_chat_completion([
                     {"role": "system",
-                     "content": ("Extract entities, relationships, and their strength from the following text. "
-                                 "Use common terms like 'related to', 'depends on', 'influences', etc., and assign a strength between 0.0 and 1.0. "
-                                 "Format: Parsed relationship: Entity1 -> Relationship -> Entity2 [strength: X.X]. "
-                                 "Return only this format.")},
+                     "content": (
+                         "Extract entities, relationships, and their strength from the following text. "
+                         "Use common terms like 'related to', 'depends on', 'influences', etc., and assign a strength between 0.0 and 1.0. "
+                         "Format: Parsed relationship: Entity1 -> Relationship -> Entity2 [strength: X.X]. "
+                         "Return only this format."
+                     )},
                     {"role": "user", "content": chunk}
                 ])
                 self.logger.info(f"Extraction complete for chunk {index + 1}")
@@ -204,9 +243,6 @@ class DocumentProcessor:
         return elements
 
     def summarize_elements(self, elements: List[str]) -> List[str]:
-        """
-        Summarize extracted elements into structured relationships using OpenAI.
-        """
         self.logger.info("Starting summarization of elements...")
         start_time = time.time()
         summaries = []
@@ -215,8 +251,10 @@ class DocumentProcessor:
             try:
                 summary = self.client.call_chat_completion([
                     {"role": "system",
-                     "content": ("Summarize the following entities and relationships in a structured format. "
-                                 "Use '->' to indicate relationships.")},
+                     "content": (
+                         "Summarize the following entities and relationships in a structured format. "
+                         "Use '->' to indicate relationships."
+                     )},
                     {"role": "user", "content": element}
                 ])
                 self.logger.info(f"Summarization complete for element {index + 1}")
@@ -228,9 +266,6 @@ class DocumentProcessor:
         return summaries
 
     def get_embeddings(self, chunks: List[str]) -> List[List[float]]:
-        """
-        Generate embeddings for each text chunk using the SentenceTransformer client.
-        """
         self.logger.info("Generating embeddings for text chunks...")
         try:
             passage_texts = [f"passage: {chunk}" for chunk in chunks]
@@ -241,7 +276,9 @@ class DocumentProcessor:
             self.logger.error(f"Embedding generation error: {e}")
             raise HTTPException(status_code=500, detail="Error retrieving embeddings")
 
-# --------------------- GraphDatabaseConnection ---------------------
+# ------------------------------------------------------------------------------
+# Graph Database & Graph Management
+# ------------------------------------------------------------------------------
 class GraphDatabaseConnection:
     """
     Manages the connection to the Neo4j graph database.
@@ -252,19 +289,15 @@ class GraphDatabaseConnection:
         self.driver = GraphDatabase.driver(uri, auth=(user, password))
 
     def close(self) -> None:
-        """Close the database connection."""
         self.driver.close()
 
     def get_session(self):
-        """Create a new session for executing database transactions."""
         return self.driver.session()
 
     def clear_database(self) -> None:
-        """Delete all nodes and relationships from the database."""
         with self.get_session() as session:
             session.run("MATCH (n) DETACH DELETE n")
 
-# --------------------- GraphManager ---------------------
 class GraphManager:
     """
     Manages graph operations including index creation, node/relationship insertion,
@@ -281,10 +314,9 @@ class GraphManager:
         self.ensure_fulltext_index_exists()
 
     def ensure_vector_index_exists(self) -> None:
-        """Ensure the vector index exists; create it if missing."""
         with self.db_connection.get_session() as session:
             result = session.run(
-                "SHOW INDEXES YIELD name WHERE name = $index_name RETURN name", 
+                "SHOW INDEXES YIELD name WHERE name = $index_name RETURN name",
                 index_name=VECTOR_INDEX_NAME
             ).data()
             if not result:
@@ -301,10 +333,9 @@ class GraphManager:
                 self.logger.info(f"Vector index '{VECTOR_INDEX_NAME}' exists.")
 
     def ensure_fulltext_index_exists(self) -> None:
-        """Ensure the fulltext index exists; create it if missing."""
         with self.db_connection.get_session() as session:
             result = session.run(
-                "SHOW INDEXES YIELD name WHERE name = $index_name RETURN name", 
+                "SHOW INDEXES YIELD name WHERE name = $index_name RETURN name",
                 index_name=FULLTEXT_INDEX_NAME
             ).data()
             if not result:
@@ -315,10 +346,6 @@ class GraphManager:
                 self.logger.info(f"Fulltext index '{FULLTEXT_INDEX_NAME}' exists.")
 
     def vector_search(self, query_embedding: List[float], limit: int = 5) -> List[Dict[str, Any]]:
-        """
-        Perform a vector search using the provided embedding.
-        Returns the top matching nodes with a score above the threshold.
-        """
         self.logger.info("Performing vector search...")
         with self.db_connection.get_session() as session:
             query = """
@@ -330,10 +357,10 @@ class GraphManager:
             """
             threshold = VECTOR_SEARCH_THRESHOLD
             result = session.run(
-                query, 
-                query_embedding=query_embedding, 
-                limit=limit, 
-                threshold=threshold, 
+                query,
+                query_embedding=query_embedding,
+                limit=limit,
+                threshold=threshold,
                 index_name=VECTOR_INDEX_NAME
             ).data()
         for rec in result:
@@ -341,13 +368,9 @@ class GraphManager:
         return result
 
     def build_graph(self, chunks: List[str], embeddings: List[List[float]], summaries: List[str], metadata_list: List[Dict[str, Any]]) -> None:
-        """
-        Build the graph by creating nodes for each document chunk and establishing relationships based on summaries.
-        """
         self.logger.info("Starting graph construction...")
         start_time = time.time()
         with self.db_connection.get_session() as session:
-            # Create nodes for each chunk
             for i, (chunk, embedding, meta) in enumerate(zip(chunks, embeddings, metadata_list)):
                 self.logger.debug(f"Creating node for chunk {i}")
                 session.run(
@@ -358,15 +381,14 @@ class GraphManager:
                         c.doc_id = $doc_id,
                         c.document_name = $document_name,
                         c.timestamp = $timestamp
-                    """, 
-                    id=i, 
-                    text=chunk, 
-                    embedding=embedding, 
-                    doc_id=meta["doc_id"], 
-                    document_name=meta["document_name"], 
+                    """,
+                    id=i,
+                    text=chunk,
+                    embedding=embedding,
+                    doc_id=meta["doc_id"],
+                    document_name=meta["document_name"],
                     timestamp=meta["timestamp"]
                 )
-            # Create relationships between entities as derived from summaries
             for summary in summaries:
                 lines = summary.split("\n")
                 for line in lines:
@@ -385,15 +407,14 @@ class GraphManager:
                             MERGE (b:Entity {name: $target})
                             MERGE (a)-[r:RELATES_TO {weight: $weight}]->(b)
                             """,
-                            source=source, target=target, weight=weight
+                            source=source,
+                            target=target,
+                            weight=weight
                         )
         self.logger.debug(f"Graph built in {time.time() - start_time:.2f} seconds")
         self.logger.info("Graph construction complete.")
 
     def calculate_centrality_measures(self, graph_name=GRAPH_NAME) -> Dict[str, List[Dict[str, Any]]]:
-        """
-        Calculate degree, betweenness, and closeness centrality measures using GDS.
-        """
         self.logger.info("Calculating centrality measures...")
         try:
             self.reproject_graph(graph_name)
@@ -436,10 +457,6 @@ class GraphManager:
             raise HTTPException(status_code=500, detail="Error calculating centrality measures")
 
     def reproject_graph(self, graph_name=GRAPH_NAME) -> None:
-        """
-        Reproject the graph for GDS by dropping an existing projection (if present)
-        and creating a new one.
-        """
         self.logger.info("Projecting graph for GDS...")
         with self.db_connection.get_session() as session:
             check_query = "CALL gds.graph.exists($graph_name) YIELD exists"
@@ -451,20 +468,18 @@ class GraphManager:
         self.logger.info("Graph projection complete.")
 
     def normalize_entity_name(self, name: str) -> str:
-        """Normalize an entity name by stripping whitespace and converting to lowercase."""
         return name.strip().lower()
 
     def sanitize_relationship_name(self, name: str) -> str:
-        """Sanitize relationship names to allow only alphanumeric characters and underscores."""
         return re.sub(r'\W+', '_', name.strip().lower())
 
-# --------------------- QueryHandler ---------------------
+# ------------------------------------------------------------------------------
+# Query Handling
+# ------------------------------------------------------------------------------
 class QueryHandler:
     """
     Handles user queries by retrieving relevant document snippets from the graph,
-    then generating two answers:
-      1. answer_vector: based on hybrid vector search results.
-      2. answer_gds: based on graph centrality (GDS) data.
+    then generating two answers: one based on vector search and one based on graph centrality.
     """
     logger = Logger("QueryHandler").get_logger()
 
@@ -473,9 +488,6 @@ class QueryHandler:
         self.client = client
 
     def summarize_centrality_measures(self, centrality_data: Dict[str, Any]) -> str:
-        """
-        Format centrality measures into a human-readable summary.
-        """
         summary = "### Centrality Measures Summary:\n"
         for key, records in centrality_data.items():
             summary += f"\n#### {key.capitalize()} Centrality:\n"
@@ -484,23 +496,14 @@ class QueryHandler:
         return summary
 
     def ask_question(self, query: str) -> Dict[str, Any]:
-        """
-        Process a user query by performing two separate operations:
-        1. Generate answer_vector using hybrid vector and fulltext search results.
-        2. Generate answer_gds using graph centrality data.
-        Both answers are obtained from the OpenAI API using tailored prompts.
-        """
         self.logger.info("Processing query...")
         try:
-            # Calculate graph centrality measures and prepare a summary.
             centrality_data = self.graph_manager.calculate_centrality_measures()
             centrality_summary = self.summarize_centrality_measures(centrality_data)
     
-            # Generate query embedding and perform vector search.
             query_embedding = embedding_client.get_embeddings([f"query: {query}"])[0]
             vector_results = self.graph_manager.vector_search(query_embedding, limit=5)
     
-            # Perform fulltext search with a limited number of results.
             fulltext_results = []
             with self.graph_manager.db_connection.get_session() as session:
                 cypher_fulltext = """
@@ -524,13 +527,10 @@ class QueryHandler:
                         "score": rec["score"]
                     })
     
-            # Combine vector and fulltext results and sort by score.
             combined_results = vector_results + fulltext_results
             combined_results.sort(key=lambda x: x["score"], reverse=True)
-            # Use only the top 5 results for context.
             context = "\n---\n".join([item["text"] for item in combined_results[:5]])
     
-            # Generate answer_vector using the combined search context.
             prompt_vector = (
                 f"Query: {query}\n\n"
                 f"Relevant Context:\n{context}\n\n"
@@ -541,7 +541,6 @@ class QueryHandler:
                 {"role": "user", "content": prompt_vector}
             ])
     
-            # Generate answer_gds using the graph centrality summary.
             prompt_gds = (
                 f"Query: {query}\n\n"
                 f"Centrality Summary:\n{centrality_summary}\n\n"
@@ -552,7 +551,6 @@ class QueryHandler:
                 {"role": "user", "content": prompt_gds}
             ])
     
-            # Prepare metadata from the combined results.
             metadata_dict = {}
             for item in combined_results:
                 doc_id = item.get("doc_id")
@@ -570,8 +568,9 @@ class QueryHandler:
             self.logger.error(f"Query error: {str(e)}")
             raise HTTPException(status_code=500, detail="Error answering question")
 
-
-# --------------------- FastAPI Application Setup ---------------------
+# ------------------------------------------------------------------------------
+# FastAPI Application Setup & Endpoints
+# ------------------------------------------------------------------------------
 chat_client = OpenAIClient()
 db_connection = GraphDatabaseConnection(uri=DB_URL, user=DB_USERNAME, password=DB_PASSWORD)
 document_processor = DocumentProcessor(chat_client)
@@ -588,8 +587,8 @@ async def get_status():
 @app.post("/upload_documents", summary="Upload documents for processing")
 async def upload_documents(files: List[UploadFile]) -> JSONResponse:
     """
-    Upload and process documents (PDF, DOCX, TXT).
-    The endpoint cleans, splits, embeds, extracts, summarizes, and stores document data in the graph.
+    Upload and process documents (PDF, DOCX, TXT). The endpoint cleans, splits, embeds,
+    extracts, summarizes, and stores document data in the graph.
     """
     start_time = time.time()
     document_texts = []
@@ -641,17 +640,54 @@ async def upload_documents(files: List[UploadFile]) -> JSONResponse:
         global_logger.error(f"Document processing error: {e}")
         raise HTTPException(status_code=500, detail=f"Error processing documents: {str(e)}")
 
-class QueryRequest(BaseModel):
-    query: str
+@app.get("/documents", summary="List all uploaded documents")
+async def list_documents() -> JSONResponse:
+    """
+    List all unique documents that have been processed and stored in the graph.
+    """
+    try:
+        with db_connection.get_session() as session:
+            query = """
+                MATCH (c:Chunk)
+                RETURN DISTINCT c.doc_id AS doc_id, c.document_name AS document_name, c.timestamp AS timestamp
+            """
+            results = session.run(query).data()
+        return JSONResponse(content={"documents": results})
+    except Exception as e:
+        global_logger.error(f"Error listing documents: {e}")
+        raise HTTPException(status_code=500, detail="Error listing documents")
+
+@app.delete("/documents/{doc_id}", summary="Delete a document")
+async def delete_document(doc_id: str) -> JSONResponse:
+    """
+    Delete all chunks associated with a specific document id from the graph.
+    """
+    try:
+        with db_connection.get_session() as session:
+            query_check = "MATCH (c:Chunk {doc_id: $doc_id}) RETURN count(c) as count"
+            result = session.run(query_check, doc_id=doc_id).single()
+            if result["count"] == 0:
+                raise HTTPException(status_code=404, detail="Document not found")
+            delete_query = "MATCH (c:Chunk {doc_id: $doc_id}) DETACH DELETE c"
+            session.run(delete_query, doc_id=doc_id)
+        return JSONResponse(content={"message": f"Document {doc_id} deleted successfully"})
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        global_logger.error(f"Error deleting document {doc_id}: {e}")
+        raise HTTPException(status_code=500, detail="Error deleting document")
 
 @app.post("/ask_question", summary="Ask a question about the graph data")
-async def ask_question(request: QueryRequest) -> JSONResponse:
+async def ask_question(request: BaseModel) -> JSONResponse:
     """
     Process a user query by retrieving relevant graph data and generating two separate answers:
-      - answer_vector: from the hybrid vector search results.
-      - answer_gds: from the graph centrality (GDS) data.
+    - answer_vector: based on hybrid vector search results.
+    - answer_gds: based on graph centrality (GDS) data.
     """
+    class QueryRequest(BaseModel):
+        query: str
+    req = QueryRequest.parse_obj(request)
     global_logger.info("Received query request.")
-    answer_data = query_handler.ask_question(request.query)
+    answer_data = query_handler.ask_question(req.query)
     global_logger.info("Returning query response.")
     return JSONResponse(content=answer_data)
