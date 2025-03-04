@@ -7,7 +7,8 @@ import uuid
 from datetime import datetime
 from functools import lru_cache
 from typing import List, Dict, Any, Tuple
-
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 import requests
 import docx
 import PyPDF2
@@ -58,13 +59,11 @@ def sentence_based_chunker(text: str, max_chunk_size: int) -> List[str]:
     Splits text into sentences using Blingfire, then greedily packs sentences into chunks.
     Each chunk is filled as close as possible to max_chunk_size without splitting any sentence.
     """
-    # Blingfire returns a string with sentences separated by newlines.
     sentences = [s.strip() for s in blingfire.text_to_sentences(text).splitlines() if s.strip()]
     
     chunks = []
     current_chunk = ""
     for sentence in sentences:
-        # Check if adding this sentence (plus a space) would exceed the chunk size.
         if current_chunk and (len(current_chunk) + len(sentence) + 1) > max_chunk_size:
             chunks.append(current_chunk.strip())
             current_chunk = sentence
@@ -115,9 +114,6 @@ class EmbeddingAPIClient:
         self.logger = Logger("EmbeddingAPIClient").get_logger()
 
     def get_embedding(self, text: str) -> List[float]:
-        """
-        Get embeddings for a given text using the embedding API.
-        """
         self.logger.info("Requesting embeddings for text...")
         try:
             response = requests.post(
@@ -173,7 +169,8 @@ class OpenAIClient:
                 self.base_url,
                 headers={"Authorization": f"Bearer {self.api_key}"},
                 json=request_payload,
-                timeout=600
+                timeout=600,
+                verify=False  # Disables SSL certificate verification
             )
             response.raise_for_status()
             output = response.json()["choices"][0]["message"]["content"]
@@ -209,7 +206,6 @@ class DocumentProcessor:
         self.logger.info("Starting document chunking using sentence_based_chunker...")
         chunks = []
         for document in documents:
-            # Use CHUNK_SIZE from the environment as the maximum chunk size
             document_chunks = sentence_based_chunker(document, CHUNK_SIZE)
             chunks.extend(document_chunks)
             self.logger.debug(f"Document split into {len(document_chunks)} chunks.")
@@ -340,7 +336,7 @@ class GraphManager:
             ).data()
             if not result:
                 self.logger.info(f"Fulltext index '{FULLTEXT_INDEX_NAME}' missing. Creating it.")
-                session.run(f"CREATE FULLTEXT INDEX {FULLTEXT_INDEX_NAME} IF NOT EXISTS FOR (n:Chunk) ON (n.text)")
+                session.run(f"CREATE FULLTEXT INDEX {FULLTEXT_INDEX_NAME} IF NOT EXISTS FOR (n:Chunk) ON EACH [n.text]")
                 self.logger.info("Fulltext index created.")
             else:
                 self.logger.info(f"Fulltext index '{FULLTEXT_INDEX_NAME}' exists.")
@@ -403,21 +399,51 @@ class GraphManager:
                         self.logger.debug(f"Creating relationship: {source} -> {relation_name} -> {target} (weight: {weight})")
                         session.run(
                             """
-                            MERGE (a:Entity {name: $source})
-                            MERGE (b:Entity {name: $target})
+                            MERGE (a:Entity {name: $source, doc_id: $doc_id})
+                            MERGE (b:Entity {name: $target, doc_id: $doc_id})
                             MERGE (a)-[r:RELATES_TO {weight: $weight}]->(b)
                             """,
                             source=source,
                             target=target,
-                            weight=weight
+                            weight=weight,
+                            doc_id=meta["doc_id"]
                         )
         self.logger.debug(f"Graph built in {time.time() - start_time:.2f} seconds")
         self.logger.info("Graph construction complete.")
 
-    def calculate_centrality_measures(self, graph_name=GRAPH_NAME) -> Dict[str, List[Dict[str, Any]]]:
+    def reproject_graph(self, graph_name=GRAPH_NAME, doc_id: str = None) -> None:
+        self.logger.info("Projecting graph for GDS...")
+        with self.db_connection.get_session() as session:
+            # Drop any existing projection
+            check_query = "CALL gds.graph.exists($graph_name) YIELD exists"
+            exists = session.run(check_query, graph_name=graph_name).single()["exists"]
+            if exists:
+                session.run("CALL gds.graph.drop($graph_name)", graph_name=graph_name)
+            if doc_id:
+                # Inline the doc_id into the query strings since parameter maps aren't supported here
+                node_query = f"MATCH (n:Entity) WHERE n.doc_id = '{doc_id}' RETURN id(n) AS id"
+                rel_query = f"MATCH (a:Entity)-[r:RELATES_TO]->(b:Entity) WHERE a.doc_id = '{doc_id}' AND b.doc_id = '{doc_id}' RETURN id(a) AS source, id(b) AS target, r.weight AS weight"
+                session.run(
+                    """
+                    CALL gds.graph.project.cypher($graph_name, $nodeQuery, $relQuery)
+                    """,
+                    graph_name=graph_name,
+                    nodeQuery=node_query,
+                    relQuery=rel_query
+                )
+                self.logger.debug(f"Graph projection '{graph_name}' created for doc_id {doc_id}.")
+            else:
+                session.run("CALL gds.graph.project($graph_name, ['Entity'], '*')", graph_name=graph_name)
+                self.logger.debug(f"Graph projection '{graph_name}' created without filtering.")
+        self.logger.info("Graph projection complete.")
+
+
+
+    def calculate_centrality_measures(self, graph_name=GRAPH_NAME, doc_id: str = None) -> Dict[str, List[Dict[str, Any]]]:
         self.logger.info("Calculating centrality measures...")
         try:
-            self.reproject_graph(graph_name)
+            # Pass doc_id to reproject_graph for filtering if provided.
+            self.reproject_graph(graph_name, doc_id)
             with self.db_connection.get_session() as session:
                 degree_query = """
                 CALL gds.degree.stream($graph_name)
@@ -456,17 +482,6 @@ class GraphManager:
             self.logger.error(f"Centrality calculation error: {e}")
             raise HTTPException(status_code=500, detail="Error calculating centrality measures")
 
-    def reproject_graph(self, graph_name=GRAPH_NAME) -> None:
-        self.logger.info("Projecting graph for GDS...")
-        with self.db_connection.get_session() as session:
-            check_query = "CALL gds.graph.exists($graph_name) YIELD exists"
-            exists = session.run(check_query, graph_name=graph_name).single()["exists"]
-            if exists:
-                session.run("CALL gds.graph.drop($graph_name)", graph_name=graph_name)
-            session.run("CALL gds.graph.project($graph_name, ['Entity'], '*')", graph_name=graph_name)
-            self.logger.debug(f"Graph projection '{graph_name}' created.")
-        self.logger.info("Graph projection complete.")
-
     def normalize_entity_name(self, name: str) -> str:
         return name.strip().lower()
 
@@ -498,12 +513,10 @@ class QueryHandler:
     def ask_question(self, query: str) -> Dict[str, Any]:
         self.logger.info("Processing query...")
         try:
-            centrality_data = self.graph_manager.calculate_centrality_measures()
-            centrality_summary = self.summarize_centrality_measures(centrality_data)
-    
+            # First, perform vector and fulltext searches.
             query_embedding = embedding_client.get_embeddings([f"query: {query}"])[0]
             vector_results = self.graph_manager.vector_search(query_embedding, limit=5)
-    
+
             fulltext_results = []
             with self.graph_manager.db_connection.get_session() as session:
                 cypher_fulltext = """
@@ -526,11 +539,26 @@ class QueryHandler:
                         "timestamp": rec.get("timestamp"),
                         "score": rec["score"]
                     })
-    
+
             combined_results = vector_results + fulltext_results
             combined_results.sort(key=lambda x: x["score"], reverse=True)
             context = "\n---\n".join([item["text"] for item in combined_results[:5]])
-    
+
+            # Use the top result's doc_id (if any) to filter centrality measures.
+            top_doc_id = None
+            for item in combined_results:
+                if item.get("doc_id"):
+                    top_doc_id = item["doc_id"]
+                    break
+
+            if top_doc_id:
+                self.logger.info(f"Filtering centrality measures for doc_id: {top_doc_id}")
+            else:
+                self.logger.info("No specific doc_id found, using global centrality measures.")
+
+            centrality_data = self.graph_manager.calculate_centrality_measures(doc_id=top_doc_id)
+            centrality_summary = self.summarize_centrality_measures(centrality_data)
+
             prompt_vector = (
                 f"Query: {query}\n\n"
                 f"Relevant Context:\n{context}\n\n"
@@ -540,7 +568,7 @@ class QueryHandler:
                 {"role": "system", "content": "You are a helpful assistant that answers questions using the provided context."},
                 {"role": "user", "content": prompt_vector}
             ])
-    
+
             prompt_gds = (
                 f"Query: {query}\n\n"
                 f"Centrality Summary:\n{centrality_summary}\n\n"
@@ -550,7 +578,7 @@ class QueryHandler:
                 {"role": "system", "content": "You are a helpful assistant that answers questions using provided graph centrality data."},
                 {"role": "user", "content": prompt_gds}
             ])
-    
+
             metadata_dict = {}
             for item in combined_results:
                 doc_id = item.get("doc_id")
@@ -561,7 +589,7 @@ class QueryHandler:
                         "timestamp": item.get("timestamp")
                     }
             metadata_list = list(metadata_dict.values())
-    
+
             self.logger.info("Query processing complete.")
             return {"answer_vector": answer_vector, "answer_gds": answer_gds, "metadata": metadata_list}
         except Exception as e:
@@ -677,16 +705,17 @@ async def delete_document(doc_id: str) -> JSONResponse:
         global_logger.error(f"Error deleting document {doc_id}: {e}")
         raise HTTPException(status_code=500, detail="Error deleting document")
 
+class QueryRequest(BaseModel):
+    query: str
+
+
 @app.post("/ask_question", summary="Ask a question about the graph data")
-async def ask_question(request: BaseModel) -> JSONResponse:
+async def ask_question(req: QueryRequest) -> JSONResponse:
     """
     Process a user query by retrieving relevant graph data and generating two separate answers:
     - answer_vector: based on hybrid vector search results.
     - answer_gds: based on graph centrality (GDS) data.
     """
-    class QueryRequest(BaseModel):
-        query: str
-    req = QueryRequest.parse_obj(request)
     global_logger.info("Received query request.")
     answer_data = query_handler.ask_question(req.query)
     global_logger.info("Returning query response.")
