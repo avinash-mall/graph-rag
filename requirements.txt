@@ -6,3 +6,8 @@ python-dotenv
 python-docx
 PyPDF2
 uvicorn
+blingfire
+urllib3
+pydantic
+elasticsearch
+scipy
