@@ -527,7 +527,13 @@ class GraphManager:
                 """, graph_name=graph_name, nodeQuery=node_query, relQuery=rel_query)
             else:
                 run_query(session, "CALL gds.graph.project($graph_name, ['Entity'], '*')", graph_name=graph_name)
-        self.logger.info("Graph projection complete.")
+
+            # Debug: Count number of nodes in the projected graph
+            node_count_result = session.run(Query("MATCH (n:Entity) RETURN count(n) AS count")).single()
+            if node_count_result:
+                self.logger.info("Graph projection complete. Entity node count: %d", node_count_result["count"])
+            else:
+                self.logger.warning("Graph projection complete, but no Entity nodes were found.")
 
     @staticmethod
     def normalize_entity_name(name: str) -> str:
