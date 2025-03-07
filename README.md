@@ -50,12 +50,14 @@ GraphRag is a Python-based application that processes documents, extracts entiti
 
 3. **Run Neo4j Database**
    ```docker
-     docker run -it --rm 
-      --publish=7474:7474 --publish=7687:7687 
-      --user="$(id -u):$(id -g)" 
-      --env NEO4J_AUTH=none 
-      --env NEO4J_PLUGINS='["graph-data-science"]' 
-      neo4j:latest
+    docker run -it -d
+   --publish=7474:7474 --publish=7687:7687
+   --user="$(id -u):$(id -g)" -e NEO4J_apoc_export_file_enabled=true
+   -e NEO4J_apoc_import_file_enabled=true
+   -e NEO4J_apoc_import_file_use__neo4j__config=true
+   --env NEO4J_AUTH=none --env NEO4J_PLUGINS='["graph-data-science", "apoc"]'
+   --name neo4j
+   neo4j:latest
    ```
 4. **Run Elastic Database**
    ```docker
