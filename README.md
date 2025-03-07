@@ -57,19 +57,32 @@ GraphRag is a Python-based application that processes documents, extracts entiti
       --env NEO4J_PLUGINS='["graph-data-science"]' 
       neo4j:latest
    ```
+4. **Run Elastic Database**
+   ```docker
+     docker run -d --name elasticsearch
+     -p 9200:9200 -p 9300:9300
+     -v $PWD/esdata:/esdata -e "ELASTICSEARCH_DATA_DIR_LIST=/esdata"
+     -e "discovery.type=single-node" -e "xpack.security.enabled=false"
+     -e ELASTICSEARCH_USERNAME=elastic -e ELASTICSEARCH_PASSWORD=elastic elasticsearch:8.17.3
+   ```
 
-4. **(Optionally) Run Embedding and Chat Completion LLMs using LLamafile** 
+5. **(Optionally) Run Embedding and Chat Completion LLMs using LLamafile** 
   ```bash 
     ./Llama-3.2-3B-Instruct.Q6_K.llamafile --server -c 0 --mlock --host 0.0.0.0 --port 8080 --nobrowser
     ./mxbai-embed-large-v1-f16.llamafile --server --nobrowser --embedding --host 0.0.0.0 --port 8081
   ```
 
-5. **Run the uvicorn python app**
+6. **Run the uvicorn python api app**
+   ```bash
+     uvicorn flair_api:app --reload --host 0.0.0.0
+   ```
+   
+7. **Run the uvicorn python app**
    ```bash
      uvicorn main:app --reload --host 0.0.0.0
    ```
 
-6. **Open the swagger-ui docs URL to test**
+8. **Open the swagger-ui docs URL to test**
    ```
      http://<your-ip-address>:8000/docs#
    ```
