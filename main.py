@@ -195,7 +195,10 @@ class VectorManager:
                         "dims": default_dims,
                         "index": True,
                         "similarity": similarity
-                    }
+                    },
+                    "document_name": {"type": "keyword"},
+                    "timestamp": {"type": "date"},
+                    "text": {"type": "text"}
                 }
             }
             self.es.indices.create(index=self.index_name, body={"mappings": mappings})
@@ -297,14 +300,15 @@ class VectorManager:
     def delete_documents(self, doc_id: str) -> Dict[str, Any]:
         self.logger.info("Deleting documents from Elasticsearch for doc_id: %s", doc_id)
         try:
-            query = {"query": {"term": {"doc_id": doc_id}}}
+            query = {"query": {"term": {"doc_id.keyword": doc_id}}}
             self.logger.debug("Delete query: %s", query)
-            response = self.es.delete_by_query(index=self.index_name, body=query)
+            response = self.es.delete_by_query(index=self.index_name, body=query, refresh=True)
             self.logger.info("Elasticsearch delete response: %s", response)
             return response
         except Exception as e:
             self.logger.error("Error deleting documents from Elasticsearch for doc_id %s: %s", doc_id, e)
             raise HTTPException(status_code=500, detail=f"Error deleting documents from Elasticsearch for doc_id {doc_id}")
+
 
     def index_documents(self, chunks: List[str], embeddings: List[List[float]], metadata_list: List[Dict[str, Any]]) -> None:
         self.logger.info("Indexing %d documents into Elasticsearch...", len(chunks))
@@ -435,16 +439,16 @@ class GraphManager:
     def build_graph(self, chunks: List[str], summaries: List[str], metadata_list: List[Dict[str, Any]]) -> None:
         self.logger.info("Building graph...")
         with self.db_connection.get_session() as session:
-            # Create Chunk nodes with unique id (using chunk index and doc_id)
+            # Create or update Chunk nodes with composite key (chunk index and doc_id)
             for i, (chunk, meta) in enumerate(zip(chunks, metadata_list)):
                 query = """
                     MERGE (c:Chunk {id: $cid, doc_id: $doc_id})
-                    SET c.text = $text,
-                        c.document_name = $document_name,
-                        c.timestamp = $timestamp
+                    ON CREATE SET c.text = $text, c.document_name = $document_name, c.timestamp = $timestamp
+                    ON MATCH SET c.text = $text, c.document_name = $document_name, c.timestamp = $timestamp
                 """
-                run_query(session, query, cid=i, doc_id=meta["doc_id"], text=chunk, document_name=meta["document_name"], timestamp=meta["timestamp"])
-            # Add Entities and relationships using remote Flair API
+                run_query(session, query, cid=i, doc_id=meta["doc_id"], text=chunk,
+                        document_name=meta.get("document_name"), timestamp=meta.get("timestamp"))
+            # (Graph building for entities and relationships remains unchanged)
             for i, (chunk, meta) in enumerate(zip(chunks, metadata_list)):
                 entities = remote_extract_flair_entities(chunk)
                 names = [e["name"].strip().lower() for e in entities]
@@ -454,7 +458,6 @@ class GraphManager:
                     for j in range(len(names)):
                         for k in range(j + 1, len(names)):
                             self._merge_cooccurrence(session, names[j], names[k], meta["doc_id"])
-            # Create relationships from LLM-extracted summaries
             for i, summary in enumerate(summaries):
                 doc_id = metadata_list[i]["doc_id"]
                 for line in summary.split("\n"):
@@ -471,6 +474,7 @@ class GraphManager:
                         """
                         run_query(session, rel_query, source=source, target=target, weight=weight, doc_id=doc_id)
         self.logger.info("Graph construction complete.")
+
 
     def _merge_entity(self, session, name: str, doc_id: str, chunk_id: int):
         query = "MERGE (e:Entity {name: $name, doc_id: $doc_id}) MERGE (e)-[:MENTIONED_IN]->(c:Chunk {id: $cid, doc_id: $doc_id})"
@@ -575,7 +579,7 @@ class QueryHandler:
         self.logger.info("Processing query...")
         expanded_query = self.client.call_chat_completion([
             {"role": "system", "content": (
-                "You are a professional query expansion agent who expands queries for both Named entity recognition and Vector Search. Rephrase and expand the following question to include additional context and clarity, but do not change its original meaning."
+                "You are a professional query expansion agent who expands queries for both Named entity recognition and Vector Search. Rephrase and expand the following question to include additional context and clarity, but do not change its original meaning. Do not write anything else other than the expanded query."
             )},
             {"role": "user", "content": query}
         ])
@@ -584,13 +588,18 @@ class QueryHandler:
         top_doc_id = None
         for item in vector_results:
             if item.get("doc_id"):
-                top_doc_id = item["doc_id"]
+                # Extract the original document id by splitting on '_' if needed.
+                candidate = item["doc_id"].split("_")[0]
+                top_doc_id = candidate
                 break
         graph_context = ""
         if top_doc_id:
             graph_context = self.graph_manager.get_entity_context(doc_id=top_doc_id)
+            if not graph_context.strip():
+                self.logger.warning("Graph context for doc_id %s is empty.", top_doc_id)
         else:
             self.logger.debug("No top_doc_id found for graph context.")
+
         vector_context = "\n---\n".join([item["text"] for item in vector_results])
         answer_vector = self.client.call_chat_completion([
             {"role": "system", "content": "You are a helpful assistant that answers questions using vector search context. Do not use your prior knowledge."},
@@ -603,7 +612,8 @@ class QueryHandler:
                 {"role": "user", "content": f"Query: {query}\n\nGraph Context:\n{graph_context}\n\nAnswer based solely on this graph context."}
             ])
         else:
-            self.logger.debug("Graph context is empty; no separate GDS answer generated.")
+            self.logger.warning("Graph context is empty; skipping GDS answer generation.")
+
         combined_prompt = (
             f"Query: {query}\n\n"
             f"Vector Context:\n{vector_context}\n\n"
@@ -752,14 +762,10 @@ async def delete_document(doc_id: str) -> JSONResponse:
     errors = []
     try:
         with db_connection.get_session() as session:
-            check_query = Query("MATCH (c:Chunk {doc_id: $doc_id}) RETURN count(c) as count")
-            result = session.run(check_query, doc_id=doc_id).single()
-            if result["count"] == 0:
-                neo4j_deleted = False
-            else:
-                del_query = Query("MATCH (c:Chunk {doc_id: $doc_id}) DETACH DELETE c")
-                session.run(del_query, doc_id=doc_id)
-                neo4j_deleted = True
+            # Delete all nodes with matching doc_id (chunks, entities, etc.)
+            del_query = Query("MATCH (n) WHERE n.doc_id = $doc_id DETACH DELETE n")
+            session.run(del_query, doc_id=doc_id)
+            neo4j_deleted = True
     except Exception as e:
         neo4j_deleted = False
         errors.append(f"Neo4j deletion error: {e}")
@@ -778,6 +784,7 @@ async def delete_document(doc_id: str) -> JSONResponse:
             "message": f"Document {doc_id} deleted successfully from Neo4j: {neo4j_deleted}, Elasticsearch: {es_deleted}",
             "errors": errors
         })
+
 
 class QueryRequest(BaseModel):
     query: str
