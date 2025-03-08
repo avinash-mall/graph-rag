@@ -332,6 +332,16 @@ class GraphContextRequest(BaseModel):
     edges: list = []
 
 
+
+def build_combined_answer_prompt(user_question: str, responses: list) -> str:
+    prompt = f"User Question: {user_question}\n\n"
+    prompt += "The following responses were generated for different aspects of your query:\n"
+    for idx, resp in enumerate(responses, start=1):
+        prompt += f"{idx}. {resp}\n"
+    prompt += ("\nBased on the above responses, please provide a comprehensive and concise final answer "
+               "that directly addresses the user's original question.")
+    return prompt.strip()
+
 # ---------------- API Endpoint ----------------
 @app.post("/get_graph_context",
           summary="Generate and execute dynamic Cypher queries using few-shot learning based on graph stats")
@@ -354,7 +364,8 @@ def get_graph_context(request: GraphContextRequest):
 
     # Prepare parameters for Neo4j queries
     params = {
-        "doc_id": request.doc_id if isinstance(request.doc_id, list) else [request.doc_id]} if request.doc_id else {}
+        "doc_id": request.doc_id if isinstance(request.doc_id, list) else [request.doc_id]
+    } if request.doc_id else {}
 
     final_answers = []
     # Loop through each generated query object and execute queries
@@ -404,8 +415,30 @@ def get_graph_context(request: GraphContextRequest):
             "llm_response": llm_answer.strip()
         })
 
-    logger.debug(f"Final response: {json.dumps(final_answers, indent=2)}")
-    return final_answers
+    # Build the combined response by synthesizing all individual llm_responses
+    responses_for_combined = [answer["llm_response"] for answer in final_answers]
+    combined_prompt = build_combined_answer_prompt(request.question, responses_for_combined)
+    logger.debug(f"Combined prompt:\n{combined_prompt}")
+
+    try:
+        combined_llm_response = openai_client.call_chat_completion([
+            {"role": "system",
+             "content": "You are a professional assistant who synthesizes information from multiple sources."},
+            {"role": "user", "content": combined_prompt}
+        ])
+    except Exception as e:
+        combined_llm_response = f"LLM error: {e}"
+
+    # Return a top-level response that includes the original user question,
+    # the combined response, and the individual answers.
+    final_response = {
+        "user_question": request.question,
+        "combined_response": combined_llm_response.strip(),
+        "answers": final_answers
+    }
+
+    logger.debug(f"Final response: {json.dumps(final_response, indent=2)}")
+    return final_response
 
 
 if __name__ == "__main__":
