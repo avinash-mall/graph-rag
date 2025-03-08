@@ -184,7 +184,10 @@ def build_cypher_questions_prompt(question: str, summary: str, nodes: list, edge
     available_labels = list(graph_stats.get("nodeCounts", {}).keys())
     available_rels = list(graph_stats.get("edgeCounts", {}).keys())
 
-    prompt = f"""<context> You are an expert in graph databases and Cypher queries. Your task is to generate insightful questions and corresponding Cypher queries strictly using the available node labels and relationship types. Your output must be a JSON array (without markdown formatting) where each element is an object with the keys: "question", "standard_query", "fuzzy_query", "general_query", and "explanation". </context>
+    prompt = f"""<context> You are an expert in graph databases and Cypher queries. Your task is to generate 
+    insightful questions and corresponding Cypher queries strictly using the available node labels and relationship 
+    types. Your output must be a JSON array (without markdown formatting) where each element is an object with the 
+    keys: "question", "standard_query", "fuzzy_query", "general_query", and "explanation". </context>
 
 <user_question>
   {question}
@@ -258,7 +261,7 @@ Fuzzy Query Output:
 General Query Output:
 {json.dumps(query_context.get('general_query_output'), indent=2)}
 
-Provide a concise and insightful answer to the user's query based solely on the information above. Do not include any 
+Provide a detailed and insightful answer to the user's query based solely on the information above without using your prior knowledge. Do not include any 
 extra commentary or markdown formatting."""
     return prompt.strip()
 
@@ -338,7 +341,7 @@ def build_combined_answer_prompt(user_question: str, responses: list) -> str:
     prompt += "The following responses were generated for different aspects of your query:\n"
     for idx, resp in enumerate(responses, start=1):
         prompt += f"{idx}. {resp}\n"
-    prompt += ("\nBased on the above responses, please provide a comprehensive and concise final answer "
+    prompt += ("\nBased on the above responses, please provide a comprehensive and detailed final answer "
                "that directly addresses the user's original question.")
     return prompt.strip()
 
@@ -348,7 +351,7 @@ def build_combined_answer_prompt(user_question: str, responses: list) -> str:
 def get_graph_context(request: GraphContextRequest):
     # Prepare human-friendly doc_id filter description
     doc_id_str = ", ".join(request.doc_id) if isinstance(request.doc_id, list) else (request.doc_id or "all documents")
-    summary_text = request.summary or f"Extract detailed graph context for {doc_id_str}."
+    summary_text = request.summary or f"Extract detailed graph context."
 
     # Build prompt with enhanced instructions and examples
     prompt = build_cypher_questions_prompt(request.question, summary_text, request.nodes, request.edges)
@@ -404,7 +407,8 @@ def get_graph_context(request: GraphContextRequest):
             llm_answer = openai_client.call_chat_completion([
                 {"role": "system",
                  "content": ("You are a professional assistant who answers queries concisely based solely on the "
-                             "Neo4j cypher query outputs provided. Do not include any additional commentary.")},
+                             "Neo4j cypher query outputs provided without using your prior knowledge. Do not include "
+                             "any additional commentary.")},
                 {"role": "user", "content": answer_prompt}
             ])
         except Exception as e:
@@ -423,7 +427,8 @@ def get_graph_context(request: GraphContextRequest):
     try:
         combined_llm_response = openai_client.call_chat_completion([
             {"role": "system",
-             "content": "You are a professional assistant who synthesizes information from multiple sources."},
+             "content": "You are a professional assistant who synthesizes information from multiple sources and "
+                        "provides a very detailed answer. Do not use your prior knowledge. Do not add any commentary."},
             {"role": "user", "content": combined_prompt}
         ])
     except Exception as e:
