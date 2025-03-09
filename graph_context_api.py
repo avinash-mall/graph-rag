@@ -37,7 +37,6 @@ app = FastAPI(
     version="1.0.0"
 )
 
-
 # ---------------- Neo4j Query Functions ----------------
 def run_cypher_query(query: str, parameters: Dict[str, Any] = {}) -> list:
     logger.debug(f"Running Cypher query: {query} with parameters: {parameters}")
@@ -50,7 +49,6 @@ def run_cypher_query(query: str, parameters: Dict[str, Any] = {}) -> list:
     except Exception as e:
         logger.error(f"Error executing query: {query}. Error: {e}")
         raise HTTPException(status_code=500, detail=f"Neo4j query execution error: {e}")
-
 
 def get_schema() -> str:
     query = """
@@ -84,7 +82,6 @@ def get_schema() -> str:
     results = run_cypher_query(query)
     return results[0].get('schema', "No schema found.") if results else "No schema found."
 
-
 def get_node_counts() -> dict:
     query = """
     MATCH (n)
@@ -94,7 +91,6 @@ def get_node_counts() -> dict:
     results = run_cypher_query(query)
     return {rec.get("nodeType"): rec.get("count") for rec in results}
 
-
 def get_edge_counts() -> dict:
     query = """
     MATCH ()-[r]->()
@@ -103,7 +99,6 @@ def get_edge_counts() -> dict:
     """
     results = run_cypher_query(query)
     return {rec.get("edgeType"): rec.get("count") for rec in results}
-
 
 def get_most_connected_nodes() -> list:
     query = """
@@ -115,7 +110,6 @@ def get_most_connected_nodes() -> list:
     """
     return run_cypher_query(query)
 
-
 def get_common_node_properties() -> list:
     query = """
     MATCH (n)
@@ -125,7 +119,6 @@ def get_common_node_properties() -> list:
     ORDER BY nodeType
     """
     return run_cypher_query(query)
-
 
 def get_relationship_patterns() -> list:
     query = """
@@ -137,12 +130,10 @@ def get_relationship_patterns() -> list:
     """
     return run_cypher_query(query)
 
-
 def generate_graph_structure() -> str:
     query = "CALL apoc.meta.schema() YIELD value RETURN value LIMIT 1"
     results = run_cypher_query(query)
     return str(results[0].get("value")) if results else "No graph structure found."
-
 
 def get_graph_stats() -> dict:
     return {
@@ -154,7 +145,6 @@ def get_graph_stats() -> dict:
         "relationshipPatterns": get_relationship_patterns(),
         "graphStructure": generate_graph_structure()
     }
-
 
 def reduce_graph_stats(stats: dict) -> dict:
     return {
@@ -170,13 +160,19 @@ def reduce_graph_stats(stats: dict) -> dict:
         "graphStructure": stats.get("graphStructure")
     }
 
-
 def get_reduced_graph_stats() -> dict:
     stats = get_graph_stats()
     reduced = reduce_graph_stats(stats)
     logger.debug(f"Reduced graph stats: {json.dumps(reduced, indent=2)}")
     return reduced
 
+# ---------------- Query Model Definition using Pydantic ----------------
+class QueryModel(BaseModel):
+    question: str
+    standard_query: str
+    fuzzy_query: str
+    general_query: str
+    explanation: str
 
 # ---------------- Prompt Builder Functions ----------------
 def build_cypher_questions_prompt(question: str, summary: str, nodes: list, edges: list) -> str:
@@ -246,7 +242,6 @@ Important 2: The output should be a JSON array where each element is an object w
 """
     return prompt.strip()
 
-
 def build_llm_answer_prompt(query_context: dict) -> str:
     prompt = f"""Given the data extracted from the graph database:
 
@@ -264,7 +259,6 @@ General Query Output:
 Provide a detailed and insightful answer to the user's query based solely on the information above without using your prior knowledge. Do not include any 
 extra commentary or markdown formatting."""
     return prompt.strip()
-
 
 # ---------------- OpenAI Client ----------------
 class OpenAIClient:
@@ -298,7 +292,6 @@ class OpenAIClient:
             logger.error(f"OpenAI API error: {e}")
             raise HTTPException(status_code=500, detail=f"OpenAI API error: {e}")
 
-
 # ---------------- LLM Call & JSON Parsing ----------------
 def call_llm_for_queries(prompt: str, client: OpenAIClient) -> str:
     messages = [
@@ -307,24 +300,21 @@ def call_llm_for_queries(prompt: str, client: OpenAIClient) -> str:
     ]
     return client.call_chat_completion(messages)
 
-
-def parse_llm_output(output: str) -> list:
+def parse_llm_output(output: str) -> List[QueryModel]:
     """
-    Parse the LLM output assuming it is strictly valid JSON.
-    The JSON should be an array of objects with keys:
+    Parse the LLM output.
+    The output should be a JSON array where each element has the keys:
     "question", "standard_query", "fuzzy_query", "general_query", and "explanation".
     """
     try:
-        queries = json.loads(output)
-        if not isinstance(queries, list):
-            raise ValueError("LLM output JSON is not an array")
-        logger.debug(f"Parsed queries: {json.dumps(queries, indent=2)}")
+        data = json.loads(output)
+        queries = [QueryModel.parse_obj(item) for item in data]
+        logger.debug(f"Parsed queries: {queries}")
         return queries
     except Exception as e:
-        logger.error(f"Failed to parse LLM output into JSON: {e}")
+        logger.error(f"Failed to parse LLM output using Pydantic: {e}")
         raise HTTPException(status_code=500,
-                            detail="Failed to parse LLM output into JSON. Please check the LLM output format.")
-
+                            detail=f"Failed to parse LLM output using Pydantic: {e}")
 
 # ---------------- Request Model ----------------
 class GraphContextRequest(BaseModel):
@@ -333,8 +323,6 @@ class GraphContextRequest(BaseModel):
     summary: str = ""
     nodes: list = []
     edges: list = []
-
-
 
 def build_combined_answer_prompt(user_question: str, responses: list) -> str:
     prompt = f"User Question: {user_question}\n\n"
@@ -351,7 +339,7 @@ def build_combined_answer_prompt(user_question: str, responses: list) -> str:
 def get_graph_context(request: GraphContextRequest):
     # Prepare human-friendly doc_id filter description
     doc_id_str = ", ".join(request.doc_id) if isinstance(request.doc_id, list) else (request.doc_id or "all documents")
-    summary_text = request.summary or f"Extract detailed graph context."
+    summary_text = request.summary or "Extract detailed graph context."
 
     # Build prompt with enhanced instructions and examples
     prompt = build_cypher_questions_prompt(request.question, summary_text, request.nodes, request.edges)
@@ -373,11 +361,11 @@ def get_graph_context(request: GraphContextRequest):
     final_answers = []
     # Loop through each generated query object and execute queries
     for query_obj in generated_queries:
-        question_text = query_obj.get("question")
+        question_text = query_obj.question
         query_types = {
-            "standard_query": query_obj.get("standard_query", ""),
-            "fuzzy_query": query_obj.get("fuzzy_query", ""),
-            "general_query": query_obj.get("general_query", "")
+            "standard_query": query_obj.standard_query,
+            "fuzzy_query": query_obj.fuzzy_query,
+            "general_query": query_obj.general_query
         }
         query_outputs = {}
         for key, query in query_types.items():
@@ -398,7 +386,7 @@ def get_graph_context(request: GraphContextRequest):
             "fuzzy_query_output": query_outputs["fuzzy_query_output"],
             "general_query": query_types["general_query"],
             "general_query_output": query_outputs["general_query_output"],
-            "explanation": query_obj.get("explanation", "")
+            "explanation": query_obj.explanation
         }
         answer_prompt = build_llm_answer_prompt(query_context)
         logger.debug(f"Answer prompt for question '{question_text}':\n{answer_prompt}")
@@ -427,8 +415,7 @@ def get_graph_context(request: GraphContextRequest):
     try:
         combined_llm_response = openai_client.call_chat_completion([
             {"role": "system",
-             "content": "You are a professional assistant who synthesizes information from multiple sources and "
-                        "provides a very detailed answer. Do not use your prior knowledge. Do not add any commentary."},
+             "content": "You are a professional assistant who synthesizes information from multiple sources and provides a very detailed answer. Do not use your prior knowledge. Do not add any commentary."},
             {"role": "user", "content": combined_prompt}
         ])
     except Exception as e:
@@ -445,8 +432,6 @@ def get_graph_context(request: GraphContextRequest):
     logger.debug(f"Final response: {json.dumps(final_response, indent=2)}")
     return final_response
 
-
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run(app, host="0.0.0.0", port=8002)
