@@ -52,6 +52,8 @@ load_dotenv()
 def run_query(session, query_str: str, **params):
     return session.run(Query(query_str), **params)
 
+timeout = float(os.getenv("API_TIMEOUT", "600"))
+
 # =============================================================================
 # Logger Setup
 # =============================================================================
@@ -95,7 +97,7 @@ def remote_extract_flair_entities(text: str) -> List[Dict[str, str]]:
             f"{os.getenv('FLAIR_API_URL', 'http://localhost:8001')}/extract_flair_entities",
             json={"text": text},
             verify=False,
-            timeout=10
+            timeout=timeout
         )
         resp.raise_for_status()
         return resp.json().get("entities", [])
@@ -103,14 +105,13 @@ def remote_extract_flair_entities(text: str) -> List[Dict[str, str]]:
         global_logger.error(f"Error calling remote extract_flair_entities: {e}")
         raise
 
-
 def remote_chunk_text(text: str, max_chunk_size: int) -> List[str]:
     try:
         resp = requests.post(
             f"{FLAIR_API_URL}/chunk_text",
             json={"text": text, "max_chunk_size": max_chunk_size},
             verify=False,
-            timeout=10
+            timeout=timeout
         )
         resp.raise_for_status()
         return resp.json().get("chunks", [])
@@ -132,7 +133,7 @@ class EmbeddingAPIClient:
             response = requests.post(
                 self.embedding_api_url,
                 json={"input": text, "model": "mxbai-embed-large"},
-                timeout=30
+                timeout=timeout
             )
             response.raise_for_status()
             embedding = response.json().get("embedding", [])
@@ -309,7 +310,6 @@ class VectorManager:
             self.logger.error("Error deleting documents from Elasticsearch for doc_id %s: %s", doc_id, e)
             raise HTTPException(status_code=500, detail=f"Error deleting documents from Elasticsearch for doc_id {doc_id}")
 
-
     def index_documents(self, chunks: List[str], embeddings: List[List[float]], metadata_list: List[Dict[str, Any]]) -> None:
         self.logger.info("Indexing %d documents into Elasticsearch...", len(chunks))
         for i, (chunk, emb, meta) in enumerate(zip(chunks, embeddings, metadata_list)):
@@ -475,7 +475,6 @@ class GraphManager:
                         run_query(session, rel_query, source=source, target=target, weight=weight, doc_id=doc_id)
         self.logger.info("Graph construction complete.")
 
-
     def _merge_entity(self, session, name: str, doc_id: str, chunk_id: int):
         query = "MERGE (e:Entity {name: $name, doc_id: $doc_id}) MERGE (e)-[:MENTIONED_IN]->(c:Chunk {id: $cid, doc_id: $doc_id})"
         run_query(session, query, name=name, doc_id=doc_id, cid=chunk_id)
@@ -605,23 +604,42 @@ class QueryHandler:
             {"role": "system", "content": "You are a helpful assistant that answers questions using vector search context. Do not use your prior knowledge."},
             {"role": "user", "content": f"Query: {query}\n\nVector Context:\n{vector_context}\n\nAnswer based solely on this vector context."}
         ])
-        answer_gds = ""
-        if graph_context:
-            answer_gds = self.client.call_chat_completion([
-                {"role": "system", "content": "You are a helpful assistant that answers questions using graph context. Do not use your prior knowledge."},
-                {"role": "user", "content": f"Query: {query}\n\nGraph Context:\n{graph_context}\n\nAnswer based solely on this graph context."}
-            ])
-        else:
-            self.logger.warning("Graph context is empty; skipping GDS answer generation.")
 
-        combined_prompt = (
-            f"Query: {query}\n\n"
-            f"Vector Context:\n{vector_context}\n\n"
-            f"Graph Context:\n{graph_context}\n\n"
-            "Answer based solely on this combined information."
-        )
+        # Use external Graph Context API for answer_gds
+        GRAPH_CONTEXT_API_URL = os.getenv("GRAPH_CONTEXT_API_URL", "http://localhost:8002/get_graph_context")
+        filter_by_docid = os.getenv("FILTER_BY_DOCID", "false").lower() == "true"
+        payload = {
+            "question": query,
+            "summary": f"Extract detailed graph context for document {top_doc_id}" if filter_by_docid and top_doc_id else "Extract detailed graph context.",
+            "nodes": [],
+            "edges": []
+        }
+        if filter_by_docid and top_doc_id:
+            payload["doc_id"] = top_doc_id
+
+        try:
+            response = requests.post(GRAPH_CONTEXT_API_URL, json=payload, timeout=timeout)
+            response.raise_for_status()
+            gds_data = response.json()
+            answer_gds = gds_data.get("combined_response", "")
+        except Exception as e:
+            self.logger.error("Error calling Graph Context API: %s", e)
+            answer_gds = f"Error retrieving graph answer: {e}"
+
+        # Retrieve the sub-question responses (assumed to be in the "answers" field)
+        final_answers = gds_data.get("answers", [])
+
+        # Build the combined prompt using answer_vector and the sub-question responses.
+        combined_prompt = f"Query: {query}\n\n"
+        combined_prompt += f"Answer from Vector Search:\n{answer_vector}\n\n"
+        combined_prompt += "Sub-question Responses:\n"
+        for item in final_answers:
+            combined_prompt += f"Question: {item.get('question', '')}\n"
+            combined_prompt += f"Answer: {item.get('llm_response', '')}\n\n"
+        combined_prompt += "Using the above context, provide a final comprehensive answer that directly addresses the query."
+
         answer_combined = self.client.call_chat_completion([
-            {"role": "system", "content": "You are a professional assistant that answers questions using both vector search context and graph data context. Answer in as much detail as possible while remaining relevant to the query."},
+            {"role": "system", "content": "You are a professional assistant that synthesizes information from multiple sources. Provide a detailed and comprehensive answer."},
             {"role": "user", "content": combined_prompt}
         ])
         self.logger.info("Query processing complete.")
@@ -657,7 +675,7 @@ class OpenAIClient:
                 self.base_url,
                 headers={"Authorization": f"Bearer {self.api_key}"},
                 json=payload,
-                timeout=600,
+                timeout=timeout,
                 verify=False
             )
             response.raise_for_status()
@@ -785,7 +803,6 @@ async def delete_document(doc_id: str) -> JSONResponse:
             "errors": errors
         })
 
-
 class QueryRequest(BaseModel):
     query: str
 
@@ -802,3 +819,7 @@ async def ask_question(req: QueryRequest) -> JSONResponse:
 db_connection = GraphDatabaseConnection(uri=os.getenv("DB_URL"), user=os.getenv("DB_USERNAME"), password=os.getenv("DB_PASSWORD"))
 graph_manager = GraphManager(db_connection, clear_on_startup=False)
 query_handler = QueryHandler(graph_manager, OpenAIClient())
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
