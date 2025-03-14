@@ -27,7 +27,8 @@ from flair.data import Sentence
 
 import PyPDF2
 import docx
-
+import re
+import json
 # -----------------------------------------------------------------------------
 # Load Environment Variables and Setup Logging
 # -----------------------------------------------------------------------------
@@ -72,9 +73,55 @@ class OpenAI:
 # -----------------------------------------------------------------------------
 # Helper Functions for Neo4j Queries and Graph Statistics
 # -----------------------------------------------------------------------------
+def parse_multiple_json_arrays(response: str) -> List[Dict[str, Any]]:
+    """
+    Extracts all JSON arrays from a response string and merges them into a single list.
+    """
+    # Find all substrings that look like JSON arrays.
+    arrays = re.findall(r'\[.*?\]', response, re.DOTALL)
+    combined = []
+    for arr in arrays:
+        try:
+            data = json.loads(arr)
+            if isinstance(data, list):
+                combined.extend(data)
+        except Exception as e:
+            logger.error(f"Error parsing JSON array: {e}. Array: {arr}")
+    return combined
+    
+def process_chunk_batch(chunks: List[str], question: str, llm_instance: OpenAI) -> List[Dict[str, Any]]:
+    """
+    Processes a batch of community report chunks in a single LLM call.
+    Returns a list of extracted key point objects with 'chunk_index', 'point', and 'rating'.
+    """
+    batch_prompt = (
+        "You are an expert in extracting key information. For each of the following community report chunks, "
+        "extract key points that are relevant for answering the user query. For each chunk, output an object with "
+        "'chunk_index' (the index number of the chunk in the batch), 'point' (a short text string), and 'rating' "
+        "(a numerical value between 1 and 100 indicating its importance). "
+        "Return only a valid JSON array (with no extra commentary)."
+    )
+    for idx, chunk in enumerate(chunks):
+        batch_prompt += f"\n\nChunk {idx}:\n\"\"\"\n{chunk}\n\"\"\""
+    batch_prompt += f"\n\nUser Query:\n\"\"\"\n{question}\n\"\"\""
+    
+    try:
+        response = llm_instance.invoke([
+            {"role": "system", "content": "You are a professional extraction assistant."},
+            {"role": "user", "content": batch_prompt}
+        ])
+        # Remove markdown code fences if present
+        cleaned_response = clean_json_response(response)
+        # Parse all JSON arrays found in the cleaned response
+        points = parse_multiple_json_arrays(cleaned_response)
+        return points
+    except Exception as e:
+        logger.error(f"Batch processing error: {e}. Response was: {response}")
+    return []
+
+
 def clean_json_response(response: str) -> str:
     response = response.strip()
-    # Remove markdown code fences if present
     if response.startswith("```") and response.endswith("```"):
         lines = response.splitlines()
         if len(lines) >= 3:
@@ -82,6 +129,7 @@ def clean_json_response(response: str) -> str:
         else:
             response = ""
     return response
+
     
 def run_cypher_query(query: str, parameters: Dict[str, Any] = {}) -> List[Dict[str, Any]]:
     logger.debug(f"Running Cypher query: {query} with parameters: {parameters}")
@@ -553,51 +601,32 @@ def generate_community_summaries(doc_id: Optional[str] = None) -> dict:
 # -----------------------------------------------------------------------------
 # Global Search Map-Reduce Implementation
 # -----------------------------------------------------------------------------
-def global_search_map_reduce(question: str, conversation_history: Optional[str] = None, chunk_size: int = 512, top_n: int = 5) -> str:
-    # Generate community summaries
+def global_search_map_reduce(question: str, conversation_history: Optional[str] = None, chunk_size: int = 512, top_n: int = 5, batch_size: int = 20) -> str:
+    # Generate community summaries (for all communities in the dataset)
     summaries = generate_community_summaries(doc_id=None)
     community_reports = list(summaries.values())
     random.shuffle(community_reports)
     
+    # Prepare LLM configuration using the OpenAI instance
     llm_instance = OpenAI(api_key=os.getenv("OPENAI_API_KEY"),
                           model=os.getenv("OPENAI_MODEL", "gpt-3.5-turbo"),
                           base_url=os.getenv("OPENAI_BASE_URL"),
                           temperature=float(os.getenv("OPENAI_TEMPERATURE", "0.0")))
-    intermediate_points = []
+    
+    # Gather all chunks from all community reports
+    all_chunks = []
     for report in community_reports:
         chunks = chunk_text(report, max_chunk_size=chunk_size)
-        for chunk in chunks:
-            map_prompt = f"""
-You are an expert in extracting key information. Given the following community report chunk and the user query, extract key points that are relevant for answering the query.
-For each key point, output an object with two keys: "point" (a short text string) and "rating" (a numerical value between 1 and 100 indicating its importance).
-Return only a valid JSON array (and nothing else).
-
-Community Report Chunk:
-\"\"\"{chunk}\"\"\"
-
-User Query:
-\"\"\"{question}\"\"\"
-            """.strip()
-            try:
-                map_response = llm_instance.invoke([
-                    {"role": "system", "content": "You are a professional extraction assistant."},
-                    {"role": "user", "content": map_prompt}
-                ])
-                if not map_response.strip():
-                    logger.warning("LLM returned an empty response for this chunk. Skipping.")
-                    continue
-                # Clean the response to remove markdown formatting
-                cleaned_response = clean_json_response(map_response)
-                try:
-                    points = json.loads(cleaned_response)
-                except Exception as json_e:
-                    logger.error(f"JSON parsing error: {json_e}. Raw response after cleaning: {cleaned_response}")
-                    continue  # Skip this chunk if JSON parsing fails
-                if isinstance(points, list):
-                    intermediate_points.extend(points)
-            except Exception as e:
-                logger.error(f"Map step error for chunk: {e}")
+        all_chunks.extend(chunks)
     
+    # Batch the chunks (for example, batch_size = 5)
+    intermediate_points = []
+    for i in range(0, len(all_chunks), batch_size):
+        batch = all_chunks[i:i+batch_size]
+        batch_points = process_chunk_batch(batch, question, llm_instance)
+        intermediate_points.extend(batch_points)
+    
+    # Sort the intermediate points by rating (descending) and select top_n
     intermediate_points_sorted = sorted(intermediate_points, key=lambda x: x.get("rating", 0), reverse=True)
     selected_points = intermediate_points_sorted[:top_n]
     aggregated_context = "\n".join([f"{pt['point']} (Rating: {pt['rating']})" for pt in selected_points])
@@ -611,6 +640,7 @@ Aggregated Key Points:
 {conv_text}User Query:
 \"\"\"{question}\"\"\"
     """.strip()
+    
     try:
         final_answer = llm_instance.invoke([
             {"role": "system", "content": "You are a professional assistant skilled in synthesizing information."},
@@ -619,6 +649,7 @@ Aggregated Key Points:
     except Exception as e:
         final_answer = f"Error during reduce step: {e}"
     return final_answer
+
 
 # -----------------------------------------------------------------------------
 # Helper Functions for Local and Community Context (for Local/DRIFT search)
