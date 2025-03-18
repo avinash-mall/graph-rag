@@ -1,20 +1,18 @@
 import os
 import re
 import json
-import time
 import string
 import uuid
 import logging
 import random
 from datetime import datetime
-from typing import List, Dict, Any, Optional, Union
-
+from typing import List, Dict, Any, Optional, Union, Tuple
+import math
 import requests
 import blingfire
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from pydantic import BaseModel
 from dotenv import load_dotenv
-
 from neo4j import GraphDatabase
 
 # Import Text2CypherRetriever from neo4j_graphrag package
@@ -24,60 +22,299 @@ from neo4j_graphrag.retrievers.text2cypher import Text2CypherRetriever
 from langdetect import detect
 from flair.models import SequenceTagger
 from flair.data import Sentence
-
+import hashlib
 import PyPDF2
 import docx
-import re
-import json
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+import spacy
+import neuralcoref
+
+# Load spaCy model for NLP and add NeuralCoref
+nlp = spacy.load('en_core_web_sm')
+neuralcoref.add_to_pipe(nlp)
+
 # -----------------------------------------------------------------------------
-# Load Environment Variables and Setup Logging
+# Load Environment Variables from .env
 # -----------------------------------------------------------------------------
 load_dotenv()
-logging.basicConfig(level=logging.DEBUG)
+
+# Application & Global Configuration
+APP_HOST = os.getenv("APP_HOST") or "0.0.0.0"
+APP_PORT = int(os.getenv("APP_PORT") or "8000")
+
+# Graph & Neo4j Configuration
+GRAPH_NAME = os.getenv("GRAPH_NAME")
+DB_URL = os.getenv("DB_URL")
+DB_USERNAME = os.getenv("DB_USERNAME")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
+
+# OpenAI Configuration
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL") or "gpt-3.5-turbo"
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")
+OPENAI_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE") or "0.0")
+OPENAI_STOP = json.loads(os.getenv("OPENAI_STOP") or '["<|end_of_text|>", "<|eot_id|>"]')
+
+# Chunking & Global Search Defaults
+CHUNK_SIZE_GDS = int(os.getenv("CHUNK_SIZE_GDS") or "1024")
+GLOBAL_SEARCH_CHUNK_SIZE = int(os.getenv("GLOBAL_SEARCH_CHUNK_SIZE") or "1024")
+GLOBAL_SEARCH_TOP_N = int(os.getenv("GLOBAL_SEARCH_TOP_N") or "5")
+GLOBAL_SEARCH_BATCH_SIZE = int(os.getenv("GLOBAL_SEARCH_BATCH_SIZE") or "20")
+RELEVANCE_THRESHOLD = float(os.getenv("RELEVANCE_THRESHOLD") or "0.1")
+
+# -----------------------------------------------------------------------------
+# Logging Setup
+# -----------------------------------------------------------------------------
+# Logging Configuration
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+LOG_DIR = os.getenv("LOG_DIR", "logs")
+LOG_FILE = os.getenv("LOG_FILE", "app.log")
+# Ensure log directory exists
+os.makedirs(LOG_DIR, exist_ok=True)
+
+# Setup logging
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(os.path.join(LOG_DIR, LOG_FILE)),
+        logging.StreamHandler()
+    ]
+)
+
 logger = logging.getLogger("GraphRAG")
-
-# Global constant for the projected graph name.
-GRAPH_NAME = os.getenv("GRAPH_NAME", "entityGraph")
-
-# -----------------------------------------------------------------------------
-# Neo4j Configuration & Driver Initialization
-# -----------------------------------------------------------------------------
-NEO4J_URI = os.getenv("DB_URL", "bolt://localhost:7687")
-NEO4J_USERNAME = os.getenv("DB_USERNAME", "neo4j")
-NEO4J_PASSWORD = os.getenv("DB_PASSWORD", "neo4j")
-driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USERNAME, NEO4J_PASSWORD))
+logger.info(f"Logging initialized with level: {LOG_LEVEL}")
+llm_logger = logging.getLogger("LLM_API")  # Logger for LLM API calls
 
 # -----------------------------------------------------------------------------
-# OpenAI LLM Class with Base URL (implements invoke)
+# Neo4j Driver Setup
+# -----------------------------------------------------------------------------
+driver = GraphDatabase.driver(DB_URL, auth=(DB_USERNAME, DB_PASSWORD))
+
+# -----------------------------------------------------------------------------
+# Pydantic Models for Request Bodies (defined only once)
+# -----------------------------------------------------------------------------
+class QuestionRequest(BaseModel):
+    question: str
+    doc_id: Optional[Union[str, List[str]]] = None
+    previous_conversations: Optional[str] = None
+
+class DeleteDocumentRequest(BaseModel):
+    doc_id: Optional[str] = None
+    document_name: Optional[str] = None
+
+class LocalSearchRequest(BaseModel):
+    entity: str
+    question: str
+
+class DriftSearchRequest(BaseModel):
+    entity: str
+    question: str
+
+# -----------------------------------------------------------------------------
+# NER Extraction using Flair (defined only once)
+# -----------------------------------------------------------------------------
+model_cache = {}
+DEFAULT_MODEL_MAP = {
+    'en': 'ner-large',
+    'de': 'de-ner-large',
+    'es': 'es-ner-large',
+    'nl': 'nl-ner-large',
+    'fr': 'ner-ner',
+    'da': 'da-ner',
+    'ar': 'ar-ner',
+    'uk': 'ner-ukrainian'
+}
+
+def extract_flair_entities(text: str) -> List[Dict[str, str]]:
+    try:
+        lang = detect(text).lower()
+    except Exception:
+        lang = 'en'
+    if '-' in lang:
+        lang = lang.split('-')[0]
+    model_name = DEFAULT_MODEL_MAP.get(lang, 'ner-large')
+    if model_name in model_cache:
+        tagger = model_cache[model_name]
+    else:
+        try:
+            tagger = SequenceTagger.load(model_name)
+            model_cache[model_name] = tagger
+        except Exception as e:
+            raise Exception(f"Failed to load model {model_name}: {e}")
+    sentence_strs = [s.strip() for s in blingfire.text_to_sentences(text).splitlines() if s.strip()]
+    sentences = [Sentence(s) for s in sentence_strs]
+    try:
+        tagger.predict(sentences, mini_batch_size=32)
+    except Exception as e:
+        raise Exception(f"NER prediction error: {e}")
+    entities = {}
+    for sentence in sentences:
+        for label in sentence.get_labels():
+            key = (label.data_point.text, label.value)
+            entities[key] = {"name": label.data_point.text, "label": label.value}
+    return list(entities.values())
+
+# -----------------------------------------------------------------------------
+# Embedding API Client for Dynamic Community Selection
+# -----------------------------------------------------------------------------
+class EmbeddingAPIClient:
+    def __init__(self):
+        self.embedding_api_url = os.getenv("EMBEDDING_API_URL", "https://s-ailabs-gpu5.westeurope.cloudapp.azure.com/api/embed")
+        self.timeout = float(os.getenv("API_TIMEOUT", "600"))
+        self.logger = logging.getLogger("EmbeddingAPIClient")
+        self.logger.setLevel(logging.INFO)
+        self.cache = {}  # Local in-memory cache to avoid redundant requests
+
+    def _get_text_hash(self, text: str) -> str:
+        """Generate a hash for the input text for deduplication."""
+        return hashlib.md5(text.encode('utf-8')).hexdigest()
+
+    def get_embedding(self, text: str) -> List[float]:
+        text_hash = self._get_text_hash(text)
+
+        if text_hash in self.cache:
+            self.logger.info(f"✅ Embedding for text (hash: {text_hash}) retrieved from cache.")
+            return self.cache[text_hash]
+
+        self.logger.info("🔍 Requesting embedding for text (first 50 chars): %s", text[:50])
+
+        try:
+            response = requests.post(
+                self.embedding_api_url,
+                json={"model": "mxbai-embed-large", "input": text},
+                headers={"Content-Type": "application/json"},
+                timeout=self.timeout,
+                verify=False  # Skipping SSL verification as per request
+            )
+            response.raise_for_status()
+
+            # Correctly extract embeddings
+            embedding = response.json().get("embeddings", [[]])[0]
+
+            if not embedding:
+                raise ValueError(f"⚠️ Empty embedding returned for text: {text[:50]}")
+
+            self.logger.debug("✅ Received embedding of length: %d", len(embedding))
+
+            # Cache the embedding to avoid redundant requests
+            self.cache[text_hash] = embedding
+            return embedding
+
+        except requests.exceptions.RequestException as e:
+            self.logger.error(f"❌ Embedding API error for text (hash: {text_hash}): {e}")
+            raise HTTPException(status_code=500, detail="Error in embedding API request")
+
+    def get_embeddings(self, texts: List[str]) -> List[List[float]]:
+        return [self.get_embedding(text) for text in texts]
+
+
+
+# Instantiate the improved embedding client
+embedding_client = EmbeddingAPIClient()
+
+def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
+    from numpy import dot
+    from numpy.linalg import norm
+    return dot(vec1, vec2) / (norm(vec1) * norm(vec2) + 1e-8)
+
+def select_relevant_communities(
+    query: str,
+    community_reports: List[Union[str, dict]],
+    top_k: int = GLOBAL_SEARCH_TOP_N,
+    threshold: float = RELEVANCE_THRESHOLD
+) -> List[Tuple[str, float]]:
+    query_embedding = embedding_client.get_embedding(query)
+    scored_reports = []
+    for report in community_reports:
+        if isinstance(report, dict) and "embedding" in report:
+            report_embedding = report["embedding"]
+            summary_text = report["summary"]
+        else:
+            summary_text = report
+            report_embedding = embedding_client.get_embedding(report)
+        score = cosine_similarity(query_embedding, report_embedding)
+        logger.info("Computed cosine similarity for community report snippet '%s...' is %.4f", summary_text[:50], score)
+        if score >= threshold:
+            scored_reports.append((summary_text, score))
+        else:
+            logger.info("Filtered out community report snippet '%s...' with score %.4f (threshold: %.2f)", summary_text[:50], score, threshold)
+    scored_reports.sort(key=lambda x: x[1], reverse=True)
+    logger.info("Selected community reports after filtering:")
+    for rep, score in scored_reports:
+        logger.info("Score: %.4f, Snippet: %s", score, rep[:100])
+    return scored_reports[:top_k]
+
+def clean_empty_chunks():
+    """Removes any chunks in the database that have no text."""
+    query = """
+    MATCH (c:Chunk)
+    WHERE c.text IS NULL OR TRIM(c.text) = ""
+    DETACH DELETE c
+    """
+    try:
+        deleted_count = run_cypher_query(query)
+        logger.info(f"✅ Cleaned up {len(deleted_count)} empty or invalid chunks from the database.")
+    except Exception as e:
+        logger.error(f"❌ Error cleaning empty chunks: {e}")
+
+def clean_empty_nodes():
+    """Removes any nodes in the database that have no properties or relationships."""
+    query = """
+    MATCH (n)
+    WHERE size(keys(n)) = 0 AND NOT (n)-[]-()
+    DELETE n
+    """
+    try:
+        deleted_count = run_cypher_query(query)
+        logger.info(f"✅ Cleaned up {len(deleted_count)} empty nodes from the database.")
+    except Exception as e:
+        logger.error(f"❌ Error cleaning empty nodes: {e}")
+
+
+def resolve_coreferences(text: str) -> str:
+    """Resolves pronouns using NeuralCoref and returns the improved text."""
+    try:
+        doc = nlp(text)
+        resolved_text = doc._.coref_resolved  # Coreference-resolved text
+        return resolved_text
+    except Exception as e:
+        logger.warning(f"Coreference resolution failed: {e}")
+        return text  # Return original text in case of errors
+        
+
+# -----------------------------------------------------------------------------
+# OpenAI LLM Class
 # -----------------------------------------------------------------------------
 class OpenAI:
-    def __init__(self, api_key: str, model: str = "gpt-3.5-turbo",
-                 base_url: str = "https://api.openai.com/v1/chat/completions", temperature: float = 0.0):
+    def __init__(self, api_key: str, model: str, base_url: str, temperature: float, stop: List[str]):
         self.api_key = api_key
         self.model = model
         self.base_url = base_url
         self.temperature = temperature
+        self.stop = stop
 
     def invoke(self, messages: List[Dict[str, str]]) -> str:
         payload = {
             "model": self.model,
             "messages": messages,
-            "temperature": self.temperature
+            "temperature": self.temperature,
+            "stop": self.stop
         }
+        llm_logger.info("LLM Request Payload: %s", messages)
         headers = {"Authorization": f"Bearer {self.api_key}"}
-        response = requests.post(self.base_url, json=payload, headers=headers, timeout=60, verify=False)
+        response = requests.post(self.base_url, json=payload, headers=headers,
+                                 timeout=60, verify=False)
         response.raise_for_status()
         output = response.json()["choices"][0]["message"]["content"]
         return output.strip()
 
 # -----------------------------------------------------------------------------
-# Helper Functions for Neo4j Queries and Graph Statistics
+# Utility Functions: JSON Cleaning, Text Processing, and Chunking
 # -----------------------------------------------------------------------------
 def parse_multiple_json_arrays(response: str) -> List[Dict[str, Any]]:
-    """
-    Extracts all JSON arrays from a response string and merges them into a single list.
-    """
-    # Find all substrings that look like JSON arrays.
     arrays = re.findall(r'\[.*?\]', response, re.DOTALL)
     combined = []
     for arr in arrays:
@@ -88,49 +325,41 @@ def parse_multiple_json_arrays(response: str) -> List[Dict[str, Any]]:
         except Exception as e:
             logger.error(f"Error parsing JSON array: {e}. Array: {arr}")
     return combined
-    
-def process_chunk_batch(chunks: List[str], question: str, llm_instance: OpenAI) -> List[Dict[str, Any]]:
-    """
-    Processes a batch of community report chunks in a single LLM call.
-    Returns a list of extracted key point objects with 'chunk_index', 'point', and 'rating'.
-    """
-    batch_prompt = (
-        "You are an expert in extracting key information. For each of the following community report chunks, "
-        "extract key points that are relevant for answering the user query. For each chunk, output an object with "
-        "'chunk_index' (the index number of the chunk in the batch), 'point' (a short text string), and 'rating' "
-        "(a numerical value between 1 and 100 indicating its importance). "
-        "Return only a valid JSON array (with no extra commentary)."
-    )
-    for idx, chunk in enumerate(chunks):
-        batch_prompt += f"\n\nChunk {idx}:\n\"\"\"\n{chunk}\n\"\"\""
-    batch_prompt += f"\n\nUser Query:\n\"\"\"\n{question}\n\"\"\""
-    
-    try:
-        response = llm_instance.invoke([
-            {"role": "system", "content": "You are a professional extraction assistant."},
-            {"role": "user", "content": batch_prompt}
-        ])
-        # Remove markdown code fences if present
-        cleaned_response = clean_json_response(response)
-        # Parse all JSON arrays found in the cleaned response
-        points = parse_multiple_json_arrays(cleaned_response)
-        return points
-    except Exception as e:
-        logger.error(f"Batch processing error: {e}. Response was: {response}")
-    return []
-
 
 def clean_json_response(response: str) -> str:
     response = response.strip()
     if response.startswith("```") and response.endswith("```"):
         lines = response.splitlines()
-        if len(lines) >= 3:
-            response = "\n".join(lines[1:-1])
-        else:
-            response = ""
+        response = "\n".join(lines[1:-1])
     return response
 
+def clean_text(text: str) -> str:
+    return ''.join(filter(lambda x: x in string.printable, text.strip()))
+
+def chunk_text(text: str, max_chunk_size: int = 512) -> List[str]:
+    sentences = [s.strip() for s in blingfire.text_to_sentences(text).splitlines() if s.strip()]
     
+    # Deduplicate sentences to avoid repeats
+    unique_sentences = list(set(sentences))
+    
+    chunks = []
+    current_chunk = ""
+
+    for s in unique_sentences:
+        if current_chunk and (len(current_chunk) + len(s) + 1) > max_chunk_size:
+            chunks.append(current_chunk.strip())
+            current_chunk = s
+        else:
+            current_chunk = s if not current_chunk else current_chunk + " " + s
+
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+
+    return chunks
+
+# -----------------------------------------------------------------------------
+# Neo4j Query Runner and Graph Statistics Functions
+# -----------------------------------------------------------------------------
 def run_cypher_query(query: str, parameters: Dict[str, Any] = {}) -> List[Dict[str, Any]]:
     logger.debug(f"Running Cypher query: {query} with parameters: {parameters}")
     try:
@@ -143,110 +372,10 @@ def run_cypher_query(query: str, parameters: Dict[str, Any] = {}) -> List[Dict[s
         logger.error(f"Error executing query: {query}. Error: {e}")
         raise HTTPException(status_code=500, detail=f"Neo4j query execution error: {e}")
 
-def get_schema() -> str:
-    query = """
-    CALL apoc.meta.schema({ includeLabels: true, includeRels: true, sample: -1 })
-    YIELD value
-    UNWIND keys(value) as label
-    WITH label, value[label] as data
-    WHERE data.type = "node"
-    MATCH (n)
-    OPTIONAL MATCH (n)-[r]->(m)
-    WITH label, data, collect(DISTINCT { type: type(r), direction: "outgoing", targetLabel: head(labels(m)) }) as outRelations
-    OPTIONAL MATCH (n)<-[r]-(m)
-    WITH label, data, outRelations, collect(DISTINCT { type: type(r), direction: "incoming", sourceLabel: head(labels(m)) }) as inRelations
-    RETURN { label: label, properties: data.properties, outgoingRelationships: outRelations, incomingRelationships: inRelations } AS schema
-    LIMIT 1
-    """
-    results = run_cypher_query(query)
-    return results[0].get('schema', "No schema found.") if results else "No schema found."
-
-def get_node_counts() -> dict:
-    query = """
-    MATCH (n)
-    RETURN labels(n)[0] AS nodeType, count(*) AS count
-    ORDER BY count DESC
-    """
-    results = run_cypher_query(query)
-    return {rec.get("nodeType"): rec.get("count") for rec in results}
-
-def get_edge_counts() -> dict:
-    query = """
-    MATCH ()-[r]->()
-    RETURN type(r) AS edgeType, count(*) AS count
-    ORDER BY count DESC
-    """
-    results = run_cypher_query(query)
-    return {rec.get("edgeType"): rec.get("count") for rec in results}
-
-def get_most_connected_nodes() -> list:
-    query = """
-    MATCH (n)
-    OPTIONAL MATCH (n)-[r]-()
-    RETURN labels(n)[0] AS nodeType, n.name AS nodeName, COUNT(r) AS connections
-    ORDER BY connections DESC
-    LIMIT 5
-    """
-    return run_cypher_query(query)
-
-def get_common_node_properties() -> list:
-    query = """
-    MATCH (n)
-    UNWIND keys(n) AS key
-    WITH labels(n)[0] AS nodeType, key
-    RETURN nodeType, collect(DISTINCT key) AS properties
-    ORDER BY nodeType
-    """
-    return run_cypher_query(query)
-
-def get_relationship_patterns() -> list:
-    query = """
-    MATCH (a)-[r]->(b)
-    WITH labels(a)[0] + '-[' + type(r) + ']->' + labels(b)[0] AS pattern, count(*) AS count
-    RETURN pattern, count
-    ORDER BY count DESC
-    LIMIT 5
-    """
-    return run_cypher_query(query)
-
-def generate_graph_structure() -> str:
-    query = "CALL apoc.meta.schema() YIELD value RETURN value LIMIT 1"
-    results = run_cypher_query(query)
-    return str(results[0].get("value")) if results else "No graph structure found."
-
-def get_graph_stats() -> dict:
-    return {
-        "schema": get_schema(),
-        "nodeCounts": get_node_counts(),
-        "edgeCounts": get_edge_counts(),
-        "mostConnectedNodes": get_most_connected_nodes(),
-        "commonNodeProperties": get_common_node_properties(),
-        "relationshipPatterns": get_relationship_patterns(),
-        "graphStructure": generate_graph_structure()
-    }
-
-def reduce_graph_stats(stats: dict) -> dict:
-    return {
-        "schema": stats.get("schema"),
-        "nodeCounts": stats.get("nodeCounts"),
-        "edgeCounts": stats.get("edgeCounts"),
-        "mostConnectedNodes": stats.get("mostConnectedNodes", [])[:3],
-        "commonNodeProperties": [
-            {"nodeType": item.get("nodeType"), "properties": item.get("properties", [])[:5]}
-            for item in stats.get("commonNodeProperties", [])
-        ],
-        "relationshipPatterns": stats.get("relationshipPatterns", [])[:3],
-        "graphStructure": stats.get("graphStructure")
-    }
-
-def get_reduced_graph_stats() -> dict:
-    stats = get_graph_stats()
-    reduced = reduce_graph_stats(stats)
-    logger.debug(f"Reduced graph stats: {json.dumps(reduced, indent=2)}")
-    return reduced
+# (Additional graph statistics functions omitted for brevity)
 
 # -----------------------------------------------------------------------------
-# LLM Prompt Builders (for answer synthesis and combined response)
+# LLM Prompt Builders for Global Search (Batch Processing)
 # -----------------------------------------------------------------------------
 def build_llm_answer_prompt(query_context: dict) -> str:
     prompt = f"""Given the data extracted from the graph database:
@@ -273,62 +402,93 @@ def build_combined_answer_prompt(user_question: str, responses: List[str]) -> st
     return prompt.strip()
 
 # -----------------------------------------------------------------------------
-# Global Search Map-Reduce Implementation
+# Global Search Map-Reduce Implementation (with Dynamic Community Selection)
 # -----------------------------------------------------------------------------
-def global_search_map_reduce(question: str, conversation_history: Optional[str] = None, chunk_size: int = 512, top_n: int = 5) -> str:
-    # Generate community summaries (for all communities in the dataset)
-    summaries = generate_community_summaries(doc_id=None)
-    # Extract community report texts and shuffle them
+def global_search_map_reduce(question: str, conversation_history: Optional[str] = None,
+                             chunk_size: int = GLOBAL_SEARCH_CHUNK_SIZE,
+                             top_n: int = GLOBAL_SEARCH_TOP_N,
+                             batch_size: int = GLOBAL_SEARCH_BATCH_SIZE) -> str:
+    # Retrieve community summaries from Neo4j via the wrapper
+    summaries = graph_manager_wrapper.get_stored_community_summaries(doc_id=None)
+    if not summaries:
+        raise HTTPException(status_code=500, detail="No community summaries available. Please re-index the dataset.")
+    
     community_reports = list(summaries.values())
     random.shuffle(community_reports)
     
-    # Map step: Process each community report in chunks to extract intermediate key points with ratings.
-    llm_instance = OpenAI(api_key=os.getenv("OPENAI_API_KEY"),
-                          model=os.getenv("OPENAI_MODEL", "gpt-3.5-turbo"),
-                          base_url=os.getenv("OPENAI_BASE_URL"),
-                          temperature=float(os.getenv("OPENAI_TEMPERATURE", "0.0")))
-    intermediate_points = []
-    for report in community_reports:
-        chunks = chunk_text(report, max_chunk_size=chunk_size)
-        for chunk in chunks:
-            map_prompt = f"""
-You are an expert in extracting key information. Given the following community report chunk and the user query, extract key points that are relevant for answering the query. For each key point, provide a numerical rating (between 1 and 100) indicating its importance.
-Output your answer in JSON format as a list of objects, each with keys "point" and "rating".
-
-Community Report Chunk:
-\"\"\"{chunk}\"\"\"
-
-User Query:
-\"\"\"{question}\"\"\"
-            """.strip()
-            try:
-                map_response = llm_instance.invoke([
-                    {"role": "system", "content": "You are a professional extraction assistant."},
-                    {"role": "user", "content": map_prompt}
-                ])
-                points = json.loads(map_response)
-                if isinstance(points, list):
-                    intermediate_points.extend(points)
-            except Exception as e:
-                logger.error(f"Map step error for chunk: {e}")
+    # Enhanced Dynamic Community Selection: rank community reports using embeddings
+    selected_reports_with_scores = select_relevant_communities(question, community_reports)
+    if not selected_reports_with_scores:
+        # Fallback: use first top_n reports with default score 0
+        selected_reports_with_scores = [(report, 0) for report in community_reports[:top_n]]
     
-    # Reduce step: Aggregate and filter the intermediate points.
-    intermediate_points_sorted = sorted(intermediate_points, key=lambda x: x.get("rating", 0), reverse=True)
+    # Log the selected community reports and their scores
+    logger.info("Selected community reports for dynamic selection:")
+    for report, score in selected_reports_with_scores:
+        logger.info("Score: %.4f, Snippet: %s", score, report[:100])
+    
+    llm_instance = OpenAI(
+        api_key=OPENAI_API_KEY,
+        model=OPENAI_MODEL,
+        base_url=OPENAI_BASE_URL,
+        temperature=OPENAI_TEMPERATURE,
+        stop=OPENAI_STOP
+    )
+
+    intermediate_points = []
+    # Process each selected report
+    for report, _ in selected_reports_with_scores:
+        chunks = chunk_text(report, max_chunk_size=chunk_size)
+        for i in range(0, len(chunks), batch_size):
+            batch = chunks[i:i + batch_size]
+            batch_prompt = (
+                "You are an expert in extracting key information. For each of the following community report chunks, "
+                "extract key points that are relevant for answering the query. For each chunk, output an object with "
+                "'chunk_index' (the index number of the chunk in the batch), 'point' (a short text string), and 'rating' "
+                "(a numerical value between 1 and 100 indicating its importance). "
+                "Return only a valid JSON array (with no extra commentary)."
+            )
+            for idx, chunk in enumerate(batch):
+                batch_prompt += f"\n\nChunk {idx}:\n\"\"\"\n{chunk}\n\"\"\""
+            batch_prompt += f"\n\nUser Query:\n\"\"\"\n{question}\n\"\"\""
+            try:
+                response = llm_instance.invoke([
+                    {"role": "system", "content": "You are a professional extraction assistant who strictly follows user's request."},
+                    {"role": "user", "content": batch_prompt}
+                ])
+                cleaned_response = clean_json_response(response)
+                points = parse_multiple_json_arrays(cleaned_response)
+                intermediate_points.extend(points)
+            except Exception as e:
+                logger.error(f"Batch processing error: {e}.")
+    
+    # Log all intermediate key points before sorting
+    logger.info("Intermediate key points extracted (unsorted):")
+    for pt in intermediate_points:
+        logger.info("Key point: %s, Rating: %s", pt.get("point"), pt.get("rating"))
+    
+    # Sort intermediate points by rating (default missing rating to 0)
+    intermediate_points_sorted = sorted(intermediate_points, key=lambda x: x.get("rating") or 0, reverse=True)
     selected_points = intermediate_points_sorted[:top_n]
     aggregated_context = "\n".join([f"{pt['point']} (Rating: {pt['rating']})" for pt in selected_points])
     
     conv_text = f"Conversation History: {conversation_history}\n" if conversation_history else ""
     reduce_prompt = f"""
-You are a professional synthesizer. Given the following aggregated key points extracted from community reports and the user query, generate a comprehensive final answer.
-Aggregated Key Points:
-\"\"\"{aggregated_context}\"\"\"
+You are a professional synthesizer answering "User Query" from the provided "Aggregated Key Points". Format your final answer strictly as a raw JSON object (without any markdown code fences) with the following keys:
+  "summary": a detailed overall summary,
+  "key_points": a list of key points (each an object with keys "text" and "importance"),
+  "additional_notes": any extra relevant observations.
 
-{conv_text}User Query:
-\"\"\"{question}\"\"\"
-    """.strip()
+Aggregated Key Points:
+{aggregated_context}
+
+User Query:
+{question}
+""".strip()
+    
     try:
         final_answer = llm_instance.invoke([
-            {"role": "system", "content": "You are a professional assistant skilled in synthesizing information."},
+            {"role": "system", "content": "You are a professional assistant skilled in synthesizing information who strictly follows user's request."},
             {"role": "user", "content": reduce_prompt}
         ])
     except Exception as e:
@@ -336,151 +496,65 @@ Aggregated Key Points:
     return final_answer
 
 # -----------------------------------------------------------------------------
-# Helper Functions for Local and Community Context (for Local/DRIFT search)
-# -----------------------------------------------------------------------------
-def get_local_context(entity: str) -> str:
-    query = """
-    MATCH (e:Entity {name: $entity})
-    OPTIONAL MATCH (e)-[r]-(neighbor:Entity)
-    RETURN e.name AS entity, collect({neighbor: neighbor.name, relationship: type(r)}) as neighbors
-    """
-    result = run_cypher_query(query, {"entity": entity.lower()})
-    if result:
-        row = result[0]
-        context = f"Entity: {row['entity']}\n"
-        if row.get('neighbors'):
-            neighbors_list = [f"{item['neighbor']} ({item.get('relationship', '')})" for item in row['neighbors'] if item.get('neighbor')]
-            context += "Neighbors: " + ", ".join(neighbors_list) + "\n"
-        else:
-            context += "No neighbors found.\n"
-        return context
-    return "No local context found."
-
-def get_community_context(entity: str) -> str:
-    communities = detect_communities(doc_id=None)
-    community_for_entity = None
-    for comm, entities in communities.items():
-        if entity.lower() in [e.lower() for e in entities]:
-            community_for_entity = comm
-            break
-    if community_for_entity is not None:
-        summaries = generate_community_summaries(doc_id=None)
-        summary = summaries.get(community_for_entity, "No summary available.")
-        return f"Community {community_for_entity} summary: {summary}"
-    return "Entity not found in any community."
-
-# -----------------------------------------------------------------------------
-# Pydantic Models for Endpoints
-# -----------------------------------------------------------------------------
-class QuestionRequest(BaseModel):
-    question: str
-    doc_id: Optional[Union[str, List[str]]] = None
-    previous_conversations: Optional[str] = None
-
-class DeleteDocumentRequest(BaseModel):
-    doc_id: Optional[str] = None
-    document_name: Optional[str] = None
-
-class LocalSearchRequest(BaseModel):
-    entity: str
-    question: str
-
-class DriftSearchRequest(BaseModel):
-    entity: str
-    question: str
-
-# -----------------------------------------------------------------------------
-# NER Extraction using Flair
-# -----------------------------------------------------------------------------
-model_cache = {}
-DEFAULT_MODEL_MAP = {
-    'en': 'ner-large',
-    'de': 'de-ner-large',
-    'es': 'es-ner-large',
-    'nl': 'nl-ner-large',
-    'fr': 'fr-ner',
-    'da': 'da-ner',
-    'ar': 'ar-ner',
-    'uk': 'ner-ukrainian'
-}
-
-def extract_flair_entities(text: str) -> List[Dict[str, str]]:
-    try:
-        lang = detect(text).lower()
-    except Exception:
-        lang = 'en'
-    if '-' in lang:
-        lang = lang.split('-')[0]
-    model_name = DEFAULT_MODEL_MAP.get(lang, 'ner-large')
-    if model_name in model_cache:
-        tagger = model_cache[model_name]
-    else:
-        try:
-            tagger = SequenceTagger.load(model_name)
-            model_cache[model_name] = tagger
-        except Exception as e:
-            raise Exception(f"Failed to load model {model_name}: {e}")
-    sentence_strs = [s.strip() for s in blingfire.text_to_sentences(text).splitlines() if s.strip()]
-    sentences = [Sentence(s) for s in sentence_strs]
-    try:
-        tagger.predict(sentences, mini_batch_size=32)
-    except Exception as e:
-        raise Exception(f"NER prediction error: {e}")
-    entities = {}
-    for sentence in sentences:
-        for label in sentence.get_labels():
-            key = (label.data_point.text, label.value)
-            entities[key] = {"name": label.data_point.text, "label": label.value}
-    return list(entities.values())
-
-# -----------------------------------------------------------------------------
-# Document Processing: Clean Text and Chunking
-# -----------------------------------------------------------------------------
-def clean_text(text: str) -> str:
-    return ''.join(filter(lambda x: x in string.printable, text.strip()))
-
-def chunk_text(text: str, max_chunk_size: int = 512) -> List[str]:
-    max_chunk_size = int(max_chunk_size)
-    sentences = [s.strip() for s in blingfire.text_to_sentences(text).splitlines() if s.strip()]
-    chunks = []
-    current_chunk = ""
-    for s in sentences:
-        if current_chunk and (len(current_chunk) + len(s) + 1) > max_chunk_size:
-            chunks.append(current_chunk.strip())
-            current_chunk = s
-        else:
-            current_chunk = s if not current_chunk else current_chunk + " " + s
-    if current_chunk:
-        chunks.append(current_chunk.strip())
-    return chunks
-
-# -----------------------------------------------------------------------------
-# Graph Manager: Build Graph (Centrality functions removed)
+# Graph Manager Class (Building & Projecting the Graph)
 # -----------------------------------------------------------------------------
 class GraphManager:
     def __init__(self):
         pass
 
     def _merge_entity(self, session, name: str, doc_id: str, chunk_id: int):
-        query = "MERGE (e:Entity {name: $name, doc_id: $doc_id}) MERGE (e)-[:MENTIONED_IN]->(c:Chunk {id: $cid, doc_id: $doc_id})"
+        query = """
+        MERGE (e:Entity {name: $name, doc_id: $doc_id})
+        MERGE (e)-[:MENTIONED_IN]->(c:Chunk {id: $cid, doc_id: $doc_id})
+        """
         session.run(query, name=name, doc_id=doc_id, cid=chunk_id)
 
     def _merge_cooccurrence(self, session, name_a: str, name_b: str, doc_id: str):
-        query = ("MATCH (a:Entity {name: $name_a, doc_id: $doc_id}), "
-                 "(b:Entity {name: $name_b, doc_id: $doc_id}) "
-                 "MERGE (a)-[:CO_OCCURS_WITH]->(b)")
+        query = """
+            MATCH (a:Entity {name: $name_a, doc_id: $doc_id})-[:MENTIONED_IN]->(c:Chunk)
+            MATCH (b:Entity {name: $name_b, doc_id: $doc_id})-[:MENTIONED_IN]->(c)
+            MERGE (entity_a:Entity {name: $name_a, doc_id: $doc_id})
+            MERGE (entity_b:Entity {name: $name_b, doc_id: $doc_id})
+            ON CREATE SET entity_a.created_at = timestamp()
+            ON CREATE SET entity_b.created_at = timestamp()
+            MERGE (entity_a)-[:CO_OCCURS_WITH]->(entity_b)
+        """
         session.run(query, name_a=name_a, name_b=name_b, doc_id=doc_id)
 
     def build_graph(self, chunks: List[str], metadata_list: List[Dict[str, Any]]) -> None:
         with driver.session() as session:
             for i, (chunk, meta) in enumerate(zip(chunks, metadata_list)):
+                if not chunk.strip() or chunk.strip().isdigit():
+                    logger.warning(f"Skipping empty or numeric chunk with ID {i}")
+                    continue
+    
+                # Compute the embedding for the chunk text
+                try:
+                    chunk_embedding = embedding_client.get_embedding(chunk)
+                except Exception as e:
+                    logger.error(f"Error generating embedding for chunk: {chunk} - {e}")
+                    continue
                 query = """
-                    MERGE (c:Chunk {id: $cid, doc_id: $doc_id})
-                    ON CREATE SET c.text = $text, c.document_name = $document_name, c.timestamp = $timestamp
-                    ON MATCH SET c.text = $text, c.document_name = $document_name, c.timestamp = $timestamp
+                MERGE (c:Chunk {id: $cid, doc_id: $doc_id})
+                ON CREATE SET c.text = $text, 
+                            c.document_name = $document_name, 
+                            c.timestamp = $timestamp,
+                            c.embedding = $embedding
+                ON MATCH SET c.text = $text, 
+                            c.document_name = $document_name, 
+                            c.timestamp = $timestamp,
+                            c.embedding = $embedding
                 """
-                session.run(query, cid=i, doc_id=meta["doc_id"], text=chunk,
-                            document_name=meta.get("document_name"), timestamp=meta.get("timestamp"))
+                session.run(
+                    query,
+                    cid=i,
+                    doc_id=meta["doc_id"],
+                    text=chunk,
+                    document_name=meta.get("document_name"),
+                    timestamp=meta.get("timestamp"),
+                    embedding=chunk_embedding
+                )
+                logger.info(f"Added chunk {i} with text: {chunk[:100]}...")
                 try:
                     entities = extract_flair_entities(chunk)
                 except Exception as e:
@@ -494,12 +568,16 @@ class GraphManager:
                         for k in range(j + 1, len(names)):
                             self._merge_cooccurrence(session, names[j], names[k], meta["doc_id"])
                 try:
-                    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"),
-                                    model=os.getenv("OPENAI_MODEL", "gpt-3.5-turbo"),
-                                    base_url=os.getenv("OPENAI_BASE_URL"),
-                                    temperature=float(os.getenv("OPENAI_TEMPERATURE", "0.0")))
+                    client = OpenAI(
+                        api_key=OPENAI_API_KEY,
+                        model=OPENAI_MODEL,
+                        base_url=OPENAI_BASE_URL,
+                        temperature=OPENAI_TEMPERATURE,
+                        stop=OPENAI_STOP
+                    )
                     summary = client.invoke([
-                        {"role": "system", "content": "Summarize the following text into relationships in the format: Entity1 -> Entity2 [strength: X.X]. Do not add extra commentary."},
+                        {"role": "system",
+                         "content": "Summarize the following text into relationships in the format: Entity1 -> Entity2 [strength: X.X]. Do not add extra commentary."},
                         {"role": "user", "content": chunk}
                     ])
                 except Exception as e:
@@ -519,36 +597,44 @@ class GraphManager:
                                 MERGE (a:Entity {name: $source, doc_id: $doc_id})
                                 MERGE (b:Entity {name: $target, doc_id: $doc_id})
                                 MERGE (a)-[r:RELATES_TO {weight: $weight}]->(b)
+                                WITH a, b
+                                MATCH (c:Chunk {id: $cid, doc_id: $doc_id})
+                                MERGE (a)-[:MENTIONED_IN]->(c)
+                                MERGE (b)-[:MENTIONED_IN]->(c)
                             """
-                            session.run(rel_query, source=source, target=target, weight=weight, doc_id=meta["doc_id"])
+                            session.run(rel_query, source=source, target=target, weight=weight, doc_id=meta["doc_id"], cid=i)
+
         logger.info("Graph construction complete.")
 
     def reproject_graph(self, graph_name: str = GRAPH_NAME, doc_id: Optional[str] = None) -> None:
         with driver.session() as session:
-            exists_record = session.run("CALL gds.graph.exists($graph_name) YIELD exists", graph_name=graph_name).single()
+            exists_record = session.run("CALL gds.graph.exists($graph_name) YIELD exists",
+                                        graph_name=graph_name).single()
             if exists_record and exists_record["exists"]:
                 session.run("CALL gds.graph.drop($graph_name)", graph_name=graph_name)
             if doc_id:
-                node_query = f"MATCH (n:Entity) WHERE n.doc_id = '{doc_id}' RETURN id(n) AS id"
-                rel_query = f"MATCH (a:Entity)-[r:RELATES_TO]->(b:Entity) WHERE a.doc_id = '{doc_id}' AND b.doc_id = '{doc_id}' RETURN id(a) AS source, id(b) AS target, r.weight AS weight"
-                config = { "relationshipProjection": { "RELATES_TO": { "orientation": "UNDIRECTED" } } }
+                session.run("MATCH (n:Entity {doc_id: $doc_id}) SET n:DocEntity", doc_id=doc_id)
+                config = {"RELATES_TO": {"orientation": "UNDIRECTED"}}
                 session.run(
-                    "CALL gds.graph.project.cypher($graph_name, $nodeQuery, $relQuery, $config)",
-                    graph_name=graph_name, nodeQuery=node_query, relQuery=rel_query, config=config
+                    "CALL gds.graph.project($graph_name, ['DocEntity'], $config) YIELD graphName",
+                    graph_name=graph_name, config=config
                 )
+                session.run("MATCH (n:DocEntity {doc_id: $doc_id}) REMOVE n:DocEntity", doc_id=doc_id)
             else:
-                config = { "RELATES_TO": { "orientation": "UNDIRECTED" } }
+                config = {"RELATES_TO": {"orientation": "UNDIRECTED"}}
                 session.run(
                     "CALL gds.graph.project($graph_name, ['Entity'], $config)",
                     graph_name=graph_name, config=config
                 )
             logger.info("Graph projection complete.")
 
+# -----------------------------------------------------------------------------
 # Instantiate GraphManager
+# -----------------------------------------------------------------------------
 graph_manager = GraphManager()
 
 # -----------------------------------------------------------------------------
-# Community Detection and Summarization Functions
+# Global Function: detect_communities
 # -----------------------------------------------------------------------------
 def detect_communities(doc_id: Optional[str] = None) -> dict:
     communities = {}
@@ -557,15 +643,14 @@ def detect_communities(doc_id: Optional[str] = None) -> dict:
         if exists_record and exists_record["exists"]:
             session.run("CALL gds.graph.drop($graph_name)", graph_name=GRAPH_NAME)
         if doc_id:
-            node_query = f"MATCH (n:Entity) WHERE n.doc_id = '{doc_id}' RETURN id(n) AS id"
-            rel_query = f"MATCH (a:Entity)-[r:RELATES_TO]->(b:Entity) WHERE a.doc_id = '{doc_id}' AND b.doc_id = '{doc_id}' RETURN id(a) AS source, id(b) AS target, r.weight AS weight"
-            config = { "relationshipProjection": { "RELATES_TO": { "orientation": "UNDIRECTED" } } }
+            session.run("MATCH (n:Entity {doc_id: $doc_id}) SET n:DocEntity", doc_id=doc_id)
+            config = {"RELATES_TO": {"orientation": "UNDIRECTED"}}
             session.run(
-                "CALL gds.graph.project.cypher($graph_name, $nodeQuery, $relQuery, $config)",
-                graph_name=GRAPH_NAME, nodeQuery=node_query, relQuery=rel_query, config=config
+                "CALL gds.graph.project($graph_name, ['DocEntity'], $config) YIELD graphName",
+                graph_name=GRAPH_NAME, config=config
             )
         else:
-            config = { "RELATES_TO": { "orientation": "UNDIRECTED" } }
+            config = {"RELATES_TO": {"orientation": "UNDIRECTED"}}
             session.run(
                 "CALL gds.graph.project($graph_name, ['Entity'], $config)",
                 graph_name=GRAPH_NAME, config=config
@@ -580,14 +665,19 @@ def detect_communities(doc_id: Optional[str] = None) -> dict:
             entity = record["entity"]
             communities.setdefault(comm, []).append(entity)
         session.run("CALL gds.graph.drop($graph_name)", graph_name=GRAPH_NAME)
+        if doc_id:
+            session.run("MATCH (n:DocEntity {doc_id: $doc_id}) REMOVE n:DocEntity", doc_id=doc_id)
     return communities
 
 def generate_community_summaries(doc_id: Optional[str] = None) -> dict:
     communities = detect_communities(doc_id)
-    llm = OpenAI(api_key=os.getenv("OPENAI_API_KEY"),
-                 model=os.getenv("OPENAI_MODEL", "gpt-3.5-turbo"),
-                 base_url=os.getenv("OPENAI_BASE_URL"),
-                 temperature=float(os.getenv("OPENAI_TEMPERATURE", "0.0")))
+    llm = OpenAI(
+        api_key=OPENAI_API_KEY,
+        model=OPENAI_MODEL,
+        base_url=OPENAI_BASE_URL,
+        temperature=OPENAI_TEMPERATURE,
+        stop=OPENAI_STOP
+    )
     summaries = {}
     for comm, entities in communities.items():
         prompt = f"Summarize the following community of entities: {', '.join(entities)}. Provide a concise summary capturing the main themes and key relationships."
@@ -599,183 +689,150 @@ def generate_community_summaries(doc_id: Optional[str] = None) -> dict:
     return summaries
 
 # -----------------------------------------------------------------------------
-# Global Search Map-Reduce Implementation
+# Graph Manager Extended: Storing and Retrieving Community Summaries
 # -----------------------------------------------------------------------------
-def global_search_map_reduce(question: str, conversation_history: Optional[str] = None, chunk_size: int = 512, top_n: int = 5, batch_size: int = 20) -> str:
-    # Generate community summaries (for all communities in the dataset)
-    summaries = generate_community_summaries(doc_id=None)
-    community_reports = list(summaries.values())
-    random.shuffle(community_reports)
+class GraphManagerExtended:
+    def __init__(self, driver):
+        self.driver = driver
+
+    def store_community_summaries(self, doc_id: str) -> None:
+        with self.driver.session() as session:
+            communities = detect_communities(doc_id)
+            logger.debug(f"Detected communities for doc_id {doc_id}: {communities}")
+            llm = OpenAI(
+                api_key=OPENAI_API_KEY,
+                model=OPENAI_MODEL,
+                base_url=OPENAI_BASE_URL,
+                temperature=OPENAI_TEMPERATURE,
+                stop=OPENAI_STOP
+            )
+            if not communities:
+                logger.warning(f"No communities detected for doc_id {doc_id}. Creating default summary.")
+                default_summary = "No communities detected."
+                default_embedding = embedding_client.get_embedding(default_summary)
+                store_query = """
+                CREATE (cs:CommunitySummary {doc_id: $doc_id, community: 'default', summary: $summary, embedding: $embedding, timestamp: $timestamp})
+                """
+                session.run(
+                    store_query,
+                    doc_id=doc_id,
+                    summary=default_summary,
+                    embedding=default_embedding,
+                    timestamp=datetime.now().isoformat()
+                )
+            else:
+                for comm, entities in communities.items():
+                    chunk_query = """
+                    MATCH (e:Entity {doc_id: $doc_id})-[:MENTIONED_IN]->(c:Chunk)
+                    WHERE toLower(e.name) IN $entity_names AND c.text IS NOT NULL AND c.text <> ""
+                    WITH collect(DISTINCT c.text) AS texts
+                    RETURN apoc.text.join(texts, "\n") AS aggregatedText
+                    """
+                    
+                    result = session.run(
+                        chunk_query,
+                        doc_id=doc_id,
+                        entity_names=[e.lower() for e in entities]
+                    )
+                    record = result.single()
+            
+                    # Ensure 'aggregated_text' is always defined
+                    aggregated_text = record["aggregatedText"] if record and record["aggregatedText"] else ""
+                    
+                    # Handle cases where no content is found
+                    if not aggregated_text.strip():
+                        logger.warning(f"No content found for community {comm}. Using entity names as fallback.")
+                        aggregated_text = ", ".join(entities)
+            
+                    # Improved Prompt Formatting
+                    prompt = (
+                        f"Summarize the following text into a concise summary that highlights the main themes and key relationships. "
+                        f"Do not include any extra commentary about the text's structure or quality.\n\n"
+                        f"{aggregated_text}"
+                    )
+            
+                    logger.info(f"Aggregated text for community {comm}: {aggregated_text}")
+                    
+                    try:
+                        summary = llm.invoke([
+                            {"role": "system", "content": "You are a professional summarization assistant."},
+                            {"role": "user", "content": prompt}
+                        ])
+                    except Exception as e:
+                        logger.error(f"Failed to generate summary for community {comm}: {e}")
+                        summary = "No summary available due to error."
+            
+                    logger.debug(f"Storing summary for community {comm}: {summary}")
+            
+                    try:
+                        summary_embedding = embedding_client.get_embedding(summary)
+                    except Exception as e:
+                        logger.error(f"Failed to generate embedding for summary of community {comm}: {e}")
+                        summary_embedding = []
+            
+                    # Ensure the community summary is stored safely
+                    store_query = """
+                    MERGE (cs:CommunitySummary {doc_id: $doc_id, community: $community})
+                    SET cs.summary = $summary, cs.embedding = $embedding, cs.timestamp = $timestamp
+                    """
+                    session.run(
+                        store_query,
+                        doc_id=doc_id,
+                        community=comm,
+                        summary=summary,
+                        embedding=summary_embedding,
+                        timestamp=datetime.now().isoformat()
+                    )
+
+
+    def get_stored_community_summaries(self, doc_id: Optional[str] = None) -> dict:
+        with self.driver.session() as session:
+            if doc_id:
+                query = """
+                MATCH (cs:CommunitySummary {doc_id: $doc_id})
+                RETURN cs.community AS community, cs.summary AS summary, cs.embedding AS embedding
+                """
+                results = session.run(query, doc_id=doc_id)
+            else:
+                query = """
+                MATCH (cs:CommunitySummary)
+                RETURN cs.community AS community, cs.summary AS summary, cs.embedding AS embedding
+                """
+                results = session.run(query)
+            summaries = {}
+            for record in results:
+                comm = record["community"]
+                summaries[comm] = {"summary": record["summary"], "embedding": record["embedding"]}
+            return summaries
+
+# -----------------------------------------------------------------------------
+# Graph Manager Wrapper
+# -----------------------------------------------------------------------------
+class GraphManagerWrapper:
+    def __init__(self):
+        self.manager = graph_manager  # global graph_manager instance
     
-    # Prepare LLM configuration using the OpenAI instance
-    llm_instance = OpenAI(api_key=os.getenv("OPENAI_API_KEY"),
-                          model=os.getenv("OPENAI_MODEL", "gpt-3.5-turbo"),
-                          base_url=os.getenv("OPENAI_BASE_URL"),
-                          temperature=float(os.getenv("OPENAI_TEMPERATURE", "0.0")))
+    def build_graph(self, chunks: List[str], metadata_list: List[Dict[str, Any]]) -> None:
+        self.manager.build_graph(chunks, metadata_list)
     
-    # Gather all chunks from all community reports
-    all_chunks = []
-    for report in community_reports:
-        chunks = chunk_text(report, max_chunk_size=chunk_size)
-        all_chunks.extend(chunks)
+    def reproject_graph(self, graph_name: str = GRAPH_NAME, doc_id: Optional[str] = None) -> None:
+        self.manager.reproject_graph(graph_name, doc_id)
     
-    # Batch the chunks (for example, batch_size = 5)
-    intermediate_points = []
-    for i in range(0, len(all_chunks), batch_size):
-        batch = all_chunks[i:i+batch_size]
-        batch_points = process_chunk_batch(batch, question, llm_instance)
-        intermediate_points.extend(batch_points)
+    def store_community_summaries(self, doc_id: str) -> None:
+        extended = GraphManagerExtended(driver)
+        extended.store_community_summaries(doc_id)
     
-    # Sort the intermediate points by rating (descending) and select top_n
-    intermediate_points_sorted = sorted(intermediate_points, key=lambda x: x.get("rating", 0), reverse=True)
-    selected_points = intermediate_points_sorted[:top_n]
-    aggregated_context = "\n".join([f"{pt['point']} (Rating: {pt['rating']})" for pt in selected_points])
-    
-    conv_text = f"Conversation History: {conversation_history}\n" if conversation_history else ""
-    reduce_prompt = f"""
-You are a professional synthesizer. Given the following aggregated key points extracted from community reports and the user query, generate a comprehensive final answer.
-Aggregated Key Points:
-\"\"\"{aggregated_context}\"\"\"
+    def get_stored_community_summaries(self, doc_id: Optional[str] = None) -> dict:
+        extended = GraphManagerExtended(driver)
+        return extended.get_stored_community_summaries(doc_id)
 
-{conv_text}User Query:
-\"\"\"{question}\"\"\"
-    """.strip()
-    
-    try:
-        final_answer = llm_instance.invoke([
-            {"role": "system", "content": "You are a professional assistant skilled in synthesizing information."},
-            {"role": "user", "content": reduce_prompt}
-        ])
-    except Exception as e:
-        final_answer = f"Error during reduce step: {e}"
-    return final_answer
-
-
-# -----------------------------------------------------------------------------
-# Helper Functions for Local and Community Context (for Local/DRIFT search)
-# -----------------------------------------------------------------------------
-def get_local_context(entity: str) -> str:
-    query = """
-    MATCH (e:Entity {name: $entity})
-    OPTIONAL MATCH (e)-[r]-(neighbor:Entity)
-    RETURN e.name AS entity, collect({neighbor: neighbor.name, relationship: type(r)}) as neighbors
-    """
-    result = run_cypher_query(query, {"entity": entity.lower()})
-    if result:
-        row = result[0]
-        context = f"Entity: {row['entity']}\n"
-        if row.get('neighbors'):
-            neighbors_list = [f"{item['neighbor']} ({item.get('relationship', '')})" for item in row['neighbors'] if item.get('neighbor')]
-            context += "Neighbors: " + ", ".join(neighbors_list) + "\n"
-        else:
-            context += "No neighbors found.\n"
-        return context
-    return "No local context found."
-
-def get_community_context(entity: str) -> str:
-    communities = detect_communities(doc_id=None)
-    community_for_entity = None
-    for comm, entities in communities.items():
-        if entity.lower() in [e.lower() for e in entities]:
-            community_for_entity = comm
-            break
-    if community_for_entity is not None:
-        summaries = generate_community_summaries(doc_id=None)
-        summary = summaries.get(community_for_entity, "No summary available.")
-        return f"Community {community_for_entity} summary: {summary}"
-    return "Entity not found in any community."
-
-# -----------------------------------------------------------------------------
-# Pydantic Models for Endpoints (Request Bodies)
-# -----------------------------------------------------------------------------
-class QuestionRequest(BaseModel):
-    question: str
-    doc_id: Optional[Union[str, List[str]]] = None
-    previous_conversations: Optional[str] = None
-
-class DeleteDocumentRequest(BaseModel):
-    doc_id: Optional[str] = None
-    document_name: Optional[str] = None
-
-class LocalSearchRequest(BaseModel):
-    entity: str
-    question: str
-
-class DriftSearchRequest(BaseModel):
-    entity: str
-    question: str
-
-# -----------------------------------------------------------------------------
-# NER Extraction using Flair
-# -----------------------------------------------------------------------------
-model_cache = {}
-DEFAULT_MODEL_MAP = {
-    'en': 'ner-large',
-    'de': 'de-ner-large',
-    'es': 'es-ner-large',
-    'nl': 'nl-ner-large',
-    'fr': 'fr-ner',
-    'da': 'da-ner',
-    'ar': 'ar-ner',
-    'uk': 'ner-ukrainian'
-}
-
-def extract_flair_entities(text: str) -> List[Dict[str, str]]:
-    try:
-        lang = detect(text).lower()
-    except Exception:
-        lang = 'en'
-    if '-' in lang:
-        lang = lang.split('-')[0]
-    model_name = DEFAULT_MODEL_MAP.get(lang, 'ner-large')
-    if model_name in model_cache:
-        tagger = model_cache[model_name]
-    else:
-        try:
-            tagger = SequenceTagger.load(model_name)
-            model_cache[model_name] = tagger
-        except Exception as e:
-            raise Exception(f"Failed to load model {model_name}: {e}")
-    sentence_strs = [s.strip() for s in blingfire.text_to_sentences(text).splitlines() if s.strip()]
-    sentences = [Sentence(s) for s in sentence_strs]
-    try:
-        tagger.predict(sentences, mini_batch_size=32)
-    except Exception as e:
-        raise Exception(f"NER prediction error: {e}")
-    entities = {}
-    for sentence in sentences:
-        for label in sentence.get_labels():
-            key = (label.data_point.text, label.value)
-            entities[key] = {"name": label.data_point.text, "label": label.value}
-    return list(entities.values())
-
-# -----------------------------------------------------------------------------
-# Document Processing: Clean Text and Chunking
-# -----------------------------------------------------------------------------
-def clean_text(text: str) -> str:
-    return ''.join(filter(lambda x: x in string.printable, text.strip()))
-
-def chunk_text(text: str, max_chunk_size: int = 512) -> List[str]:
-    max_chunk_size = int(max_chunk_size)
-    sentences = [s.strip() for s in blingfire.text_to_sentences(text).splitlines() if s.strip()]
-    chunks = []
-    current_chunk = ""
-    for s in sentences:
-        if current_chunk and (len(current_chunk) + len(s) + 1) > max_chunk_size:
-            chunks.append(current_chunk.strip())
-            current_chunk = s
-        else:
-            current_chunk = s if not current_chunk else current_chunk + " " + s
-    if current_chunk:
-        chunks.append(current_chunk.strip())
-    return chunks
+graph_manager_wrapper = GraphManagerWrapper()
 
 # -----------------------------------------------------------------------------
 # FastAPI Application and Endpoints
 # -----------------------------------------------------------------------------
 app = FastAPI(title="Graph RAG API", description="End-to-end Graph Database RAG on Neo4j", version="1.0.0")
 
-# Endpoint: Upload Documents and Build Graph
 @app.post("/upload_documents")
 async def upload_documents(files: List[UploadFile] = File(...)):
     document_texts = []
@@ -796,7 +853,10 @@ async def upload_documents(files: List[UploadFile] = File(...)):
         except Exception as e:
             logger.error(f"Error processing file {file.filename}: {e}")
             raise HTTPException(status_code=500, detail=f"Error processing file {file.filename}")
-        text = clean_text(text)
+
+        text = clean_text(text)   # Step 1: Clean text
+        text = resolve_coreferences(text)  # Step 2: Coreference resolution
+        
         doc_id = str(uuid.uuid4())
         metadata.append({
             "doc_id": doc_id,
@@ -804,26 +864,44 @@ async def upload_documents(files: List[UploadFile] = File(...)):
             "timestamp": datetime.now().isoformat()
         })
         document_texts.append(text)
+
     all_chunks = []
     meta_list = []
     for text, meta in zip(document_texts, metadata):
-        chunks = chunk_text(text, max_chunk_size=int(os.getenv("CHUNK_SIZE_GDS", "1024")))
+        chunks = chunk_text(text, max_chunk_size=CHUNK_SIZE_GDS)
+        logger.info(f"Generated {len(chunks)} chunks for document {meta['document_name']}")
         all_chunks.extend(chunks)
         meta_list.extend([meta] * len(chunks))
+
     try:
         graph_manager.build_graph(all_chunks, meta_list)
     except Exception as e:
         logger.error(f"Graph building error: {e}")
         raise HTTPException(status_code=500, detail=f"Graph building error: {e}")
-    return {"message": "Documents processed and graph updated successfully."}
 
-# Endpoint: Ask Question (with previous conversation rewriting and using Text2Cypher)
+    # Cleanup logic for empty chunks and nodes
+    clean_empty_chunks()
+    clean_empty_nodes()
+
+    unique_doc_ids = set(meta["doc_id"] for meta in metadata)
+    for doc_id in unique_doc_ids:
+        try:
+            graph_manager_wrapper.store_community_summaries(doc_id)
+        except Exception as e:
+            logger.error(f"Error storing community summaries for doc_id {doc_id}: {e}")
+
+    return {"message": "Documents processed, graph updated, and community summaries stored successfully."}
+
+
 @app.post("/ask_question")
 def ask_question(request: QuestionRequest):
-    llm_instance = OpenAI(api_key=os.getenv("OPENAI_API_KEY"),
-                          model=os.getenv("OPENAI_MODEL", "gpt-3.5-turbo"),
-                          base_url=os.getenv("OPENAI_BASE_URL"),
-                          temperature=float(os.getenv("OPENAI_TEMPERATURE", "0.0")))
+    llm_instance = OpenAI(
+        api_key=OPENAI_API_KEY,
+        model=OPENAI_MODEL,
+        base_url=OPENAI_BASE_URL,
+        temperature=OPENAI_TEMPERATURE,
+        stop=OPENAI_STOP
+    )
     if request.previous_conversations:
         rewrite_prompt = (
             f"Based on the user's previous history query about '{request.previous_conversations}', "
@@ -871,7 +949,8 @@ def ask_question(request: QuestionRequest):
         logger.debug(f"Answer prompt for question '{question_text}':\n{answer_prompt}")
         try:
             llm_answer = llm_instance.invoke([
-                {"role": "system", "content": "You are a professional assistant who answers queries concisely based solely on the provided Neo4j Cypher query outputs."},
+                {"role": "system",
+                 "content": "You are a professional assistant who answers queries concisely based solely on the provided Neo4j Cypher query outputs."},
                 {"role": "user", "content": answer_prompt}
             ])
         except Exception as e:
@@ -885,7 +964,8 @@ def ask_question(request: QuestionRequest):
     logger.debug(f"Combined prompt:\n{combined_prompt}")
     try:
         combined_llm_response = llm_instance.invoke([
-            {"role": "system", "content": "You are a professional assistant who synthesizes information from multiple sources to provide a detailed final answer."},
+            {"role": "system",
+             "content": "You are a professional assistant who synthesizes information from multiple sources to provide a detailed final answer."},
             {"role": "user", "content": combined_prompt}
         ])
     except Exception as e:
@@ -898,20 +978,42 @@ def ask_question(request: QuestionRequest):
     logger.debug(f"Final response: {json.dumps(final_response, indent=2)}")
     return final_response
 
-# Endpoint: Global Search – using map-reduce on community summaries
 @app.post("/global_search")
 def global_search(request: QuestionRequest):
-    answer = global_search_map_reduce(request.question, conversation_history=request.previous_conversations, chunk_size=512, top_n=5)
+    answer = global_search_map_reduce(
+        question=request.question,
+        conversation_history=request.previous_conversations,
+        chunk_size=GLOBAL_SEARCH_CHUNK_SIZE,
+        top_n=GLOBAL_SEARCH_TOP_N,
+        batch_size=GLOBAL_SEARCH_BATCH_SIZE
+    )
     return {"global_search_answer": answer}
 
-# Endpoint: Local Search – reasoning about a specific entity via its neighbors.
 @app.post("/local_search")
 def local_search(request: LocalSearchRequest):
-    llm_instance = OpenAI(api_key=os.getenv("OPENAI_API_KEY"),
-                          model=os.getenv("OPENAI_MODEL"),
-                          base_url=os.getenv("OPENAI_BASE_URL"),
-                          temperature=float(os.getenv("OPENAI_TEMPERATURE", "0.0")))
-    context = get_local_context(request.entity)
+    llm_instance = OpenAI(
+        api_key=OPENAI_API_KEY,
+        model=OPENAI_MODEL,
+        base_url=OPENAI_BASE_URL,
+        temperature=OPENAI_TEMPERATURE,
+        stop=OPENAI_STOP
+    )
+    query = """
+    MATCH (e:Entity {name: $entity})
+    OPTIONAL MATCH (e)-[r]-(neighbor:Entity)
+    RETURN e.name AS entity, collect({neighbor: neighbor.name, relationship: type(r)}) as neighbors
+    """
+    result = run_cypher_query(query, {"entity": request.entity.lower()})
+    if result:
+        row = result[0]
+        context = f"Entity: {row['entity']}\n"
+        if row.get('neighbors'):
+            neighbors_list = [f"{item['neighbor']} ({item.get('relationship', '')})" for item in row['neighbors'] if item.get('neighbor')]
+            context += "Neighbors: " + ", ".join(neighbors_list) + "\n"
+        else:
+            context += "No neighbors found.\n"
+    else:
+        context = "No local context found."
     prompt = f"Based on the following local context:\n{context}\n\nAnswer the following question about the entity '{request.entity}': {request.question}"
     try:
         answer = llm_instance.invoke([
@@ -922,16 +1024,48 @@ def local_search(request: LocalSearchRequest):
         answer = f"LLM error: {e}"
     return {"local_search_answer": answer}
 
-# Endpoint: DRIFT Search – local search with additional community context.
 @app.post("/drift_search")
 def drift_search(request: DriftSearchRequest):
-    llm_instance = OpenAI(api_key=os.getenv("OPENAI_API_KEY"),
-                          model=os.getenv("OPENAI_MODEL"),
-                          base_url=os.getenv("OPENAI_BASE_URL"),
-                          temperature=float(os.getenv("OPENAI_TEMPERATURE", "0.0")))
-    local_context_text = get_local_context(request.entity)
-    community_context_text = get_community_context(request.entity)
-    prompt = f"Based on the following information:\nLocal Context:\n{local_context_text}\n\nCommunity Context:\n{community_context_text}\n\nAnswer the following question about the entity '{request.entity}': {request.question}"
+    llm_instance = OpenAI(
+        api_key=OPENAI_API_KEY,
+        model=OPENAI_MODEL,
+        base_url=OPENAI_BASE_URL,
+        temperature=OPENAI_TEMPERATURE,
+        stop=OPENAI_STOP
+    )
+    local_context_text = ""
+    query = """
+    MATCH (e:Entity {name: $entity})
+    OPTIONAL MATCH (e)-[r]-(neighbor:Entity)
+    RETURN e.name AS entity, collect({neighbor: neighbor.name, relationship: type(r)}) as neighbors
+    """
+    result = run_cypher_query(query, {"entity": request.entity.lower()})
+    if result:
+        row = result[0]
+        local_context_text = f"Entity: {row['entity']}\n"
+        if row.get('neighbors'):
+            neighbors_list = [f"{item['neighbor']} ({item.get('relationship', '')})" for item in row['neighbors'] if item.get('neighbor')]
+            local_context_text += "Neighbors: " + ", ".join(neighbors_list) + "\n"
+        else:
+            local_context_text += "No neighbors found.\n"
+    community_context_text = ""
+    communities = detect_communities(doc_id=None)
+    community_for_entity = None
+    for comm, entities in communities.items():
+        if request.entity.lower() in [e.lower() for e in entities]:
+            community_for_entity = comm
+            break
+    if community_for_entity is not None:
+        summaries = graph_manager_wrapper.get_stored_community_summaries(doc_id=None)
+        summary = summaries.get(community_for_entity, "No summary available.")
+        community_context_text = f"Community {community_for_entity} summary: {summary}"
+    else:
+        community_context_text = "Entity not found in any community."
+    prompt = (
+        f"Based on the following information:\nLocal Context:\n{local_context_text}\n\n"
+        f"Community Context:\n{community_context_text}\n\n"
+        f"Answer the following question about the entity '{request.entity}': {request.question}"
+    )
     try:
         answer = llm_instance.invoke([
             {"role": "system", "content": "You are a professional assistant skilled in synthesizing local and community context to provide detailed answers."},
@@ -941,7 +1075,6 @@ def drift_search(request: DriftSearchRequest):
         answer = f"LLM error: {e}"
     return {"drift_search_answer": answer}
 
-# Endpoint: List Documents with Metadata
 @app.get("/documents")
 def list_documents():
     try:
@@ -955,7 +1088,6 @@ def list_documents():
         logger.error(f"Error listing documents: {e}")
         raise HTTPException(status_code=500, detail="Error listing documents")
 
-# Endpoint: Delete a Document based on doc_id or document_name
 @app.delete("/delete_document")
 def delete_document(request: DeleteDocumentRequest):
     if not request.doc_id and not request.document_name:
@@ -974,7 +1106,6 @@ def delete_document(request: DeleteDocumentRequest):
         logger.error(f"Error deleting document: {e}")
         raise HTTPException(status_code=500, detail=f"Error deleting document: {e}")
 
-# Endpoint: Get Communities (using Leiden algorithm)
 @app.get("/communities")
 def get_communities(doc_id: Optional[str] = None):
     try:
@@ -984,19 +1115,19 @@ def get_communities(doc_id: Optional[str] = None):
         logger.error(f"Error detecting communities: {e}")
         raise HTTPException(status_code=500, detail=f"Error detecting communities: {e}")
 
-# Endpoint: Get Community Summaries
 @app.get("/community_summaries")
 def community_summaries(doc_id: Optional[str] = None):
     try:
-        summaries = generate_community_summaries(doc_id)
+        summaries = graph_manager_wrapper.get_stored_community_summaries(doc_id)
         return {"community_summaries": summaries}
     except Exception as e:
         logger.error(f"Error generating community summaries: {e}")
         raise HTTPException(status_code=500, detail=f"Error generating community summaries: {e}")
 
-# -----------------------------------------------------------------------------
-# Main: Run the Application
-# -----------------------------------------------------------------------------
+@app.get("/")
+def root():
+    return {"message": "GraphRAG API is running."}
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host=APP_HOST, port=APP_PORT)
