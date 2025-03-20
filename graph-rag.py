@@ -429,10 +429,12 @@ def global_search_map_reduce(question: str, conversation_history: Optional[str] 
             batch = chunks[i:i + batch_size]
             batch_prompt = (
                 "You are an expert in extracting key information. For each of the following community report chunks, "
-                "extract key points relevant to answering the query. Return the output strictly as a valid JSON array "
-                'in this format: [{"point": "key detail", "rating": 1-100}].\n\n'
+                "extract key points that are relevant to answering the user query provided at the end. "
+                "Return the output strictly as a valid JSON array in this format: "
+                '[{"point": "key detail", "rating": 1-100}].\n\n'
                 "**IMPORTANT:** Use **double quotes** for keys and string values. Do NOT add any explanation, commentary, or extra text outside the JSON structure."
             )
+
             for idx, chunk in enumerate(batch):
                 batch_prompt += f"\n\nChunk {idx}:\n\"\"\"\n{chunk}\n\"\"\""
             batch_prompt += f"\n\nUser Query:\n\"\"\"\n{question}\n\"\"\""
