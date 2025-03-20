@@ -185,6 +185,45 @@ class EmbeddingAPIClient:
 
 embedding_client = EmbeddingAPIClient()
 
+
+def detect_communities(doc_id: Optional[str] = None) -> dict:
+    communities = {}
+    with driver.session() as session:
+        exists_record = session.run(
+            "CALL gds.graph.exists($graph_name) YIELD exists", 
+            graph_name=GRAPH_NAME
+        ).single()
+        if exists_record and exists_record["exists"]:
+            session.run("CALL gds.graph.drop($graph_name)", graph_name=GRAPH_NAME)
+        if doc_id:
+            session.run("MATCH (n:Entity {doc_id: $doc_id}) SET n:DocEntity", doc_id=doc_id)
+            config = {"RELATES_TO": {"orientation": "UNDIRECTED"}}
+            session.run(
+                "CALL gds.graph.project($graph_name, ['DocEntity'], $config) YIELD graphName",
+                graph_name=GRAPH_NAME, config=config
+            )
+        else:
+            config = {"RELATES_TO": {"orientation": "UNDIRECTED"}}
+            session.run(
+                "CALL gds.graph.project($graph_name, ['Entity'], $config)",
+                graph_name=GRAPH_NAME, config=config
+            )
+        result = session.run(
+            "CALL gds.leiden.stream($graph_name) YIELD nodeId, communityId "
+            "RETURN gds.util.asNode(nodeId).name AS entity, communityId AS community ORDER BY community, entity",
+            graph_name=GRAPH_NAME
+        )
+        for record in result:
+            comm = record["community"]
+            entity = record["entity"]
+            communities.setdefault(comm, []).append(entity)
+        session.run("CALL gds.graph.drop($graph_name)", graph_name=GRAPH_NAME)
+        if doc_id:
+            session.run("MATCH (n:DocEntity {doc_id: $doc_id}) REMOVE n:DocEntity", doc_id=doc_id)
+    return communities
+
+
+
 def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
     from numpy import dot
     from numpy.linalg import norm
