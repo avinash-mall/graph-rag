@@ -43,6 +43,7 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL") or "gpt-3.5-turbo"
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")
 OPENAI_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE") or "0.0")
 OPENAI_STOP = json.loads(os.getenv("OPENAI_STOP") or '["<|end_of_text|>", "<|eot_id|>"]')
+OPENAI_API_TIMEOUT = int(os.getenv("API_TIMEOUT") or "600")
 
 # Chunking & Global Search Defaults
 CHUNK_SIZE_GDS = int(os.getenv("CHUNK_SIZE_GDS") or "1024")
@@ -147,7 +148,7 @@ def clean_and_parse_json(response_text: str) -> Union[dict, list]:
 class EmbeddingAPIClient:
     def __init__(self):
         self.embedding_api_url = os.getenv("EMBEDDING_API_URL", "https://s-ailabs-gpu5.westeurope.cloudapp.azure.com/api/embed")
-        self.timeout = float(os.getenv("API_TIMEOUT", "600"))
+        self.timeout = OPENAI_API_TIMEOUT
         self.logger = logging.getLogger("EmbeddingAPIClient")
         self.logger.setLevel(logging.INFO)
         self.cache = {}
@@ -452,9 +453,13 @@ def global_search_map_reduce(question: str, conversation_history: Optional[str] 
     aggregated_context = "\n".join([f"{pt['point']} (Rating: {pt['rating']})" for pt in selected_points])
     conv_text = f"Conversation History: {conversation_history}\n" if conversation_history else ""
     reduce_prompt = f"""
-        You are a professional assistant skilled in synthesizing information. 
-        Summarize the relationship between Maude and David based on the provided key points. 
-        Return the response strictly in this JSON format:
+        You are a professional assistant skilled in synthesizing information strictly from the provided context. 
+        Using ONLY the following intermediate key points:
+        {json.dumps(intermediate_points_sorted[:top_n], indent=2)}
+        and the original user query: "{question}",
+        generate a detailed answer that directly addresses the query.
+        IMPORTANT: Do NOT use any external knowledge or assumptions beyond the provided key points.
+        Return your response strictly in the following JSON format:
         
         {{
         "summary": "Your detailed answer here",
@@ -463,8 +468,7 @@ def global_search_map_reduce(question: str, conversation_history: Optional[str] 
             {{"point": "another detail", "rating": 1-100}}
         ]
         }}
-        
-        Do NOT include commentary, uncertainty language, or explanations about what you know or don’t know.
+        Do NOT include any extra commentary, uncertainty language, or explanations.
         """
     try:
         final_answer = llm_instance.invoke_json([
@@ -617,9 +621,11 @@ def extract_entities_with_llm(text: str) -> List[Dict[str, str]]:
     )
     prompt = (
         "Extract all named entities from the following text. "
-        "For each entity, provide its name and type (e.g., person name, organization name, location name, etc.). "
+        "For each entity, provide its name and type (e.g., cardinal value, date value, event name, building name, "
+        "geo-political entity, language name, law name, money name, person name, organization name, location name, "
+        " affiliation, ordinal value, percent value, product name, quantity value, time value, name of work of art, etc.). "
         "If uncertain, label it as 'UNKNOWN'. "
-        "Return your answer as a valid JSON array with each element in the format: "
+        "Return ONLY a valid JSON array (without any additional text or markdown) in the exact format: "
         '[{"name": "entity name", "type": "entity type"}].'
         "\n\n" + text
     )
@@ -628,15 +634,23 @@ def extract_entities_with_llm(text: str) -> List[Dict[str, str]]:
             {"role": "system", "content": "You are a professional NER extraction assistant."},
             {"role": "user", "content": prompt}
         ])
-        entities = response
-        filtered_entities = [entity for entity in entities if entity['name'].strip() and entity['type'].strip()]
-        removed_entities = set(e['name'] for e in entities) - set(e['name'] for e in filtered_entities)
-        if removed_entities:
-            logger.info(f"🧹 Removed invalid or empty entities: {', '.join(removed_entities)}")
+        # Check if the response is a dict containing the array under a key
+        if isinstance(response, dict) and "entities" in response:
+            entities = response["entities"]
+        elif isinstance(response, list):
+            entities = response
+        else:
+            raise ValueError("Unexpected JSON structure in NER response")
+        
+        filtered_entities = [
+            entity for entity in entities 
+            if entity.get('name', '').strip() and entity.get('type', '').strip()
+        ]
         return filtered_entities
     except Exception as e:
         logger.error(f"❌ NER extraction error: {e}")
         return []
+
 
 def format_natural_response(response: str) -> str:
     logger.info(f"Raw LLM Response: {repr(response)}")
@@ -682,7 +696,7 @@ class OpenAI:
             response = requests.post(
                 self.base_url, json=payload,
                 headers={"Authorization": f"Bearer {self.api_key}"},
-                timeout=60, verify=False
+                timeout=OPENAI_API_TIMEOUT, verify=False
             )
             response.raise_for_status()
             content = response.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
@@ -771,8 +785,8 @@ class GraphManagerExtended:
                     record = result.single()
                     aggregated_text = record["aggregatedText"] if record and record["aggregatedText"] else ""
                     if not aggregated_text.strip():
-                        logger.warning(f"No content found for community {comm}. Using entity names as fallback.")
-                        aggregated_text = ", ".join(entities)
+                        logger.warning(f"No content found for community {comm}. Skipping community summary creation.")
+                        continue
                     prompt = (
                         "Summarize the following text into a meaningful summary with key insights. "
                         "If the text is too short or unclear, describe the entities and their possible connections. "
