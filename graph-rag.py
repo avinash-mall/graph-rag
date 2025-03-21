@@ -93,12 +93,18 @@ class DeleteDocumentRequest(BaseModel):
 
 class LocalSearchRequest(BaseModel):
     question: str
-    entity: Optional[str] = None
+    doc_id: Optional[str] = None
     previous_conversations: Optional[str] = None
 
 class DriftSearchRequest(BaseModel):
-    entity: str
     question: str
+    previous_conversations: Optional[str] = None
+    doc_id: Optional[str] = None
+
+class GlobalSearchRequest(BaseModel):
+    question: str
+    previous_conversations: Optional[str] = None
+    doc_id: Optional[str] = None
 
 # =============================================================================
 # UTILITY FUNCTIONS
@@ -247,7 +253,7 @@ class OpenAI:
             "content": "You are a professional assistant. Your response MUST be a valid JSON object with no additional text, markdown, or commentary."
         }] + messages
         response_text = self.invoke(primary_messages)
-        logger.debug("Initial LLM response:\n" + response_text)
+        logger.debug("Raw LLM response: " + repr(response_text))
         try:
             parsed = parse_strict_json(response_text)
             return parsed
@@ -725,11 +731,11 @@ class GraphManagerWrapper:
 
 graph_manager_wrapper = GraphManagerWrapper()
 
-def global_search_map_reduce(question: str, conversation_history: Optional[str] = None,
+def global_search_map_reduce(question: str, conversation_history: Optional[str] = None, doc_id: Optional[str] = None,
                              chunk_size: int = GLOBAL_SEARCH_CHUNK_SIZE,
                              top_n: int = GLOBAL_SEARCH_TOP_N,
                              batch_size: int = GLOBAL_SEARCH_BATCH_SIZE) -> str:
-    summaries = graph_manager_wrapper.get_stored_community_summaries(doc_id=None)
+    summaries = graph_manager_wrapper.get_stored_community_summaries(doc_id=doc_id)
     if not summaries:
         raise HTTPException(status_code=500, detail="No community summaries available. Please re-index the dataset.")
     community_reports = list(summaries.values())
@@ -788,7 +794,7 @@ def global_search_map_reduce(question: str, conversation_history: Optional[str] 
         Please follow these instructions:
         1. Produce a detailed summary that directly and thoroughly answers the user’s query.
         2. Include a list of the key points along with their ratings exactly as provided.
-        3. Provide an extended detailed explanation that weaves together all the key points, elaborating on how each contributes to the overall answer.
+        3. Provide an extended detailed explanation that weaves together all key points, elaborating on how each contributes to the overall answer.
         4. Do not use any external knowledge; rely solely on the provided key points.
         5. Return your response strictly in the following JSON format:
             {{
@@ -812,6 +818,7 @@ def global_search_map_reduce(question: str, conversation_history: Optional[str] 
     except Exception as e:
         final_answer = f"Error during reduce step: {e}"
     return final_answer
+
 
 # =============================================================================
 # TEXT2CYPHER RETRIEVER STUB
@@ -839,6 +846,20 @@ app = FastAPI(title="Graph RAG API", description="End-to-end Graph Database RAG 
 
 @app.post("/upload_documents")
 async def upload_documents(files: List[UploadFile] = File(...)):
+    """
+    Purpose:
+    Upload files (PDF, DOCX, TXT), extract and clean text, resolve coreferences, and break the text into chunks.
+    Each document is assigned a unique doc_id and processed to build/update the graph in the Neo4j database.
+    Community summaries are generated for each document after indexing.
+    
+    Key Phases:
+    Document Extraction: Reads and cleans the file content, resolving coreferences.
+    Graph Construction: Chunks the document text, computes embeddings, and creates nodes and relationships (including entity extraction and co-occurrence).
+    Community Summarization: Generates summaries per document (using the unique doc_id) for later retrieval.
+    
+    Response:
+    Returns a success message confirming that the documents were processed, the graph updated, and community summaries stored.
+    """
     document_texts = []
     metadata = []
     for file in files:
@@ -890,6 +911,20 @@ async def upload_documents(files: List[UploadFile] = File(...)):
 
 @app.post("/ask_question")
 def ask_question(request: QuestionRequest):
+    """
+    Purpose:
+    Accepts a user’s question along with optional previous conversation history.
+    Optionally rewrites the query based on conversation history to create a standalone question.
+    Generates multiple Cypher queries (standard, fuzzy, general) for the graph, retrieves results, and synthesizes a final answer using the LLM.
+    
+    Key Phases:
+    Query Rewriting: Adjusts the question if previous conversations are provided.
+    Cypher Query Generation & Execution: Runs various graph queries to fetch relevant context.
+    LLM Synthesis: Combines the results from the graph queries into a single final answer.
+    
+    Response:
+    Returns the original question, the combined LLM-generated answer, and detailed responses from each sub-query.
+    """
     llm_instance = OpenAI(
         api_key=OPENAI_API_KEY,
         model=OPENAI_MODEL,
@@ -972,10 +1007,24 @@ def ask_question(request: QuestionRequest):
     return final_response
 
 @app.post("/global_search")
-def global_search(request: QuestionRequest):
+def global_search(request: GlobalSearchRequest):
+    """
+    Purpose:
+    Performs a broad search over the graph using community summaries.
+    Accepts a user question, optional previous conversations, and an optional doc_id to filter results to a specific document.
+    
+    Key Phases:
+    Community Retrieval: Retrieves community summaries optionally filtered by doc_id.
+    Intermediate Key Point Extraction: Shuffles and selects relevant community report snippets, then extracts key points.
+    Final Answer Synthesis: Uses the key points and conversation history to generate a comprehensive answer.
+    
+    Response:
+    Returns a synthesized answer based solely on the provided context and key points.
+    """
     answer = global_search_map_reduce(
         question=request.question,
         conversation_history=request.previous_conversations,
+        doc_id=request.doc_id,  # Optional doc_id filter
         chunk_size=GLOBAL_SEARCH_CHUNK_SIZE,
         top_n=GLOBAL_SEARCH_TOP_N,
         batch_size=GLOBAL_SEARCH_BATCH_SIZE
@@ -983,83 +1032,67 @@ def global_search(request: QuestionRequest):
     logger.debug(f"Raw search answer: {answer}")
     return {"answer": format_natural_response(answer)}
 
+
+# 2. Update the /local_search endpoint:
 @app.post("/local_search")
 def local_search(request: LocalSearchRequest):
-    # If an entity is not provided, try to extract one from the question.
-    search_entity = request.entity
-    if not search_entity:
-        extracted_entities = extract_entities_with_llm(request.question)
-        if extracted_entities:
-            # Take the first extracted entity as the primary entity.
-            search_entity = extracted_entities[0].get("name", "").lower()
-        else:
-            return {"error": "No entity could be identified in the question. Please provide an entity."}
-    
-    # --- Entity Context ---
-    entity_query = """
-    MATCH (e:Entity {name: $entity})
-    OPTIONAL MATCH (e)-[r]-(neighbor:Entity)
-    RETURN e.name AS entity, collect({neighbor: neighbor.name, relationship: type(r)}) AS neighbors
     """
-    entity_result = run_cypher_query(entity_query, {"entity": search_entity.lower()})
-    if entity_result:
-        row = entity_result[0]
-        entity_context = f"Entity: {row['entity']}\n"
-        if row.get('neighbors'):
-            neighbors_list = [
-                f"{item['neighbor']} ({item.get('relationship', '')})"
-                for item in row['neighbors'] if item.get('neighbor')
-            ]
-            entity_context += "Neighbors: " + ", ".join(neighbors_list) + "\n"
-        else:
-            entity_context += "No neighbors found.\n"
-    else:
-        entity_context = "No entity context found.\n"
+    Purpose:
+    Provides a localized search answer by building context strictly from a specific document and conversation history.
+    Now uses an optional doc_id to filter community summaries and document chunks.
     
+    Key Phases:
+    Context Retrieval:
+    Conversation History: Includes any previous conversation context.
+    Community Context: Retrieves community summaries filtered by doc_id (if provided).
+    Document Chunks: Fetches document chunks for the specific doc_id.
+    LLM Prompt Construction: Combines the above contexts into a prompt.
+    LLM Answer Generation: Produces an answer based solely on the provided local context.
+    
+    Response:
+    Returns the LLM-generated answer that strictly leverages the filtered local context.
+    """
+    # Ensure a doc_id is provided (you can also make this optional if desired)
+    if not request.doc_id:
+        return {"error": "doc_id parameter is required for local search."}
+
     # --- Conversation History Context ---
     conversation_context = ""
     if request.previous_conversations:
         conversation_context = f"Conversation History:\n{request.previous_conversations}\n\n"
-    
+
     # --- Community Context ---
-    communities = detect_communities(doc_id=None)
-    community_context = ""
-    community_for_entity = None
-    for comm, entities in communities.items():
-        if search_entity.lower() in [e.lower() for e in entities]:
-            community_for_entity = comm
-            break
-    if community_for_entity:
-        summaries = graph_manager_wrapper.get_stored_community_summaries(doc_id=None)
-        summary_info = summaries.get(community_for_entity, {})
-        summary = summary_info.get("summary", "No summary available.")
-        community_context = f"Community ({community_for_entity}) Summary: {summary}\n"
+    # Filter community summaries by the provided doc_id.
+    summaries = graph_manager_wrapper.get_stored_community_summaries(doc_id=request.doc_id)
+    if summaries:
+        community_context = "Community Summaries:\n" + "\n".join(
+            [f"{comm}: {info['summary']}" for comm, info in summaries.items() if info.get("summary")]
+        ) + "\n"
     else:
-        community_context = "Entity not found in any community.\n"
-    
-    # --- Text Unit Context ---
+        community_context = "No community summaries found for the specified document.\n"
+
+    # --- Document Chunk Context ---
+    # Query document chunks for the given doc_id.
     text_unit_query = """
     MATCH (c:Chunk)
-    WHERE toLower(c.text) CONTAINS $entity
+    WHERE c.doc_id = $doc_id
     RETURN c.text AS chunk_text
     LIMIT 5
     """
-    text_unit_results = run_cypher_query(text_unit_query, {"entity": search_entity.lower()})
-    text_unit_context = ""
+    text_unit_results = run_cypher_query(text_unit_query, {"doc_id": request.doc_id})
     if text_unit_results:
         chunks = [res.get("chunk_text", "") for res in text_unit_results if res.get("chunk_text")]
         text_unit_context = "Related Document Chunks:\n" + "\n---\n".join(chunks) + "\n"
     else:
         text_unit_context = "No related document chunks found.\n"
-    
+
     # --- Combine All Contexts ---
     combined_context = (
         conversation_context +
-        entity_context + "\n" +
         community_context + "\n" +
         text_unit_context
     )
-    
+
     # --- Build the Prompt Using a System Prompt Template ---
     local_search_system_prompt = (
         "You are a professional assistant who answers queries strictly based on the provided context.\n\n"
@@ -1068,7 +1101,7 @@ def local_search(request: LocalSearchRequest):
         "Answer:"
     )
     prompt = local_search_system_prompt.format(context_data=combined_context, question=request.question)
-    
+
     # --- LLM Call ---
     llm_instance = OpenAI(
         api_key=OPENAI_API_KEY,
@@ -1081,12 +1114,30 @@ def local_search(request: LocalSearchRequest):
         {"role": "system", "content": "You are a professional assistant who answers strictly based on the provided context."},
         {"role": "user", "content": prompt}
     ])
-    
+
     return {"local_search_answer": answer}
 
 
 @app.post("/drift_search")
 def drift_search(request: DriftSearchRequest):
+    """
+    Purpose:
+    Uses a multi-phase approach to refine answers over hierarchical data.
+    Accepts a question, optional previous conversation history, and an optional doc_id to filter community summaries and document chunks.
+    
+    Key Phases:
+    Global (Primer) Phase:
+    Retrieves community summaries (optionally filtered by doc_id).
+    Generates an intermediate answer and follow-up queries.
+    Follow-Up Phase:
+    For each follow-up query, gathers local document chunks (optionally filtered by doc_id) and refines the answer.
+    Output Hierarchy Phase:
+    Synthesizes all hierarchical results (including conversation history) into a final comprehensive answer.
+    
+    Response:
+    Returns the final comprehensive answer along with the hierarchical breakdown of the intermediate results.
+    """
+    # Initialize the LLM client using your OpenAI configuration.
     llm_instance = OpenAI(
         api_key=OPENAI_API_KEY,
         model=OPENAI_MODEL,
@@ -1094,50 +1145,169 @@ def drift_search(request: DriftSearchRequest):
         temperature=OPENAI_TEMPERATURE,
         stop=OPENAI_STOP
     )
-    local_context_text = ""
-    query = """
-    MATCH (e:Entity {name: $entity})
-    OPTIONAL MATCH (e)-[r]-(neighbor:Entity)
-    RETURN e.name AS entity, collect({neighbor: neighbor.name, relationship: type(r)}) as neighbors
-    """
-    result = run_cypher_query(query, {"entity": request.entity.lower()})
-    if result:
-        row = result[0]
-        local_context_text = f"Entity: {row['entity']}\n"
-        if row.get('neighbors'):
-            neighbors_list = [f"{item['neighbor']} ({item.get('relationship', '')})" for item in row['neighbors'] if item.get('neighbor')]
-            local_context_text += "Neighbors: " + ", ".join(neighbors_list) + "\n"
-        else:
-            local_context_text += "No neighbors found.\n"
-    community_context_text = ""
-    communities = detect_communities(doc_id=None)
-    community_for_entity = None
-    for comm, entities in communities.items():
-        if request.entity.lower() in [e.lower() for e in entities]:
-            community_for_entity = comm
-            break
-    if community_for_entity is not None:
-        summaries = graph_manager_wrapper.get_stored_community_summaries(doc_id=None)
-        summary = summaries.get(community_for_entity, "No summary available.")
-        community_context_text = f"Community {community_for_entity} summary: {summary}"
-    else:
-        community_context_text = "Entity not found in any community."
-    prompt = (
-        f"Based on the following information:\nLocal Context:\n{local_context_text}\n\n"
-        f"Community Context:\n{community_context_text}\n\n"
-        f"Answer the following question about the entity '{request.entity}': {request.question}"
-    )
-    try:
-        answer = llm_instance.invoke([
-            {"role": "system", "content": "You are a professional assistant skilled in synthesizing local and community context to provide detailed answers. Do not use your prior knowledge and only use knowledge from the provided text."},
-            {"role": "user", "content": prompt}
+
+    # --- Conversation History Logic ---
+    if request.previous_conversations:
+        rewrite_prompt = (
+            f"Based on the following conversation history:\n\n{request.previous_conversations}\n\n"
+            f"rewrite the new query '{request.question}' into a standalone, unambiguous query."
+        )
+        rewritten_query = llm_instance.invoke([
+            {"role": "system", "content": "You are a professional query rewriting assistant."},
+            {"role": "user", "content": rewrite_prompt}
         ])
-    except Exception as e:
-        answer = f"LLM error: {e}"
-    return {"drift_search_answer": answer}
+        request.question = rewritten_query.strip()
+
+    # --------------------------
+    # Global (Primer) Phase: Community Summaries
+    # --------------------------
+    # Retrieve community summaries from the graph.
+    # If a doc_id is provided, the summaries will be filtered accordingly.
+    summaries = graph_manager_wrapper.get_stored_community_summaries(doc_id=request.doc_id)
+    if not summaries:
+        if request.doc_id:
+            return {
+                "drift_search_answer": f"No community summaries found for doc_id {request.doc_id}. Please re-index the dataset or try without specifying a doc_id."
+            }
+        else:
+            return {"drift_search_answer": "No community summaries available. Please re-index the dataset."}
+    
+    # Use only the summary texts.
+    community_reports = [v["summary"] for v in summaries.values() if v.get("summary")]
+    # Rank and select the most relevant community reports using your helper.
+    selected_reports = select_relevant_communities(request.question, community_reports)
+    # Combine the selected reports into a global context.
+    global_context = "\n\n".join([rep for rep, score in selected_reports])
+    
+    # Optionally include conversation history in the primer prompt.
+    conversation_context = ""
+    if request.previous_conversations:
+        conversation_context = f"Conversation History:\n{request.previous_conversations}\n\n"
+    
+    primer_prompt = (
+        "You are an expert in synthesizing information from diverse community reports. "
+        "Using the following community report excerpts:\n\n"
+        f"{global_context}\n\n"
+        f"{conversation_context}"
+        "Answer the following query by generating a hypothetical answer and list follow-up questions that could further refine the query. "
+        "Return your output as a strict JSON object with the keys: 'intermediate_answer', 'follow_up_queries' (a JSON array), and 'score' (a confidence score). "
+        "Do not include any extra commentary.\n\n"
+        f"Query: {request.question}"
+    )
+    
+    primer_result = llm_instance.invoke_json([
+        {"role": "system", "content": "You are a professional assistant."},
+        {"role": "user", "content": primer_prompt}
+    ])
+    
+    if not isinstance(primer_result, dict) or "intermediate_answer" not in primer_result:
+        return {"drift_search_answer": "Primer phase failed to generate a valid response."}
+    
+    # Build the hierarchical structure from the primer results.
+    drift_hierarchy = {
+        "query": request.question,
+        "answer": primer_result["intermediate_answer"],
+        "score": primer_result.get("score", 0),
+        "follow_ups": []  # This will collect local follow-up results.
+    }
+    
+    # ---------------------------
+    # Follow-Up Phase: Local Search Refinement
+    # ---------------------------
+    follow_up_queries = primer_result.get("follow_up_queries", [])
+    for follow_up in follow_up_queries:
+        # Ensure the follow-up query is a plain string.
+        if isinstance(follow_up, str):
+            follow_up_text = follow_up
+        elif isinstance(follow_up, dict) and "query" in follow_up:
+            follow_up_text = follow_up["query"]
+        else:
+            follow_up_text = str(follow_up)
+
+        # Retrieve local context from document chunks.
+        local_context_text = ""
+        local_chunk_query = """
+        MATCH (c:Chunk)
+        WHERE toLower(c.text) CONTAINS toLower($keyword)
+        """
+        if request.doc_id:
+            local_chunk_query += " AND c.doc_id = $doc_id"
+        local_chunk_query += "\nRETURN c.text AS chunk_text\nLIMIT 5"
+        
+        params = {"keyword": follow_up_text}
+        if request.doc_id:
+            params["doc_id"] = request.doc_id
+        
+        chunk_results = run_cypher_query(local_chunk_query, params)
+        if chunk_results:
+            chunks = [res.get("chunk_text", "") for res in chunk_results if res.get("chunk_text")]
+            local_context_text += "Related Document Chunks:\n" + "\n---\n".join(chunks) + "\n"
+        
+        # Include conversation history in the local prompt if available.
+        local_conversation = ""
+        if request.previous_conversations:
+            local_conversation = f"Conversation History:\n{request.previous_conversations}\n\n"
+        
+        local_prompt = (
+            "You are a professional assistant who refines queries using local document context. "
+            "Based solely on the following local context information:\n\n"
+            f"{local_context_text}\n\n"
+            f"{local_conversation}"
+            "Answer the following follow-up query and, if applicable, propose additional follow-up queries. "
+            "Return your answer as a strict JSON object with keys: 'answer', 'follow_up_queries' (a JSON array), and 'score'.\n\n"
+            f"Follow-Up Query: {follow_up_text}"
+        )
+        
+        local_result = llm_instance.invoke_json([
+            {"role": "system", "content": "You are a professional assistant."},
+            {"role": "user", "content": local_prompt}
+        ])
+        
+        drift_hierarchy["follow_ups"].append({
+            "query": follow_up_text,
+            "answer": local_result.get("answer", ""),
+            "score": local_result.get("score", 0),
+            "follow_ups": local_result.get("follow_up_queries", [])
+        })
+    
+    # ---------------------------------
+    # Output Hierarchy Phase: Reduction
+    # ---------------------------------
+    reduction_prompt = (
+        "You are a professional assistant tasked with synthesizing a final detailed answer from hierarchical query data. "
+        "Below is a JSON representation of the query and its follow-up answers:\n\n"
+        f"{drift_hierarchy}\n\n"
+        "Based solely on the above information, provide a final, comprehensive answer to the original query. "
+        "Return your answer as plain text without any additional commentary.\n\n"
+        f"Original Query: {request.question}"
+    )
+    
+    final_answer = llm_instance.invoke([
+        {"role": "system", "content": "You are a professional assistant."},
+        {"role": "user", "content": reduction_prompt}
+    ])
+    
+    return {
+        "drift_search_answer": final_answer.strip(),
+        "drift_hierarchy": drift_hierarchy
+    }
+
 
 @app.get("/documents")
 def list_documents():
+    """
+    Purpose:
+    Lists all documents that have been processed and stored in the graph.
+    
+    Key Phases:
+    Graph Query:
+    Runs a Cypher query to fetch distinct document IDs (doc_id), document names, and timestamps from the stored chunks.
+    Response Construction:
+    Aggregates and returns the metadata for each document.
+    
+    Response:
+    Returns a list of documents along with their metadata.
+    """
     try:
         query = """
             MATCH (c:Chunk)
@@ -1151,6 +1321,19 @@ def list_documents():
 
 @app.delete("/delete_document")
 def delete_document(request: DeleteDocumentRequest):
+    """
+    Purpose:
+    Deletes a document and its related graph data from the database.
+    
+    Key Phases:
+    Input Selection:
+    Accepts either a doc_id or a document_name for deletion.
+    Graph Cleanup:
+    Runs a Cypher query to detach and delete all nodes associated with the provided identifier.
+    
+    Response:
+    Returns a confirmation message indicating that the document was successfully deleted.
+    """
     if not request.doc_id and not request.document_name:
         raise HTTPException(status_code=400, detail="Provide either doc_id or document_name to delete a document.")
     try:
@@ -1169,6 +1352,22 @@ def delete_document(request: DeleteDocumentRequest):
 
 @app.get("/communities")
 def get_communities(doc_id: Optional[str] = None):
+    """
+    Purpose:
+    Detects and returns communities (groupings of related entities) from the graph.
+    Optionally accepts a doc_id to filter the community detection to a specific document.
+    
+    Key Phases:
+    Community Detection:
+    Uses graph algorithms (e.g., Leiden algorithm) to cluster entities.
+    Optional Filtering:
+    Applies doc_id filtering if provided to focus on a single document's communities.
+    Response Construction:
+    Returns the detected communities and the associated entities.
+    
+    Response:
+    Returns a JSON object mapping community identifiers to lists of entities.
+    """
     try:
         communities = detect_communities(doc_id)
         return {"communities": communities}
@@ -1178,6 +1377,20 @@ def get_communities(doc_id: Optional[str] = None):
 
 @app.get("/community_summaries")
 def community_summaries(doc_id: Optional[str] = None):
+    """
+    Purpose:
+    Retrieves stored summaries for detected communities.
+    Optionally accepts a doc_id to return summaries for communities within a specific document.
+    
+    Key Phases:
+    Graph Query:
+    Fetches community summaries from the database, filtered by doc_id if provided.
+    Response Construction:
+    Aggregates and returns each community’s summary and related embedding.
+    
+    Response:
+    Returns a JSON object containing community summaries (and optionally their embeddings).
+    """
     try:
         summaries = graph_manager_wrapper.get_stored_community_summaries(doc_id)
         return {"community_summaries": summaries}
@@ -1187,6 +1400,17 @@ def community_summaries(doc_id: Optional[str] = None):
 
 @app.get("/")
 def root():
+    """
+    Purpose:
+    Provides a basic health-check endpoint.
+    
+    Key Phases:
+    Static Response:
+    Returns a simple message confirming that the GraphRAG API is running.
+    
+    Response:
+    Returns a JSON message indicating the API status.
+    """
     return {"message": "GraphRAG API is running."}
 
 if __name__ == "__main__":
