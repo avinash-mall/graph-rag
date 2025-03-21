@@ -11,23 +11,25 @@ from typing import List, Dict, Any, Optional, Union, Tuple
 import math
 import requests
 import blingfire
+import hashlib
+import urllib3
+import PyPDF2
+import docx
+
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from neo4j import GraphDatabase
-import urllib3
-import hashlib
-import PyPDF2
-import docx
 
+# -----------------------------------------------------------------------------
+# Disable warnings and load environment variables
+# -----------------------------------------------------------------------------
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-# -----------------------------------------------------------------------------
-# Load Environment Variables from .env
-# -----------------------------------------------------------------------------
 load_dotenv()
 
+# -----------------------------------------------------------------------------
 # Application & Global Configuration
+# -----------------------------------------------------------------------------
 APP_HOST = os.getenv("APP_HOST") or "0.0.0.0"
 APP_PORT = int(os.getenv("APP_PORT") or "8000")
 
@@ -54,7 +56,7 @@ RELEVANCE_THRESHOLD = float(os.getenv("RELEVANCE_THRESHOLD") or "0.1")
 COREF_WORD_LIMIT = int(os.getenv("COREF_WORD_LIMIT", "8000"))
 
 # -----------------------------------------------------------------------------
-# Logging Setup
+# Logging Configuration
 # -----------------------------------------------------------------------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 LOG_DIR = os.getenv("LOG_DIR", "logs")
@@ -71,7 +73,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("GraphRAG")
 logger.info(f"Logging initialized with level: {LOG_LEVEL}")
-llm_logger = logging.getLogger("LLM_API")
 
 # -----------------------------------------------------------------------------
 # Neo4j Driver Setup
@@ -91,16 +92,18 @@ class DeleteDocumentRequest(BaseModel):
     document_name: Optional[str] = None
 
 class LocalSearchRequest(BaseModel):
-    entity: str
     question: str
+    entity: Optional[str] = None
+    previous_conversations: Optional[str] = None
 
 class DriftSearchRequest(BaseModel):
     entity: str
     question: str
 
-# -----------------------------------------------------------------------------
-# Alternative JSON Parser: Standard parser with fallback to json5
-# -----------------------------------------------------------------------------
+# =============================================================================
+# UTILITY FUNCTIONS
+# =============================================================================
+
 def parse_strict_json(response_text: str) -> Union[dict, list]:
     """
     Attempt to parse response_text as JSON.
@@ -116,35 +119,156 @@ def parse_strict_json(response_text: str) -> Union[dict, list]:
             logger.error("json5 parsing also failed: " + str(e2))
             raise e2
 
-# -----------------------------------------------------------------------------
-# Original JSON Cleaning Function (retained for other uses)
-# -----------------------------------------------------------------------------
-def clean_and_parse_json(response_text: str) -> Union[dict, list]:
-    if not isinstance(response_text, str):
-        logger.error("❌ Received non-string content for JSON parsing.")
-        return []
-    cleaned_text = response_text.strip().replace("'", '"')
-    match = re.search(r'(\{.*\}|\[.*\])', cleaned_text, re.DOTALL)
-    if match:
-        cleaned_text = match.group(0)
-    logger.debug(f"🔍 Cleaned JSON Block: {cleaned_text}")
-    while True:
-        try:
-            parsed_data = json.loads(cleaned_text)
-            logger.debug(f"✅ Successfully parsed JSON data: {parsed_data}")
-            return parsed_data
-        except json.JSONDecodeError as e:
-            unexp = int(re.findall(r'\(char (\d+)\)', str(e))[0])
-            unesc = cleaned_text.rfind('"', 0, unexp)
-            cleaned_text = cleaned_text[:unesc] + r'\"' + cleaned_text[unesc+1:]
-            closg = cleaned_text.find('"', unesc + 2)
-            cleaned_text = cleaned_text[:closg] + r'\"' + cleaned_text[closg+1:]
-            logger.warning(f"⚠️ Correcting malformed JSON at position {unexp}")
-    return []
+def clean_text(text: str) -> str:
+    """
+    Clean text to include only printable characters.
+    """
+    if not isinstance(text, str):
+        logger.error(f"❌ Received non-string content for text cleaning: {type(text)}")
+        return ""
+    cleaned_text = ''.join(filter(lambda x: x in string.printable, text.strip()))
+    logger.debug(f"✅ Cleaned text: {cleaned_text[:100]}...")
+    return cleaned_text
 
-# -----------------------------------------------------------------------------
-# Embedding API Client
-# -----------------------------------------------------------------------------
+def chunk_text(text: str, max_chunk_size: int = 512) -> List[str]:
+    """
+    Chunk text into groups of sentences that fit within max_chunk_size.
+    """
+    sentences = [s.strip() for s in blingfire.text_to_sentences(text).splitlines() if s.strip()]
+    unique_sentences = list(set(sentences))
+    chunks = []
+    current_chunk = ""
+    for s in unique_sentences:
+        if current_chunk and (len(current_chunk) + len(s) + 1) > max_chunk_size:
+            chunks.append(current_chunk.strip())
+            current_chunk = s
+        else:
+            current_chunk = s if not current_chunk else current_chunk + " " + s
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+    return chunks
+
+def run_cypher_query(query: str, parameters: Dict[str, Any] = {}) -> List[Dict[str, Any]]:
+    """
+    Execute a given Cypher query using the Neo4j driver.
+    """
+    logger.debug(f"Running Cypher query: {query} with parameters: {parameters}")
+    try:
+        with driver.session() as session:
+            result = session.run(query, **parameters)
+            data = [record.data() for record in result]
+            logger.debug(f"Query result: {data}")
+            return data
+    except Exception as e:
+        logger.error(f"Error executing query: {query}. Error: {e}")
+        raise HTTPException(status_code=500, detail=f"Neo4j query execution error: {e}")
+
+def build_llm_answer_prompt(query_context: dict) -> str:
+    prompt = f"""Given the data extracted from the graph database:
+
+Question: {query_context.get('question')}
+
+Standard Query Output:
+{json.dumps(query_context.get('standard_query_output'), indent=2)}
+
+Fuzzy Query Output:
+{json.dumps(query_context.get('fuzzy_query_output'), indent=2)}
+
+General Query Output:
+{json.dumps(query_context.get('general_query_output'), indent=2)}
+
+Provide a detailed answer to the query based solely on the information above."""
+    return prompt.strip()
+
+def build_combined_answer_prompt(user_question: str, responses: List[str]) -> str:
+    prompt = f"User Question: {user_question}\n\nThe following responses were generated for different aspects of your query:\n"
+    for idx, resp in enumerate(responses, start=1):
+        prompt += f"{idx}. {resp}\n"
+    prompt += "\nBased on the above responses, provide a final comprehensive answer that directly addresses the original question. Do not use your prior knowledge and only use knowledge from the provided text."
+    return prompt.strip()
+
+def format_natural_response(response: str) -> str:
+    logger.info(f"Raw LLM Response: {repr(response)}")
+    response = response.strip()
+    if (response.startswith("{") and response.endswith("}")) or (response.startswith("[") and response.endswith("]")):
+        try:
+            parsed_data = parse_strict_json(response)
+            if isinstance(parsed_data, dict) and "summary" in parsed_data:
+                summary = parsed_data.get("summary", "No summary available.")
+                key_points = parsed_data.get("key_points", [])
+                answer = f"{summary}\n\nKey points of note include:\n"
+                for idx, point in enumerate(key_points, 1):
+                    answer += f"{idx}. {point['point']} (Importance: {point['rating']})\n"
+                return answer.strip()
+        except Exception as e:
+            logger.error("Error parsing JSON: " + str(e))
+            return response
+    return response
+
+# =============================================================================
+# OPENAI & EMBEDDING API CLIENT CLASSES
+# =============================================================================
+
+class OpenAI:
+    def __init__(self, api_key: str, model: str, base_url: str, temperature: float, stop: List[str]):
+        self.api_key = api_key
+        self.model = model
+        self.base_url = base_url
+        self.temperature = temperature
+        self.stop = stop
+
+    def invoke(self, messages: List[Dict[str, str]]) -> str:
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": self.temperature,
+            "stop": self.stop
+        }
+        logger.debug(f"🔍 LLM Payload Sent: {json.dumps(payload, indent=2)}")
+        try:
+            response = requests.post(
+                self.base_url, json=payload,
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                timeout=OPENAI_API_TIMEOUT, verify=False
+            )
+            response.raise_for_status()
+            content = response.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+            return content
+        except requests.exceptions.RequestException as e:
+            logger.error(f"❌ API request error: {e}")
+            return "Sorry, there was a problem connecting to the API."
+        except json.JSONDecodeError as e:
+            logger.error(f"❌ JSON decoding error: {e} | Response content: {response.text}")
+            return "Sorry, the response could not be decoded correctly."
+
+    def invoke_json(self, messages: List[Dict[str, str]], fallback: bool = True) -> Union[dict, list]:
+        primary_messages = [{
+            "role": "system",
+            "content": "You are a professional assistant. Your response MUST be a valid JSON object with no additional text, markdown, or commentary."
+        }] + messages
+        response_text = self.invoke(primary_messages)
+        logger.debug("Initial LLM response:\n" + response_text)
+        try:
+            parsed = parse_strict_json(response_text)
+            return parsed
+        except Exception as e:
+            logger.warning("Initial JSON parsing failed: " + str(e))
+            if fallback:
+                fallback_messages = [{
+                    "role": "system",
+                    "content": "You are a professional assistant. IMPORTANT: Return ONLY a valid JSON object with no extra text, markdown, or commentary."
+                }] + messages
+                fallback_response_text = self.invoke(fallback_messages)
+                logger.debug("Fallback LLM response:\n" + fallback_response_text)
+                try:
+                    parsed = parse_strict_json(fallback_response_text)
+                    return parsed
+                except Exception as e2:
+                    logger.error("Fallback JSON parsing failed: " + str(e2))
+                    return {}
+            else:
+                return {}
+
 class EmbeddingAPIClient:
     def __init__(self):
         self.embedding_api_url = os.getenv("EMBEDDING_API_URL", "https://s-ailabs-gpu5.westeurope.cloudapp.azure.com/api/embed")
@@ -186,44 +310,9 @@ class EmbeddingAPIClient:
 
 embedding_client = EmbeddingAPIClient()
 
-
-def detect_communities(doc_id: Optional[str] = None) -> dict:
-    communities = {}
-    with driver.session() as session:
-        exists_record = session.run(
-            "CALL gds.graph.exists($graph_name) YIELD exists", 
-            graph_name=GRAPH_NAME
-        ).single()
-        if exists_record and exists_record["exists"]:
-            session.run("CALL gds.graph.drop($graph_name)", graph_name=GRAPH_NAME)
-        if doc_id:
-            session.run("MATCH (n:Entity {doc_id: $doc_id}) SET n:DocEntity", doc_id=doc_id)
-            config = {"RELATES_TO": {"orientation": "UNDIRECTED"}}
-            session.run(
-                "CALL gds.graph.project($graph_name, ['DocEntity'], $config) YIELD graphName",
-                graph_name=GRAPH_NAME, config=config
-            )
-        else:
-            config = {"RELATES_TO": {"orientation": "UNDIRECTED"}}
-            session.run(
-                "CALL gds.graph.project($graph_name, ['Entity'], $config)",
-                graph_name=GRAPH_NAME, config=config
-            )
-        result = session.run(
-            "CALL gds.leiden.stream($graph_name) YIELD nodeId, communityId "
-            "RETURN gds.util.asNode(nodeId).name AS entity, communityId AS community ORDER BY community, entity",
-            graph_name=GRAPH_NAME
-        )
-        for record in result:
-            comm = record["community"]
-            entity = record["entity"]
-            communities.setdefault(comm, []).append(entity)
-        session.run("CALL gds.graph.drop($graph_name)", graph_name=GRAPH_NAME)
-        if doc_id:
-            session.run("MATCH (n:DocEntity {doc_id: $doc_id}) REMOVE n:DocEntity", doc_id=doc_id)
-    return communities
-
-
+# =============================================================================
+# GRAPH DATABASE HELPER FUNCTIONS & CLASSES
+# =============================================================================
 
 def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
     from numpy import dot
@@ -312,177 +401,44 @@ def resolve_coreferences_in_parts(text: str) -> str:
     filtered_text = re.sub(r'\b(he|she|it|they|him|her|them|his|her|their|its|himself|herself|his partner)\b', '', combined_text, flags=re.IGNORECASE)
     return filtered_text.strip()
 
-def clean_residual_pronouns(text: str) -> str:
-    if not isinstance(text, str):
-        return ""
-    return re.sub(r'\b(he|she|it|they|him|her|them|his|her|their|its)\b', '', text, flags=re.IGNORECASE).strip()
-
-def parse_multiple_json_arrays(response: str) -> List[Dict[str, Any]]:
-    arrays = re.findall(r'\[.*?\]', response, re.DOTALL)
-    combined = []
-    logger.debug(f"🔍 Found potential JSON arrays: {arrays}")
-    for arr in arrays:
-        cleaned_array = re.sub(r'(?<=\w)\s*,\s*(?=\])', '', arr)
-        logger.debug(f"🔍 Attempting to parse cleaned array: {cleaned_array}")
-        try:
-            data = parse_strict_json(cleaned_array)
-            if isinstance(data, list):
-                valid_data = [entry for entry in data if entry.get('point') and isinstance(entry.get('rating'), int)]
-                combined.extend(valid_data)
-                logger.debug(f"✅ Successfully parsed data: {valid_data}")
-        except json.JSONDecodeError as e:
-            logger.error(f"❌ Error parsing JSON array: {e}. Array: {cleaned_array}")
-    return combined
-
-def clean_json_response(response: str) -> str:
-    response = response.strip()
-    if response.startswith("```") and response.endswith("```"):
-        lines = response.splitlines()
-        response = "\n".join(lines[1:-1])
-    return response
-
-def clean_text(text: str) -> str:
-    if not isinstance(text, str):
-        logger.error(f"❌ Received non-string content for text cleaning: {type(text)}")
-        return ""
-    cleaned_text = ''.join(filter(lambda x: x in string.printable, text.strip()))
-    logger.debug(f"✅ Cleaned text: {cleaned_text[:100]}...")
-    return cleaned_text
-
-def chunk_text(text: str, max_chunk_size: int = 512) -> List[str]:
-    sentences = [s.strip() for s in blingfire.text_to_sentences(text).splitlines() if s.strip()]
-    unique_sentences = list(set(sentences))
-    chunks = []
-    current_chunk = ""
-    for s in unique_sentences:
-        if current_chunk and (len(current_chunk) + len(s) + 1) > max_chunk_size:
-            chunks.append(current_chunk.strip())
-            current_chunk = s
-        else:
-            current_chunk = s if not current_chunk else current_chunk + " " + s
-    if current_chunk:
-        chunks.append(current_chunk.strip())
-    return chunks
-
-def run_cypher_query(query: str, parameters: Dict[str, Any] = {}) -> List[Dict[str, Any]]:
-    logger.debug(f"Running Cypher query: {query} with parameters: {parameters}")
-    try:
-        with driver.session() as session:
-            result = session.run(query, **parameters)
-            data = [record.data() for record in result]
-            logger.debug(f"Query result: {data}")
-            return data
-    except Exception as e:
-        logger.error(f"Error executing query: {query}. Error: {e}")
-        raise HTTPException(status_code=500, detail=f"Neo4j query execution error: {e}")
-
-def build_llm_answer_prompt(query_context: dict) -> str:
-    prompt = f"""Given the data extracted from the graph database:
-
-Question: {query_context.get('question')}
-
-Standard Query Output:
-{json.dumps(query_context.get('standard_query_output'), indent=2)}
-
-Fuzzy Query Output:
-{json.dumps(query_context.get('fuzzy_query_output'), indent=2)}
-
-General Query Output:
-{json.dumps(query_context.get('general_query_output'), indent=2)}
-
-Provide a detailed answer to the query based solely on the information above."""
-    return prompt.strip()
-
-def build_combined_answer_prompt(user_question: str, responses: List[str]) -> str:
-    prompt = f"User Question: {user_question}\n\nThe following responses were generated for different aspects of your query:\n"
-    for idx, resp in enumerate(responses, start=1):
-        prompt += f"{idx}. {resp}\n"
-    prompt += "\nBased on the above responses, provide a final comprehensive answer that directly addresses the original question. Do not use your prior knowledge and only use knowledge from the provided text."
-    return prompt.strip()
-
-def global_search_map_reduce(question: str, conversation_history: Optional[str] = None,
-                             chunk_size: int = GLOBAL_SEARCH_CHUNK_SIZE,
-                             top_n: int = GLOBAL_SEARCH_TOP_N,
-                             batch_size: int = GLOBAL_SEARCH_BATCH_SIZE) -> str:
-    summaries = graph_manager_wrapper.get_stored_community_summaries(doc_id=None)
-    if not summaries:
-        raise HTTPException(status_code=500, detail="No community summaries available. Please re-index the dataset.")
-    community_reports = list(summaries.values())
-    random.shuffle(community_reports)
-    selected_reports_with_scores = select_relevant_communities(question, community_reports)
-    if not selected_reports_with_scores:
-        selected_reports_with_scores = [(report, 0) for report in community_reports[:top_n]]
-    logger.info("Selected community reports for dynamic selection:")
-    for report, score in selected_reports_with_scores:
-        logger.info("Score: %.4f, Snippet: %s", score, report[:100])
-    llm_instance = OpenAI(
+def extract_entities_with_llm(text: str) -> List[Dict[str, str]]:
+    client = OpenAI(
         api_key=OPENAI_API_KEY,
         model=OPENAI_MODEL,
         base_url=OPENAI_BASE_URL,
         temperature=OPENAI_TEMPERATURE,
         stop=OPENAI_STOP
     )
-    intermediate_points = []
-    for report, _ in selected_reports_with_scores:
-        chunks = chunk_text(report, max_chunk_size=chunk_size)
-        for i in range(0, len(chunks), batch_size):
-            batch = chunks[i:i + batch_size]
-            batch_prompt = (
-                "You are an expert in extracting key information. For each of the following community report chunks, "
-                "extract key points that are relevant to answering the user query provided at the end. "
-                "Return the output strictly as a valid JSON array in this format: "
-                '[{"point": "key detail", "rating": 1-100}].\n\n'
-                "**IMPORTANT:** Use **double quotes** for keys and string values. Do NOT add any explanation, commentary, or extra text outside the JSON structure."
-            )
-
-            for idx, chunk in enumerate(batch):
-                batch_prompt += f"\n\nChunk {idx}:\n\"\"\"\n{chunk}\n\"\"\""
-            batch_prompt += f"\n\nUser Query:\n\"\"\"\n{question}\n\"\"\""
-            try:
-                response = llm_instance.invoke_json([
-                    {"role": "system", "content": "You are a professional extraction assistant."},
-                    {"role": "user", "content": batch_prompt}
-                ])
-                points = response  # Expected to be a parsed JSON array
-                intermediate_points.extend(points)
-            except Exception as e:
-                logger.error(f"Batch processing error: {e}")
-    logger.info("Intermediate key points extracted (unsorted):")
-    for pt in intermediate_points:
-        logger.info("Key point: %s, Rating: %s", pt.get("point"), pt.get("rating"))
-    intermediate_points_sorted = sorted(intermediate_points, key=lambda x: x.get("rating") or 0, reverse=True)
-    selected_points = intermediate_points_sorted[:top_n]
-    aggregated_context = "\n".join([f"{pt['point']} (Rating: {pt['rating']})" for pt in selected_points])
-    conv_text = f"Conversation History: {conversation_history}\n" if conversation_history else ""
-    reduce_prompt = f"""
-        You are a professional assistant skilled in synthesizing information strictly from the provided context. 
-        Using ONLY the following intermediate key points:
-        {json.dumps(intermediate_points_sorted[:top_n], indent=2)}
-        and the original user query: "{question}",
-        generate a detailed answer that directly addresses the query.
-        IMPORTANT: Do NOT use any external knowledge or assumptions beyond the provided key points.
-        Return your response strictly in the following JSON format:
-        
-        {{
-        "summary": "Your detailed answer here",
-        "key_points": [
-            {{"point": "key detail", "rating": 1-100}},
-            {{"point": "another detail", "rating": 1-100}}
-        ]
-        }}
-        Do NOT include any extra commentary, uncertainty language, or explanations.
-        """
+    prompt = (
+        "Extract all named entities from the following text. "
+        "For each entity, provide its name and type (e.g., cardinal value, date value, event name, building name, "
+        "geo-political entity, language name, law name, money name, person name, organization name, location name, "
+        " affiliation, ordinal value, percent value, product name, quantity value, time value, name of work of art). "
+        "If uncertain, label it as 'UNKNOWN'. "
+        "Return ONLY a valid JSON array (without any additional text or markdown) in the exact format: "
+        '[{"name": "entity name", "type": "entity type"}].'
+        "\n\n" + text
+    )
     try:
-        final_answer = llm_instance.invoke_json([
-            {"role": "system", "content": "You are a professional assistant providing detailed answers based solely on provided information. Infer insights when possible. Your response MUST be a valid JSON object."},
-            {"role": "user", "content": reduce_prompt}
+        response = client.invoke_json([
+            {"role": "system", "content": "You are a professional NER extraction assistant."},
+            {"role": "user", "content": prompt}
         ])
-        if isinstance(final_answer, dict) and "summary" in final_answer:
-            return format_natural_response(json.dumps(final_answer))
-        return "Here's the provided content:\n\n" + json.dumps(final_answer, indent=2)
+        if isinstance(response, dict) and "entities" in response:
+            entities = response["entities"]
+        elif isinstance(response, list):
+            entities = response
+        else:
+            raise ValueError("Unexpected JSON structure in NER response")
+        
+        filtered_entities = [
+            entity for entity in entities 
+            if entity.get('name', '').strip() and entity.get('type', '').strip()
+        ]
+        return filtered_entities
     except Exception as e:
-        final_answer = f"Error during reduce step: {e}"
-    return final_answer
+        logger.error(f"❌ NER extraction error: {e}")
+        return []
 
 class GraphManager:
     def __init__(self):
@@ -560,8 +516,7 @@ class GraphManager:
                         stop=OPENAI_STOP
                     )
                     summary = client.invoke([
-                        {"role": "system",
-                         "content": "Summarize the following text into relationships in the format: Entity1 -> Entity2 [strength: X.X]. Do not add extra commentary."},
+                        {"role": "system", "content": "Summarize the following text into relationships in the format: Entity1 -> Entity2 [strength: X.X]. Do not add extra commentary."},
                         {"role": "user", "content": chunk}
                     ])
                 except Exception as e:
@@ -613,135 +568,6 @@ class GraphManager:
 
 graph_manager = GraphManager()
 
-def extract_entities_with_llm(text: str) -> List[Dict[str, str]]:
-    client = OpenAI(
-        api_key=OPENAI_API_KEY,
-        model=OPENAI_MODEL,
-        base_url=OPENAI_BASE_URL,
-        temperature=OPENAI_TEMPERATURE,
-        stop=OPENAI_STOP
-    )
-    prompt = (
-        "Extract all named entities from the following text. "
-        "For each entity, provide its name and type (e.g., cardinal value, date value, event name, building name, "
-        "geo-political entity, language name, law name, money name, person name, organization name, location name, "
-        " affiliation, ordinal value, percent value, product name, quantity value, time value, name of work of art, etc.). "
-        "If uncertain, label it as 'UNKNOWN'. "
-        "Return ONLY a valid JSON array (without any additional text or markdown) in the exact format: "
-        '[{"name": "entity name", "type": "entity type"}].'
-        "\n\n" + text
-    )
-    try:
-        response = client.invoke_json([
-            {"role": "system", "content": "You are a professional NER extraction assistant."},
-            {"role": "user", "content": prompt}
-        ])
-        # Check if the response is a dict containing the array under a key
-        if isinstance(response, dict) and "entities" in response:
-            entities = response["entities"]
-        elif isinstance(response, list):
-            entities = response
-        else:
-            raise ValueError("Unexpected JSON structure in NER response")
-        
-        filtered_entities = [
-            entity for entity in entities 
-            if entity.get('name', '').strip() and entity.get('type', '').strip()
-        ]
-        return filtered_entities
-    except Exception as e:
-        logger.error(f"❌ NER extraction error: {e}")
-        return []
-
-
-def format_natural_response(response: str) -> str:
-    logger.info(f"Raw LLM Response: {repr(response)}")
-    response = response.strip()
-    # Check if response starts and ends with JSON delimiters.
-    if (response.startswith("{") and response.endswith("}")) or \
-       (response.startswith("[") and response.endswith("]")):
-        try:
-            parsed_data = parse_strict_json(response)
-            if isinstance(parsed_data, dict) and "summary" in parsed_data:
-                summary = parsed_data.get("summary", "No summary available.")
-                key_points = parsed_data.get("key_points", [])
-                answer = f"{summary}\n\nKey points of note include:\n"
-                for idx, point in enumerate(key_points, 1):
-                    answer += f"{idx}. {point['point']} (Importance: {point['rating']})\n"
-                return answer.strip()
-        except Exception as e:
-            logger.error("Error parsing JSON: " + str(e))
-            return response  # Fallback to plain text if parsing fails.
-    # If it doesn't look like JSON, return it directly.
-    return response
-
-# -----------------------------------------------------------------------------
-# New OpenAI Class: Single definition with both invoke and invoke_json
-# -----------------------------------------------------------------------------
-class OpenAI:
-    def __init__(self, api_key: str, model: str, base_url: str, temperature: float, stop: List[str]):
-        self.api_key = api_key
-        self.model = model
-        self.base_url = base_url
-        self.temperature = temperature
-        self.stop = stop
-
-    def invoke(self, messages: List[Dict[str, str]]) -> str:
-        payload = {
-            "model": self.model,
-            "messages": messages,
-            "temperature": self.temperature,
-            "stop": self.stop
-        }
-        logger.debug(f"🔍 LLM Payload Sent: {json.dumps(payload, indent=2)}")
-        try:
-            response = requests.post(
-                self.base_url, json=payload,
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                timeout=OPENAI_API_TIMEOUT, verify=False
-            )
-            response.raise_for_status()
-            content = response.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-            return content
-        except requests.exceptions.RequestException as e:
-            logger.error(f"❌ API request error: {e}")
-            return "Sorry, there was a problem connecting to the API."
-        except json.JSONDecodeError as e:
-            logger.error(f"❌ JSON decoding error: {e} | Response content: {response.text}")
-            return "Sorry, the response could not be decoded correctly."
-
-    def invoke_json(self, messages: List[Dict[str, str]], fallback: bool = True) -> Union[dict, list]:
-        # Improved prompting: instruct LLM to return strictly valid JSON.
-        primary_messages = [{
-            "role": "system",
-            "content": "You are a professional assistant. Your response MUST be a valid JSON object with no additional text, markdown, or commentary."
-        }] + messages
-        response_text = self.invoke(primary_messages)
-        logger.debug("Initial LLM response:\n" + response_text)
-        try:
-            parsed = parse_strict_json(response_text)
-            return parsed
-        except Exception as e:
-            logger.warning("Initial JSON parsing failed: " + str(e))
-            if fallback:
-                fallback_messages = [{
-                    "role": "system",
-                    "content": "You are a professional assistant. IMPORTANT: Return ONLY a valid JSON object with no extra text, markdown, or commentary."
-                }] + messages
-                fallback_response_text = self.invoke(fallback_messages)
-                logger.debug("Fallback LLM response:\n" + fallback_response_text)
-                try:
-                    parsed = parse_strict_json(fallback_response_text)
-                    return parsed
-                except Exception as e2:
-                    logger.error("Fallback JSON parsing failed: " + str(e2))
-                    return {}  # safe fallback
-            else:
-                return {}
-
-# -----------------------------------------------------------------------------
-# Graph Manager Extended and Wrapper
-# -----------------------------------------------------------------------------
 class GraphManagerExtended:
     def __init__(self, driver):
         self.driver = driver
@@ -843,6 +669,42 @@ class GraphManagerExtended:
                 summaries[comm] = {"summary": record["summary"], "embedding": record["embedding"]}
             return summaries
 
+def detect_communities(doc_id: Optional[str] = None) -> dict:
+    communities = {}
+    with driver.session() as session:
+        exists_record = session.run(
+            "CALL gds.graph.exists($graph_name) YIELD exists", 
+            graph_name=GRAPH_NAME
+        ).single()
+        if exists_record and exists_record["exists"]:
+            session.run("CALL gds.graph.drop($graph_name)", graph_name=GRAPH_NAME)
+        if doc_id:
+            session.run("MATCH (n:Entity {doc_id: $doc_id}) SET n:DocEntity", doc_id=doc_id)
+            config = {"RELATES_TO": {"orientation": "UNDIRECTED"}}
+            session.run(
+                "CALL gds.graph.project($graph_name, ['DocEntity'], $config) YIELD graphName",
+                graph_name=GRAPH_NAME, config=config
+            )
+        else:
+            config = {"RELATES_TO": {"orientation": "UNDIRECTED"}}
+            session.run(
+                "CALL gds.graph.project($graph_name, ['Entity'], $config)",
+                graph_name=GRAPH_NAME, config=config
+            )
+        result = session.run(
+            "CALL gds.leiden.stream($graph_name) YIELD nodeId, communityId "
+            "RETURN gds.util.asNode(nodeId).name AS entity, communityId AS community ORDER BY community, entity",
+            graph_name=GRAPH_NAME
+        )
+        for record in result:
+            comm = record["community"]
+            entity = record["entity"]
+            communities.setdefault(comm, []).append(entity)
+        session.run("CALL gds.graph.drop($graph_name)", graph_name=GRAPH_NAME)
+        if doc_id:
+            session.run("MATCH (n:DocEntity {doc_id: $doc_id}) REMOVE n:DocEntity", doc_id=doc_id)
+    return communities
+
 class GraphManagerWrapper:
     def __init__(self):
         self.manager = graph_manager
@@ -863,9 +725,116 @@ class GraphManagerWrapper:
 
 graph_manager_wrapper = GraphManagerWrapper()
 
-# -----------------------------------------------------------------------------
-# FastAPI Endpoints
-# -----------------------------------------------------------------------------
+def global_search_map_reduce(question: str, conversation_history: Optional[str] = None,
+                             chunk_size: int = GLOBAL_SEARCH_CHUNK_SIZE,
+                             top_n: int = GLOBAL_SEARCH_TOP_N,
+                             batch_size: int = GLOBAL_SEARCH_BATCH_SIZE) -> str:
+    summaries = graph_manager_wrapper.get_stored_community_summaries(doc_id=None)
+    if not summaries:
+        raise HTTPException(status_code=500, detail="No community summaries available. Please re-index the dataset.")
+    community_reports = list(summaries.values())
+    random.shuffle(community_reports)
+    selected_reports_with_scores = select_relevant_communities(question, community_reports)
+    if not selected_reports_with_scores:
+        selected_reports_with_scores = [(report, 0) for report in community_reports[:top_n]]
+    logger.info("Selected community reports for dynamic selection:")
+    for report, score in selected_reports_with_scores:
+        logger.info("Score: %.4f, Snippet: %s", score, report[:100])
+    llm_instance = OpenAI(
+        api_key=OPENAI_API_KEY,
+        model=OPENAI_MODEL,
+        base_url=OPENAI_BASE_URL,
+        temperature=OPENAI_TEMPERATURE,
+        stop=OPENAI_STOP
+    )
+    intermediate_points = []
+    for report, _ in selected_reports_with_scores:
+        chunks = chunk_text(report, max_chunk_size=chunk_size)
+        for i in range(0, len(chunks), batch_size):
+            batch = chunks[i:i + batch_size]
+            batch_prompt = (
+                "You are an expert in extracting key information. For each of the following community report chunks, "
+                "extract key points that are relevant to answering the user query provided at the end. "
+                "Return the output strictly as a valid JSON array in this format: "
+                '[{"point": "key detail", "rating": 1-100}].\n\n'
+                "**IMPORTANT:** Use **double quotes** for keys and string values. Do NOT add any explanation, commentary, or extra text outside the JSON structure."
+            )
+            for idx, chunk in enumerate(batch):
+                batch_prompt += f"\n\nChunk {idx}:\n\"\"\"\n{chunk}\n\"\"\""
+            batch_prompt += f"\n\nUser Query:\n\"\"\"\n{question}\n\"\"\""
+            try:
+                response = llm_instance.invoke_json([
+                    {"role": "system", "content": "You are a professional extraction assistant."},
+                    {"role": "user", "content": batch_prompt}
+                ])
+                points = response
+                intermediate_points.extend(points)
+            except Exception as e:
+                logger.error(f"Batch processing error: {e}")
+    logger.info("Intermediate key points extracted (unsorted):")
+    for pt in intermediate_points:
+        logger.info("Key point: %s, Rating: %s", pt.get("point"), pt.get("rating"))
+    intermediate_points_sorted = sorted(intermediate_points, key=lambda x: x.get("rating") or 0, reverse=True)
+    selected_points = intermediate_points_sorted[:top_n]
+    aggregated_context = "\n".join([f"{pt['point']} (Rating: {pt['rating']})" for pt in selected_points])
+    conv_text = f"Conversation History: {conversation_history}\n" if conversation_history else ""
+    reduce_prompt = f"""
+        You are a professional assistant specialized in synthesizing detailed information from provided data.
+        Your task is to analyze the following list of intermediate key points and the original user query, and then generate a comprehensive answer that fully explains the topic using only the provided information. 
+        Using ONLY the following intermediate key points:
+        {json.dumps(intermediate_points_sorted[:top_n], indent=2)}
+        and the original user query: "{question}",
+        generate a detailed answer that directly addresses the query.
+        Please follow these instructions:
+        1. Produce a detailed summary that directly and thoroughly answers the user’s query.
+        2. Include a list of the key points along with their ratings exactly as provided.
+        3. Provide an extended detailed explanation that weaves together all the key points, elaborating on how each contributes to the overall answer.
+        4. Do not use any external knowledge; rely solely on the provided key points.
+        5. Return your response strictly in the following JSON format:
+            {{
+            "summary": "Your detailed answer summary here",
+            "key_points": [
+                {{"point": "key detail", "rating": "1-100"}},
+                {{"point": "another detail", "rating": "1-100"}}
+            ],
+            "detailed_explanation": "A comprehensive explanation that connects all key points and fully addresses the query."
+            }}
+        Ensure that your answer is extensive, uses complete sentences, and provides a deep, detailed explanation based solely on the supplied context.
+        """
+    try:
+        final_answer = llm_instance.invoke_json([
+            {"role": "system", "content": "You are a professional assistant providing detailed answers based solely on provided information. Infer insights when possible. Your response MUST be a valid JSON object."},
+            {"role": "user", "content": reduce_prompt}
+        ])
+        if isinstance(final_answer, dict) and "summary" in final_answer:
+            return format_natural_response(json.dumps(final_answer))
+        return "Here's the provided content:\n\n" + json.dumps(final_answer, indent=2)
+    except Exception as e:
+        final_answer = f"Error during reduce step: {e}"
+    return final_answer
+
+# =============================================================================
+# TEXT2CYPHER RETRIEVER STUB
+# =============================================================================
+class Text2CypherRetriever:
+    def __init__(self, driver, llm_instance: OpenAI):
+        self.driver = driver
+        self.llm = llm_instance
+
+    def get_cypher(self, question: str) -> List[Dict[str, str]]:
+        # Dummy implementation: returns a set of simple queries for demonstration.
+        return [{
+            "question": question,
+            "standard_query": f"MATCH (n) WHERE n.text CONTAINS '{question}' RETURN n LIMIT 10",
+            "fuzzy_query": f"MATCH (n) WHERE toLower(n.text) CONTAINS toLower('{question}') RETURN n LIMIT 10",
+            "general_query": f"MATCH (n) RETURN n LIMIT 10",
+            "explanation": "Dummy query for demonstration."
+        }]
+
+# =============================================================================
+# FASTAPI ENDPOINTS
+# =============================================================================
+
 app = FastAPI(title="Graph RAG API", description="End-to-end Graph Database RAG on Neo4j", version="1.0.0")
 
 @app.post("/upload_documents")
@@ -1016,6 +985,91 @@ def global_search(request: QuestionRequest):
 
 @app.post("/local_search")
 def local_search(request: LocalSearchRequest):
+    # If an entity is not provided, try to extract one from the question.
+    search_entity = request.entity
+    if not search_entity:
+        extracted_entities = extract_entities_with_llm(request.question)
+        if extracted_entities:
+            # Take the first extracted entity as the primary entity.
+            search_entity = extracted_entities[0].get("name", "").lower()
+        else:
+            return {"error": "No entity could be identified in the question. Please provide an entity."}
+    
+    # --- Entity Context ---
+    entity_query = """
+    MATCH (e:Entity {name: $entity})
+    OPTIONAL MATCH (e)-[r]-(neighbor:Entity)
+    RETURN e.name AS entity, collect({neighbor: neighbor.name, relationship: type(r)}) AS neighbors
+    """
+    entity_result = run_cypher_query(entity_query, {"entity": search_entity.lower()})
+    if entity_result:
+        row = entity_result[0]
+        entity_context = f"Entity: {row['entity']}\n"
+        if row.get('neighbors'):
+            neighbors_list = [
+                f"{item['neighbor']} ({item.get('relationship', '')})"
+                for item in row['neighbors'] if item.get('neighbor')
+            ]
+            entity_context += "Neighbors: " + ", ".join(neighbors_list) + "\n"
+        else:
+            entity_context += "No neighbors found.\n"
+    else:
+        entity_context = "No entity context found.\n"
+    
+    # --- Conversation History Context ---
+    conversation_context = ""
+    if request.previous_conversations:
+        conversation_context = f"Conversation History:\n{request.previous_conversations}\n\n"
+    
+    # --- Community Context ---
+    communities = detect_communities(doc_id=None)
+    community_context = ""
+    community_for_entity = None
+    for comm, entities in communities.items():
+        if search_entity.lower() in [e.lower() for e in entities]:
+            community_for_entity = comm
+            break
+    if community_for_entity:
+        summaries = graph_manager_wrapper.get_stored_community_summaries(doc_id=None)
+        summary_info = summaries.get(community_for_entity, {})
+        summary = summary_info.get("summary", "No summary available.")
+        community_context = f"Community ({community_for_entity}) Summary: {summary}\n"
+    else:
+        community_context = "Entity not found in any community.\n"
+    
+    # --- Text Unit Context ---
+    text_unit_query = """
+    MATCH (c:Chunk)
+    WHERE toLower(c.text) CONTAINS $entity
+    RETURN c.text AS chunk_text
+    LIMIT 5
+    """
+    text_unit_results = run_cypher_query(text_unit_query, {"entity": search_entity.lower()})
+    text_unit_context = ""
+    if text_unit_results:
+        chunks = [res.get("chunk_text", "") for res in text_unit_results if res.get("chunk_text")]
+        text_unit_context = "Related Document Chunks:\n" + "\n---\n".join(chunks) + "\n"
+    else:
+        text_unit_context = "No related document chunks found.\n"
+    
+    # --- Combine All Contexts ---
+    combined_context = (
+        conversation_context +
+        entity_context + "\n" +
+        community_context + "\n" +
+        text_unit_context
+    )
+    
+    # --- Build the Prompt Using a System Prompt Template ---
+    local_search_system_prompt = (
+        "You are a professional assistant who answers queries strictly based on the provided context.\n\n"
+        "Context:\n{context_data}\n\n"
+        "Question: {question}\n\n"
+        "Answer:"
+    )
+    prompt = local_search_system_prompt.format(context_data=combined_context, question=request.question)
+    
+    # --- LLM Call ---
     llm_instance = OpenAI(
         api_key=OPENAI_API_KEY,
         model=OPENAI_MODEL,
@@ -1023,31 +1077,13 @@ def local_search(request: LocalSearchRequest):
         temperature=OPENAI_TEMPERATURE,
         stop=OPENAI_STOP
     )
-    query = """
-    MATCH (e:Entity {name: $entity})
-    OPTIONAL MATCH (e)-[r]-(neighbor:Entity)
-    RETURN e.name AS entity, collect({neighbor: neighbor.name, relationship: type(r)}) as neighbors
-    """
-    result = run_cypher_query(query, {"entity": request.entity.lower()})
-    if result:
-        row = result[0]
-        context = f"Entity: {row['entity']}\n"
-        if row.get('neighbors'):
-            neighbors_list = [f"{item['neighbor']} ({item.get('relationship', '')})" for item in row['neighbors'] if item.get('neighbor')]
-            context += "Neighbors: " + ", ".join(neighbors_list) + "\n"
-        else:
-            context += "No neighbors found.\n"
-    else:
-        context = "No local context found."
-    prompt = f"Based on the following local context:\n{context}\n\nAnswer the following question about the entity '{request.entity}': {request.question}"
-    try:
-        answer = llm_instance.invoke([
-            {"role": "system", "content": "You are a professional assistant skilled in reasoning based on local context information. Do not use your prior knowledge and only use knowledge from the provided text."},
-            {"role": "user", "content": prompt}
-        ])
-    except Exception as e:
-        answer = f"LLM error: {e}"
+    answer = llm_instance.invoke([
+        {"role": "system", "content": "You are a professional assistant who answers strictly based on the provided context."},
+        {"role": "user", "content": prompt}
+    ])
+    
     return {"local_search_answer": answer}
+
 
 @app.post("/drift_search")
 def drift_search(request: DriftSearchRequest):
