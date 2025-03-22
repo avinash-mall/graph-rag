@@ -277,7 +277,7 @@ class OpenAI:
 
 class EmbeddingAPIClient:
     def __init__(self):
-        self.embedding_api_url = os.getenv("EMBEDDING_API_URL", "https://s-ailabs-gpu5.westeurope.cloudapp.azure.com/api/embed")
+        self.embedding_api_url = os.getenv("EMBEDDING_API_URL", "http://localhost/api/embed")
         self.timeout = OPENAI_API_TIMEOUT
         self.logger = logging.getLogger("EmbeddingAPIClient")
         self.logger.setLevel(logging.INFO)
