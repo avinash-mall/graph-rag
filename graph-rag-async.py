@@ -1,4 +1,5 @@
 import asyncio
+import threading
 import hashlib
 import json
 import logging
@@ -21,6 +22,32 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from neo4j import GraphDatabase
 from pydantic import BaseModel
+
+# -----------------------------------------------------------------------------
+# Helper function to run asynchronous coroutines without calling asyncio.run()
+# inside an already running event loop.
+# -----------------------------------------------------------------------------
+def run_async(coro):
+    try:
+        # Try to get the current running event loop.
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop and loop.is_running():
+        # Running inside an existing event loop – run the coroutine in a new thread with its own loop.
+        result_container = {}
+        def run():
+            new_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(new_loop)
+            result_container["result"] = new_loop.run_until_complete(coro)
+            new_loop.close()
+        thread = threading.Thread(target=run)
+        thread.start()
+        thread.join()
+        return result_container["result"]
+    else:
+        # No running event loop, safe to use asyncio.run()
+        return asyncio.run(coro)
 
 # -----------------------------------------------------------------------------
 # Disable warnings and load environment variables
@@ -56,12 +83,10 @@ GLOBAL_SEARCH_BATCH_SIZE = int(os.getenv("GLOBAL_SEARCH_BATCH_SIZE") or "20")
 RELEVANCE_THRESHOLD = float(os.getenv("RELEVANCE_THRESHOLD") or "0.1")
 COREF_WORD_LIMIT = int(os.getenv("COREF_WORD_LIMIT", "8000"))
 
-# -----------------------------------------------------------------------------
-# Logging Configuration
-# -----------------------------------------------------------------------------
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+# Logging Configuration (optional)
 LOG_DIR = os.getenv("LOG_DIR", "logs")
 LOG_FILE = os.getenv("LOG_FILE", "app.log")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 os.makedirs(LOG_DIR, exist_ok=True)
 
 logging.basicConfig(
@@ -222,7 +247,9 @@ class AsyncOpenAI:
             return content
 
     async def invoke_json(self, messages: List[Dict[str, str]], fallback: bool = True) -> Union[dict, list]:
-        primary_messages = [{"role": "system", "content": "You are a professional assistant. Your response MUST be a valid JSON object with no additional text, markdown, or commentary."}] + messages
+        primary_messages = [{"role": "system", "content": "You are a professional assistant. Your response MUST be a "
+                                                          "valid JSON object with no additional text, markdown formatting, "
+                                                          "code blocks, or commentary."}] + messages
         response_text = await self.invoke(primary_messages)
         logger.debug("Raw LLM response: " + repr(response_text))
         try:
@@ -231,7 +258,10 @@ class AsyncOpenAI:
         except Exception as e:
             logger.warning("Initial JSON parsing failed: " + str(e))
             if fallback:
-                fallback_messages = [{"role": "system", "content": "You are a professional assistant. IMPORTANT: Return ONLY a valid JSON object with no extra text, markdown, or commentary."}] + messages
+                fallback_messages = [{"role": "system", "content": "You are a professional assistant. IMPORTANT: "
+                                                                   "Return ONLY a valid JSON object with no extra "
+                                                                   "text, markdown formatting, code blocks, "
+                                                                   "or commentary."}] + messages
                 fallback_response_text = await self.invoke(fallback_messages)
                 logger.debug("Fallback LLM response:\n" + fallback_response_text)
                 try:
@@ -274,25 +304,28 @@ class AsyncEmbeddingAPIClient:
         tasks = [self.get_embedding(text) for text in texts]
         return await asyncio.gather(*tasks)
 
+# -----------------------------------------------------------------------------
+# Synchronous wrappers for asynchronous API clients.
+# -----------------------------------------------------------------------------
 class SyncOpenAI:
     def __init__(self, api_key: str, model: str, base_url: str, temperature: float, stop: List[str], timeout: int):
         self.async_llm = AsyncOpenAI(api_key, model, base_url, temperature, stop, timeout)
 
     def invoke(self, messages: List[Dict[str, str]]) -> str:
-        return asyncio.run(self.async_llm.invoke(messages))
+        return run_async(self.async_llm.invoke(messages))
 
     def invoke_json(self, messages: List[Dict[str, str]], fallback: bool = True) -> Union[dict, list]:
-        return asyncio.run(self.async_llm.invoke_json(messages, fallback))
+        return run_async(self.async_llm.invoke_json(messages, fallback))
 
 class SyncEmbeddingAPIClient:
     def __init__(self):
         self.async_client = AsyncEmbeddingAPIClient()
 
     def get_embedding(self, text: str) -> List[float]:
-        return asyncio.run(self.async_client.get_embedding(text))
+        return run_async(self.async_client.get_embedding(text))
 
     def get_embeddings(self, texts: List[str]) -> List[List[float]]:
-        return asyncio.run(self.async_client.get_embeddings(texts))
+        return run_async(self.async_client.get_embeddings(texts))
 
 # Create a global synchronous embedding client instance.
 sync_embedding_client = SyncEmbeddingAPIClient()
@@ -399,7 +432,7 @@ def extract_entities_with_llm(text: str) -> List[Dict[str, str]]:
               '[{"name": "entity name", "type": "entity type"}].'
               "\n\n" + text)
     try:
-        response = asyncio.run(client.invoke_json([
+        response = run_async(client.invoke_json([
             {"role": "system", "content": "You are a professional NER extraction assistant."},
             {"role": "user", "content": prompt}
         ]))
@@ -449,7 +482,6 @@ class GraphManager:
                     logger.warning(f"Skipping empty or numeric chunk with ID {i}")
                     continue
                 try:
-                    # Use the synchronous wrapper to retrieve the embedding.
                     chunk_embedding = sync_embedding_client.get_embedding(chunk)
                 except Exception as e:
                     logger.error(f"Error generating embedding for chunk: {chunk} - {e}")
@@ -470,7 +502,6 @@ class GraphManager:
                             timestamp=meta.get("timestamp"), embedding=chunk_embedding)
                 logger.info(f"Added chunk {i} with text: {chunk[:100]}...")
                 try:
-                    # Use the synchronous OpenAI wrapper (OpenAI is aliased to SyncOpenAI)
                     client = OpenAI(api_key=OPENAI_API_KEY, model=OPENAI_MODEL,
                                     base_url=OPENAI_BASE_URL,
                                     temperature=OPENAI_TEMPERATURE, stop=OPENAI_STOP, timeout=OPENAI_API_TIMEOUT)
@@ -532,7 +563,6 @@ class GraphManagerExtended:
         with self.driver.session() as session:
             communities = detect_communities(doc_id)
             logger.debug(f"Detected communities for doc_id {doc_id}: {communities}")
-            # Use the synchronous OpenAI wrapper (OpenAI is aliased to SyncOpenAI)
             llm = OpenAI(api_key=OPENAI_API_KEY, model=OPENAI_MODEL, base_url=OPENAI_BASE_URL,
                          temperature=OPENAI_TEMPERATURE, stop=OPENAI_STOP, timeout=OPENAI_API_TIMEOUT)
             if not communities:
@@ -663,7 +693,6 @@ def global_search_map_reduce(question: str, conversation_history: Optional[str] 
     logger.info("Selected community reports for dynamic selection:")
     for report, score in selected_reports_with_scores:
         logger.info("Score: %.4f, Snippet: %s", score, report[:100])
-    # Using the synchronous OpenAI wrapper (OpenAI is aliased to SyncOpenAI)
     llm_instance = OpenAI(api_key=OPENAI_API_KEY, model=OPENAI_MODEL, base_url=OPENAI_BASE_URL,
                           temperature=OPENAI_TEMPERATURE, stop=OPENAI_STOP, timeout=OPENAI_API_TIMEOUT)
     intermediate_points = []
@@ -738,7 +767,6 @@ class Text2CypherRetriever:
         self.llm = llm_instance
 
     def get_cypher(self, question: str) -> List[Dict[str, str]]:
-        # Dummy implementation: returns a set of simple queries for demonstration.
         return [
             {"question": question, "standard_query": f"MATCH (n) WHERE n.text CONTAINS '{question}' RETURN n LIMIT 10",
              "fuzzy_query": f"MATCH (n) WHERE toLower(n.text) CONTAINS toLower('{question}') RETURN n LIMIT 10",
@@ -782,7 +810,6 @@ async def upload_documents(files: List[UploadFile] = File(...)):
         all_chunks.extend(chunks)
         meta_list.extend([meta] * len(chunks))
     try:
-        # Run synchronous graph building in a separate thread.
         await asyncio.to_thread(graph_manager.build_graph, all_chunks, meta_list)
     except Exception as e:
         logger.error(f"Graph building error: {e}")
@@ -800,7 +827,7 @@ async def upload_documents(files: List[UploadFile] = File(...)):
 @app.post("/ask_question")
 async def ask_question(request: QuestionRequest):
     async_llm = AsyncOpenAI(api_key=OPENAI_API_KEY, model=OPENAI_MODEL, base_url=OPENAI_BASE_URL,
-                            temperature=OPENAI_TEMPERATURE, stop=OPENAI_STOP)
+                            temperature=OPENAI_TEMPERATURE, stop=OPENAI_STOP, timeout=OPENAI_API_TIMEOUT)
     if request.previous_conversations:
         rewrite_prompt = (f"Based on the user's previous history query about '{request.previous_conversations}', "
                           f"rewrite their new query: '{request.question}' into a standalone query.")
@@ -810,7 +837,6 @@ async def ask_question(request: QuestionRequest):
         ])
         logger.debug(f"Rewritten query: {rewritten_query}")
         request.question = rewritten_query
-    # Use a synchronous LLM instance for the retriever.
     retriever = Text2CypherRetriever(driver, OpenAI(api_key=OPENAI_API_KEY, model=OPENAI_MODEL,
                                                      base_url=OPENAI_BASE_URL, temperature=OPENAI_TEMPERATURE,
                                                      stop=OPENAI_STOP, timeout=OPENAI_API_TIMEOUT))
@@ -885,48 +911,122 @@ async def global_search(request: GlobalSearchRequest):
     return {"answer": format_natural_response(answer)}
 
 @app.post("/local_search")
-async def local_search(request: LocalSearchRequest):
-    if not request.doc_id:
-        return {"error": "doc_id parameter is required for local search."}
-    conversation_context = f"Conversation History:\n{request.previous_conversations}\n\n" if request.previous_conversations else ""
-    summaries = graph_manager_wrapper.get_stored_community_summaries(doc_id=request.doc_id)
-    if summaries:
-        community_context = "Community Summaries:\n" + "\n".join(
-            [f"{comm}: {info['summary']}" for comm, info in summaries.items() if info.get("summary")]) + "\n"
-    else:
-        community_context = "No community summaries found for the specified document.\n"
-    text_unit_query = """
-        MATCH (c:Chunk)
-        WHERE c.doc_id = $doc_id
-        RETURN c.text AS chunk_text
-        LIMIT 5
+def local_search(request: LocalSearchRequest):
+    """
+    Advanced Local Search using Entity-based Reasoning.
+
+    This endpoint builds the local context by:
+      1. Incorporating conversation history (if provided).
+      2. Retrieving community summaries (entity-report mapping) using the doc_id.
+      3. Retrieving document text units (raw text chunks) via a Cypher query.
+      4. Extracting candidate entities (from community summary keys) and relationships
+         (via a Cypher query on RELATES_TO relationships).
+      5. Combining all of these into a single context that is then used to generate an answer via the LLM.
+
+    If no doc_id is provided, the endpoint falls back to conversation history only.
+    """
+    # --- Conversation History ---
+    conversation_context = (
+        f"Conversation History:\n{request.previous_conversations}\n\n"
+        if request.previous_conversations else ""
+    )
+
+    final_context = ""
+
+    if request.doc_id:
+        # --- Community Context ---
+        summaries = graph_manager_wrapper.get_stored_community_summaries(doc_id=request.doc_id)
+        if summaries:
+            # Assume these summaries are already prioritized.
+            community_context = "Community Reports:\n" + "\n".join(
+                [f"{comm}: {info['summary']}" for comm, info in summaries.items()]
+            ) + "\n"
+        else:
+            community_context = "No community reports available.\n"
+
+        # --- Document Text Units ---
+        text_unit_query = """
+            MATCH (c:Chunk)
+            WHERE c.doc_id = $doc_id
+            RETURN c.text AS chunk_text
+            LIMIT 10
         """
-    text_unit_results = run_cypher_query(text_unit_query, {"doc_id": request.doc_id})
-    if text_unit_results:
-        chunks = [res.get("chunk_text", "") for res in text_unit_results if res.get("chunk_text")]
-        text_unit_context = "Related Document Chunks:\n" + "\n---\n".join(chunks) + "\n"
+        text_unit_results = run_cypher_query(text_unit_query, {"doc_id": request.doc_id})
+        if text_unit_results:
+            text_unit_context = "Document Text Units:\n" + "\n---\n".join(
+                [res.get("chunk_text", "") for res in text_unit_results if res.get("chunk_text")]
+            ) + "\n"
+        else:
+            text_unit_context = "No document text units found.\n"
+
+        # --- Entity Extraction (from Community Summaries) ---
+        if summaries:
+            # Simulate entity extraction by using the keys of the community summaries.
+            entities = list(summaries.keys())
+            entity_context = "Extracted Entities: " + ", ".join(entities) + "\n"
+        else:
+            entity_context = "No entities extracted.\n"
+
+        # --- Entity Relationships ---
+        relationship_query = """
+            MATCH (e1:Entity)-[r:RELATES_TO]->(e2:Entity)
+            WHERE e1.doc_id = $doc_id AND e2.doc_id = $doc_id
+            RETURN e1.name AS source, e2.name AS target, r.weight AS weight
+            LIMIT 10
+        """
+        relationship_results = run_cypher_query(relationship_query, {"doc_id": request.doc_id})
+        if relationship_results:
+            relationship_lines = [
+                f"{res['source']} -> {res['target']} (Weight: {res.get('weight', 1)})"
+                for res in relationship_results
+            ]
+            relationship_context = "Entity Relationships:\n" + "\n".join(relationship_lines) + "\n"
+        else:
+            relationship_context = "No entity relationships found.\n"
+
+        # --- Combine All Contexts ---
+        final_context = (
+            conversation_context +
+            community_context +
+            text_unit_context +
+            entity_context +
+            relationship_context
+        )
     else:
-        text_unit_context = "No related document chunks found.\n"
-    combined_context = conversation_context + community_context + "\n" + text_unit_context
-    local_search_system_prompt = (
-        "You are a professional assistant who answers queries strictly based on the provided context.\n\n"
-        "Context:\n{context_data}\n\n"
-        "Question: {question}\n\n"
-        "Answer:")
-    prompt = local_search_system_prompt.format(context_data=combined_context, question=request.question)
-    async_llm = AsyncOpenAI(api_key=OPENAI_API_KEY, model=OPENAI_MODEL, base_url=OPENAI_BASE_URL,
-                            temperature=OPENAI_TEMPERATURE, stop=OPENAI_STOP)
-    answer = await async_llm.invoke([
-        {"role": "system",
-         "content": "You are a professional assistant who answers strictly based on the provided context."},
+        # If no doc_id is provided, use only conversation history.
+        final_context = conversation_context + "No document-specific context available.\n"
+
+    # --- Build Final Prompt ---
+    prompt = (
+        "You are a professional assistant who answers queries based solely on the provided local context.\n\n"
+        f"Context:\n{final_context}\n\n"
+        f"Question: {request.question}\n\n"
+        "Answer:"
+    )
+    logger.debug(f"Local search prompt:\n{prompt}")
+
+    # --- LLM Invocation ---
+    # Note: The timeout parameter is now provided.
+    llm_instance = OpenAI(
+        api_key=OPENAI_API_KEY,
+        model=OPENAI_MODEL,
+        base_url=OPENAI_BASE_URL,
+        temperature=OPENAI_TEMPERATURE,
+        stop=OPENAI_STOP,
+        timeout=OPENAI_API_TIMEOUT
+    )
+    answer = llm_instance.invoke([
+        {"role": "system", "content": "You are a professional assistant who answers strictly based on the provided context."},
         {"role": "user", "content": prompt}
     ])
+
     return {"local_search_answer": answer}
+
 
 @app.post("/drift_search")
 async def drift_search(request: DriftSearchRequest):
     async_llm = AsyncOpenAI(api_key=OPENAI_API_KEY, model=OPENAI_MODEL, base_url=OPENAI_BASE_URL,
-                            temperature=OPENAI_TEMPERATURE, stop=OPENAI_STOP)
+                            temperature=OPENAI_TEMPERATURE, stop=OPENAI_STOP, timeout=OPENAI_API_TIMEOUT)
     if request.previous_conversations:
         rewrite_prompt = (f"Based on the following conversation history:\n\n{request.previous_conversations}\n\n"
                           f"rewrite the new query '{request.question}' into a standalone, unambiguous query.")
@@ -945,14 +1045,18 @@ async def drift_search(request: DriftSearchRequest):
     selected_reports = select_relevant_communities(request.question, community_reports)
     global_context = "\n\n".join([rep for rep, score in selected_reports])
     conversation_context = f"Conversation History:\n{request.previous_conversations}\n\n" if request.previous_conversations else ""
-    primer_prompt = ("You are an expert in synthesizing information from diverse community reports. "
-                     "Using the following community report excerpts:\n\n"
-                     f"{global_context}\n\n"
-                     f"{conversation_context}"
-                     "Answer the following query by generating a hypothetical answer and list follow-up questions that could further refine the query. "
-                     "Return your output as a strict JSON object with the keys: 'intermediate_answer', 'follow_up_queries' (a JSON array), and 'score' (a confidence score). "
-                     "Do not include any extra commentary.\n\n"
-                     f"Query: {request.question}")
+    primer_prompt = (
+        "You are an expert in synthesizing information from diverse community reports. "
+        "Using the following community report excerpts:\n\n"
+        f"{global_context}\n\n"
+        f"{conversation_context}"
+        "Answer the following query by generating a hypothetical answer and listing follow-up questions that could "
+        "further refine the query."
+        "Return your output as a strict JSON object with the keys: 'intermediate_answer', 'follow_up_queries' (a JSON "
+        "array), and 'score' (a confidence score),"
+        "and do not include any markdown formatting, code blocks, or extra commentary.\n\n"
+        f"Query: {request.question}"
+    )
     primer_result = await async_llm.invoke_json([
         {"role": "system", "content": "You are a professional assistant."},
         {"role": "user", "content": primer_prompt}
