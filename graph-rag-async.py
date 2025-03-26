@@ -910,113 +910,112 @@ async def global_search(request: GlobalSearchRequest):
     logger.debug(f"Raw search answer: {answer}")
     return {"answer": format_natural_response(answer)}
 
+
 @app.post("/local_search")
 def local_search(request: LocalSearchRequest):
     """
-    Advanced Local Search using Entity-based Reasoning.
+    Local Search Endpoint with Prioritization & Filtering
 
-    This endpoint builds the local context by:
-      1. Incorporating conversation history (if provided).
-      2. Retrieving community summaries (entity-report mapping) using the doc_id.
-      3. Retrieving document text units (raw text chunks) via a Cypher query.
-      4. Extracting candidate entities (from community summary keys) and relationships
-         (via a Cypher query on RELATES_TO relationships).
-      5. Combining all of these into a single context that is then used to generate an answer via the LLM.
-
-    If no doc_id is provided, the endpoint falls back to conversation history only.
+    This implementation performs the following:
+      1. Retrieves community summaries (filtered by doc_id if provided).
+      2. Computes the embedding for the user query using sync_embedding_client.
+      3. Calculates cosine similarity between the query and each community summary's embedding.
+      4. Filters and ranks the summaries based on a threshold, including only the top-k.
+      5. Retrieves document chunks (filtered by doc_id if provided).
+      6. Combines conversation history, filtered community summaries, and document chunks into a final prompt.
+      7. Invokes the LLM to generate an answer strictly based on the provided context.
     """
-    # --- Conversation History ---
+    # --- 1. Conversation History Context ---
     conversation_context = (
         f"Conversation History:\n{request.previous_conversations}\n\n"
         if request.previous_conversations else ""
     )
 
-    final_context = ""
-
+    # --- 2. Retrieve and Filter Community Summaries ---
+    # Fetch summaries by doc_id if provided; otherwise, use global summaries.
     if request.doc_id:
-        # --- Community Context ---
         summaries = graph_manager_wrapper.get_stored_community_summaries(doc_id=request.doc_id)
-        if summaries:
-            # Assume these summaries are already prioritized.
-            community_context = "Community Reports:\n" + "\n".join(
-                [f"{comm}: {info['summary']}" for comm, info in summaries.items()]
-            ) + "\n"
-        else:
-            community_context = "No community reports available.\n"
+    else:
+        summaries = graph_manager_wrapper.get_stored_community_summaries()
 
-        # --- Document Text Units ---
+    if summaries:
+        # Compute embedding for the user query using the global synchronous embedding client.
+        query_embedding = sync_embedding_client.get_embedding(request.question)
+        scored_summaries = []
+        # Compute cosine similarity between the query embedding and each summary's embedding.
+        for comm, info in summaries.items():
+            if info.get("embedding"):
+                summary_embedding = info["embedding"]
+                score = cosine_similarity(query_embedding, summary_embedding)
+                scored_summaries.append((comm, info["summary"], score))
+
+        # Filter out low-scoring summaries (e.g., threshold = 0.3) and sort descending by similarity score.
+        threshold = 0.3
+        filtered_summaries = [
+            (comm, summary, score) for comm, summary, score in scored_summaries if score >= threshold
+        ]
+        filtered_summaries.sort(key=lambda x: x[2], reverse=True)
+
+        # Limit to top_k results (e.g., top 3).
+        top_k = 3
+        top_summaries = filtered_summaries[:top_k]
+
+        # Build the community context text including similarity scores (for debugging).
+        community_context = "Community Summaries (ranked by similarity):\n" + "\n".join(
+            [f"{comm}: {summary} (Score: {score:.2f})" for comm, summary, score in top_summaries]
+        ) + "\n"
+    else:
+        community_context = "No community summaries available.\n"
+
+    # --- 3. Retrieve Document Text Units (Chunks) ---
+    if request.doc_id:
         text_unit_query = """
-            MATCH (c:Chunk)
-            WHERE c.doc_id = $doc_id
-            RETURN c.text AS chunk_text
-            LIMIT 10
+        MATCH (c:Chunk)
+        WHERE c.doc_id = $doc_id
+        RETURN c.text AS chunk_text
+        LIMIT 5
         """
         text_unit_results = run_cypher_query(text_unit_query, {"doc_id": request.doc_id})
-        if text_unit_results:
-            text_unit_context = "Document Text Units:\n" + "\n---\n".join(
-                [res.get("chunk_text", "") for res in text_unit_results if res.get("chunk_text")]
-            ) + "\n"
-        else:
-            text_unit_context = "No document text units found.\n"
-
-        # --- Entity Extraction (from Community Summaries) ---
-        if summaries:
-            # Simulate entity extraction by using the keys of the community summaries.
-            entities = list(summaries.keys())
-            entity_context = "Extracted Entities: " + ", ".join(entities) + "\n"
-        else:
-            entity_context = "No entities extracted.\n"
-
-        # --- Entity Relationships ---
-        relationship_query = """
-            MATCH (e1:Entity)-[r:RELATES_TO]->(e2:Entity)
-            WHERE e1.doc_id = $doc_id AND e2.doc_id = $doc_id
-            RETURN e1.name AS source, e2.name AS target, r.weight AS weight
-            LIMIT 10
-        """
-        relationship_results = run_cypher_query(relationship_query, {"doc_id": request.doc_id})
-        if relationship_results:
-            relationship_lines = [
-                f"{res['source']} -> {res['target']} (Weight: {res.get('weight', 1)})"
-                for res in relationship_results
-            ]
-            relationship_context = "Entity Relationships:\n" + "\n".join(relationship_lines) + "\n"
-        else:
-            relationship_context = "No entity relationships found.\n"
-
-        # --- Combine All Contexts ---
-        final_context = (
-            conversation_context +
-            community_context +
-            text_unit_context +
-            entity_context +
-            relationship_context
-        )
     else:
-        # If no doc_id is provided, use only conversation history.
-        final_context = conversation_context + "No document-specific context available.\n"
+        text_unit_query = """
+        MATCH (c:Chunk)
+        RETURN c.text AS chunk_text
+        LIMIT 5
+        """
+        text_unit_results = run_cypher_query(text_unit_query)
 
-    # --- Build Final Prompt ---
-    prompt = (
-        "You are a professional assistant who answers queries based solely on the provided local context.\n\n"
-        f"Context:\n{final_context}\n\n"
-        f"Question: {request.question}\n\n"
+    if text_unit_results:
+        text_unit_context = "Document Text Units:\n" + "\n---\n".join(
+            [res.get("chunk_text", "") for res in text_unit_results if res.get("chunk_text")]
+        ) + "\n"
+    else:
+        text_unit_context = "No document text units found.\n"
+
+    # --- 4. Combine All Contexts ---
+    combined_context = conversation_context + community_context + text_unit_context
+
+    # --- 5. Build the Final Prompt ---
+    prompt_template = (
+        "You are a professional assistant who answers queries strictly based on the provided context.\n\n"
+        "Context:\n{context}\n\n"
+        "Question: {question}\n\n"
         "Answer:"
     )
+    prompt = prompt_template.format(context=combined_context, question=request.question)
     logger.debug(f"Local search prompt:\n{prompt}")
 
-    # --- LLM Invocation ---
-    # Note: The timeout parameter is now provided.
+    # --- 6. Invoke the LLM ---
     llm_instance = OpenAI(
         api_key=OPENAI_API_KEY,
         model=OPENAI_MODEL,
         base_url=OPENAI_BASE_URL,
         temperature=OPENAI_TEMPERATURE,
         stop=OPENAI_STOP,
-        timeout=OPENAI_API_TIMEOUT
+        timeout=OPENAI_API_TIMEOUT  # Pass the timeout parameter here
     )
     answer = llm_instance.invoke([
-        {"role": "system", "content": "You are a professional assistant who answers strictly based on the provided context."},
+        {"role": "system",
+         "content": "You are a professional assistant who answers strictly based on the provided context."},
         {"role": "user", "content": prompt}
     ])
 
