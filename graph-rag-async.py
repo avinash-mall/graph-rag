@@ -135,6 +135,64 @@ class GlobalSearchRequest(BaseModel):
 # =============================================================================
 # UTILITY FUNCTIONS
 # =============================================================================
+# --- Query Validation and Fallback ---
+def validate_and_refine_query(initial_query: str, question: str, llm_instance: OpenAI) -> str:
+    results = run_cypher_query(initial_query)
+    if results:
+        return initial_query
+    fallback_prompt = (
+        f"The generated Cypher query returned no results. "
+        f"Based on the provided schema and question, generate an alternative query that retrieves data. "
+        f"Schema: (:Actor)-[:ActedIn]->(:Movie). Question: {question}. "
+        "Return valid JSON with key 'cypher_query'."
+    )
+    messages = [
+        {"role": "system", "content": "You are a professional assistant. Return ONLY valid JSON with no extra commentary."},
+        {"role": "user", "content": fallback_prompt}
+    ]
+    raw_response = llm_instance.invoke_json(messages, fallback=True)
+    if isinstance(raw_response, (dict, list)):
+        raw_response = json.dumps(raw_response)
+    refined_query = extract_cypher_query(raw_response)
+    fallback_results = run_cypher_query(refined_query)
+    return refined_query if fallback_results else refined_query
+
+# --- Enhanced Final Synthesis Prompt ---
+def build_enhanced_final_prompt(question: str, responses: List[str], query: str, query_output: dict) -> str:
+    return (
+        f"User Question: {question}\n\n"
+        f"Generated Cypher Query: {query}\n\n"
+        f"Query Output: {json.dumps(query_output, indent=2)}\n\n"
+        "Based solely on the provided data, generate a comprehensive answer. "
+        "If the query output is empty, explain possible reasons (e.g., schema mismatch or missing data) "
+        "and suggest corrective actions. Do not include external knowledge."
+    )
+
+# Helper to extract a valid Cypher query from the LLM response.
+def extract_cypher_query(response_text: str) -> str:
+    try:
+        data = parse_strict_json(response_text)
+        if isinstance(data, dict) and "cypher_query" in data:
+            return data["cypher_query"].strip()
+    except Exception as e:
+        logger.error(f"Error parsing JSON: {e}")
+    # Fallback to conventional postprocessing.
+    return _postprocess_output_cypher(response_text)
+
+def _postprocess_output_cypher(output_cypher: str) -> str:
+    # Try to extract content between triple backticks.
+    if "```" in output_cypher:
+        parts = output_cypher.split("```")
+        # Assume the first code block contains the Cypher query.
+        code = parts[1]
+        if code.lower().startswith("cypher"):
+            code = code[len("cypher"):].strip()
+        return code.strip()
+    # Fallback: Remove extraneous text.
+    partition_by = "**Explanation:**"
+    output_cypher, _, _ = output_cypher.partition(partition_by)
+    return output_cypher.strip("`\n").lstrip("cypher\n").strip("`\n ")
+
 def parse_strict_json(response_text: str) -> Union[dict, list]:
     try:
         return json.loads(response_text)
@@ -761,16 +819,36 @@ def global_search_map_reduce(question: str, conversation_history: Optional[str] 
 # =============================================================================
 # TEXT2CYPHER RETRIEVER STUB
 # =============================================================================
+# Modified Text2CypherRetriever that uses the Hugging Face text2cypher model.
 class Text2CypherRetriever:
-    def __init__(self, driver, llm_instance: OpenAI):
+    def __init__(self, driver, llm_instance: OpenAI, schema: str = "(:Actor)-[:ActedIn]->(:Movie)"):
         self.driver = driver
         self.llm = llm_instance
+        self.schema = schema
 
-    def get_cypher(self, question: str) -> List[Dict[str, str]]:
-        return [
-            {"question": question, "standard_query": f"MATCH (n) WHERE n.text CONTAINS '{question}' RETURN n LIMIT 10",
-             "fuzzy_query": f"MATCH (n) WHERE toLower(n.text) CONTAINS toLower('{question}') RETURN n LIMIT 10",
-             "general_query": f"MATCH (n) RETURN n LIMIT 10", "explanation": "Dummy query for demonstration."}]
+    def get_cypher(self, question: str) -> List[dict]:
+        instruction = (
+            "Generate a Cypher query for a Neo4j graph database using only the provided schema. "
+            "Schema: {schema}. Question: {question}. "
+            "Return valid JSON with a single key 'cypher_query' containing only the Cypher query. "
+            "Ensure the query uses exactly the provided labels and relationships."
+        )
+        prompt = instruction.format(schema=self.schema, question=question)
+        messages = [
+            {"role": "system", "content": "You are a professional assistant. Your response MUST be valid JSON with no extra text."},
+            {"role": "user", "content": prompt}
+        ]
+        raw_response = self.llm.invoke_json(messages, fallback=True)
+        if isinstance(raw_response, (dict, list)):
+            raw_response = json.dumps(raw_response)
+        cypher_query = extract_cypher_query(raw_response)
+        validated_query = validate_and_refine_query(cypher_query, question, self.llm)
+        return [{
+            "question": question,
+            "cypher_query": validated_query,
+            "explanation": "Generated using avinashm/text2cypher with refined prompt and query validation."
+        }]
+
 
 # =============================================================================
 # FASTAPI ENDPOINTS (Modified to be asynchronous where possible)
@@ -824,77 +902,85 @@ async def upload_documents(files: List[UploadFile] = File(...)):
             logger.error(f"Error storing community summaries for doc_id {doc_id}: {e}")
     return {"message": "Documents processed, graph updated, and community summaries stored successfully."}
 
+
+# Modified ask_question endpoint that uses the new Text2CypherRetriever.
 @app.post("/ask_question")
 async def ask_question(request: QuestionRequest):
-    async_llm = AsyncOpenAI(api_key=OPENAI_API_KEY, model=OPENAI_MODEL, base_url=OPENAI_BASE_URL,
-                            temperature=OPENAI_TEMPERATURE, stop=OPENAI_STOP, timeout=OPENAI_API_TIMEOUT)
+    async_llm = AsyncOpenAI(
+        api_key=OPENAI_API_KEY,
+        model=OPENAI_MODEL,  # For rewriting and final synthesis.
+        base_url=OPENAI_BASE_URL,
+        temperature=OPENAI_TEMPERATURE,
+        stop=OPENAI_STOP,
+        timeout=OPENAI_API_TIMEOUT
+    )
+
+    # Rewrite question if previous conversation exists.
     if request.previous_conversations:
-        rewrite_prompt = (f"Based on the user's previous history query about '{request.previous_conversations}', "
-                          f"rewrite their new query: '{request.question}' into a standalone query.")
+        rewrite_prompt = (
+            f"Based on the previous conversation: '{request.previous_conversations}', "
+            f"rewrite the query: '{request.question}' into a standalone query."
+        )
         rewritten_query = await async_llm.invoke([
             {"role": "system", "content": "You are a professional query rewriting assistant."},
             {"role": "user", "content": rewrite_prompt}
         ])
         logger.debug(f"Rewritten query: {rewritten_query}")
-        request.question = rewritten_query
-    retriever = Text2CypherRetriever(driver, OpenAI(api_key=OPENAI_API_KEY, model=OPENAI_MODEL,
-                                                     base_url=OPENAI_BASE_URL, temperature=OPENAI_TEMPERATURE,
-                                                     stop=OPENAI_STOP, timeout=OPENAI_API_TIMEOUT))
-    try:
-        generated_queries = retriever.get_cypher(request.question)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error generating cypher queries: {e}")
+        request.question = rewritten_query.strip()
+
+    # Instantiate an LLM client for text-to-Cypher conversion.
+    cypher_llm = OpenAI(
+        api_key=OPENAI_API_KEY,
+        model="avinashm/text2cypher",
+        base_url=OPENAI_BASE_URL,
+        temperature=0.2,
+        stop=OPENAI_STOP,
+        timeout=OPENAI_API_TIMEOUT
+    )
+    retriever = Text2CypherRetriever(driver, cypher_llm, schema="(:Actor)-[:ActedIn]->(:Movie)")
+    generated_queries = retriever.get_cypher(request.question)
 
     async def process_query(item: dict) -> dict:
         question_text = item.get("question", "")
-        query_types = {"standard_query": item.get("standard_query", ""),
-                       "fuzzy_query": item.get("fuzzy_query", ""),
-                       "general_query": item.get("general_query", "")}
-        query_outputs = {}
-        for key, query in query_types.items():
-            if query:
-                try:
-                    query_outputs[f"{key}_output"] = run_cypher_query(query)
-                except Exception as e:
-                    query_outputs[f"{key}_output"] = {"error": str(e)}
-            else:
-                query_outputs[f"{key}_output"] = []
-        query_context = {"question": question_text,
-                         "standard_query": query_types["standard_query"],
-                         "standard_query_output": query_outputs["standard_query_output"],
-                         "fuzzy_query": query_types["fuzzy_query"],
-                         "fuzzy_query_output": query_outputs["fuzzy_query_output"],
-                         "general_query": query_types["general_query"],
-                         "general_query_output": query_outputs["general_query_output"],
-                         "explanation": item.get("explanation", "")}
-        answer_prompt = build_llm_answer_prompt(query_context)
-        logger.debug(f"Answer prompt for question '{question_text}':\n{answer_prompt}")
-        try:
-            llm_answer = await async_llm.invoke([
-                {"role": "system",
-                 "content": "You are a professional assistant who answers queries concisely based solely on the provided Neo4j Cypher query outputs."},
-                {"role": "user", "content": answer_prompt}
-            ])
-        except Exception as e:
-            llm_answer = f"LLM error: {e}"
-        return {"question": question_text, "llm_response": llm_answer.strip()}
+        cypher_query = item.get("cypher_query", "")
+        query_output = {}
+        if cypher_query:
+            try:
+                query_output["cypher_output"] = run_cypher_query(cypher_query)
+            except Exception as e:
+                query_output["cypher_output"] = {"error": str(e)}
+        answer_prompt = (
+            f"Given the following data for the question:\n{question_text}\n\n"
+            f"Cypher Query:\n{cypher_query}\n\n"
+            f"Query Output:\n{json.dumps(query_output.get('cypher_output'), indent=2)}\n\n"
+            "Provide a detailed answer based solely on this information. "
+            "If no data is returned, explain potential reasons and suggest corrective actions."
+        )
+        llm_answer = await async_llm.invoke([
+            {"role": "system",
+             "content": "You are a professional assistant answering based solely on the provided data."},
+            {"role": "user", "content": answer_prompt}
+        ])
+        return {
+            "question": question_text,
+            "llm_response": llm_answer.strip(),
+            "cypher_query": cypher_query,
+            "query_output": query_output.get("cypher_output")
+        }
 
     final_answers = await asyncio.gather(*(process_query(item) for item in generated_queries))
-    responses_for_combined = [answer["llm_response"] for answer in final_answers]
-    combined_prompt = build_combined_answer_prompt(request.question, responses_for_combined)
-    logger.debug(f"Combined prompt:\n{combined_prompt}")
-    try:
-        combined_llm_response = await async_llm.invoke([
-            {"role": "system",
-             "content": "You are a professional assistant who synthesizes information from multiple sources to provide a detailed final answer."},
-            {"role": "user", "content": combined_prompt}
-        ])
-    except Exception as e:
-        combined_llm_response = f"LLM error: {e}"
-    final_response = {"user_question": request.question,
-                      "combined_response": format_natural_response(combined_llm_response.strip()),
-                      "answers": final_answers}
-    logger.debug(f"Final response: {json.dumps(final_response, indent=2)}")
+    primary = final_answers[0] if final_answers else {"cypher_query": "", "query_output": {}}
+    combined_prompt = build_enhanced_final_prompt(request.question, [a["llm_response"] for a in final_answers],
+                                                  primary["cypher_query"], primary.get("query_output", {}))
+    combined_llm_response = await async_llm.invoke([
+        {"role": "system", "content": "You are a professional assistant synthesizing multiple sources."},
+        {"role": "user", "content": combined_prompt}
+    ])
+    final_response = {
+        "user_question": request.question,
+        "combined_response": format_natural_response(combined_llm_response.strip()),
+        "answers": final_answers
+    }
     return final_response
 
 @app.post("/global_search")
