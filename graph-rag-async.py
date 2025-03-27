@@ -1,3 +1,4 @@
+from __future__ import annotations
 import asyncio
 import threading
 import hashlib
@@ -29,24 +30,28 @@ from pydantic import BaseModel
 # -----------------------------------------------------------------------------
 def run_async(coro):
     try:
-        # Try to get the current running event loop.
         loop = asyncio.get_running_loop()
     except RuntimeError:
         loop = None
     if loop and loop.is_running():
-        # Running inside an existing event loop – run the coroutine in a new thread with its own loop.
         result_container = {}
         def run():
-            new_loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(new_loop)
-            result_container["result"] = new_loop.run_until_complete(coro)
-            new_loop.close()
+            try:
+                new_loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(new_loop)
+                result_container["result"] = new_loop.run_until_complete(coro)
+            except Exception as e:
+                result_container["result"] = e
+            finally:
+                new_loop.close()
         thread = threading.Thread(target=run)
         thread.start()
         thread.join()
-        return result_container["result"]
+        result = result_container.get("result")
+        if isinstance(result, Exception):
+            raise result
+        return result
     else:
-        # No running event loop, safe to use asyncio.run()
         return asyncio.run(coro)
 
 # -----------------------------------------------------------------------------
@@ -135,9 +140,19 @@ class GlobalSearchRequest(BaseModel):
 # =============================================================================
 # UTILITY FUNCTIONS
 # =============================================================================
-# --- Query Validation and Fallback ---
-def validate_and_refine_query(initial_query: str, question: str, llm_instance: OpenAI) -> str:
-    results = run_cypher_query(initial_query)
+
+def get_schema_from_neo4j() -> str:
+    try:
+        # Run the APOC procedure to fetch the schema
+        schema_result = run_cypher_query("CALL apoc.meta.schema()")
+        # Optionally, process the result to format it nicely for your LLM
+        return json.dumps(schema_result, indent=2)
+    except Exception as e:
+        logger.error(f"Error retrieving schema: {e}")
+        return "Error retrieving schema from Neo4j."
+        
+async def validate_and_refine_query(initial_query: str, question: str, llm_instance: AsyncOpenAI) -> str:
+    results = await asyncio.to_thread(run_cypher_query, initial_query)
     if results:
         return initial_query
     fallback_prompt = (
@@ -150,14 +165,13 @@ def validate_and_refine_query(initial_query: str, question: str, llm_instance: O
         {"role": "system", "content": "You are a professional assistant. Return ONLY valid JSON with no extra commentary."},
         {"role": "user", "content": fallback_prompt}
     ]
-    raw_response = llm_instance.invoke_json(messages, fallback=True)
+    raw_response = await llm_instance.invoke_json(messages, fallback=True)
     if isinstance(raw_response, (dict, list)):
         raw_response = json.dumps(raw_response)
     refined_query = extract_cypher_query(raw_response)
-    fallback_results = run_cypher_query(refined_query)
+    fallback_results = await asyncio.to_thread(run_cypher_query, refined_query)
     return refined_query if fallback_results else refined_query
 
-# --- Enhanced Final Synthesis Prompt ---
 def build_enhanced_final_prompt(question: str, responses: List[str], query: str, query_output: dict) -> str:
     return (
         f"User Question: {question}\n\n"
@@ -168,27 +182,46 @@ def build_enhanced_final_prompt(question: str, responses: List[str], query: str,
         "and suggest corrective actions. Do not include external knowledge."
     )
 
-# Helper to extract a valid Cypher query from the LLM response.
 def extract_cypher_query(response_text: str) -> str:
     try:
         data = parse_strict_json(response_text)
-        if isinstance(data, dict) and "cypher_query" in data:
-            return data["cypher_query"].strip()
+        if isinstance(data, dict):
+            if "cypher_query" in data:
+                return data["cypher_query"].strip()
+            elif "query" in data:
+                return data["query"].strip()
     except Exception as e:
         logger.error(f"Error parsing JSON: {e}")
-    # Fallback to conventional postprocessing.
     return _postprocess_output_cypher(response_text)
 
+def fix_cypher_query(query: str) -> str:
+    # If the query is wrapped in a JSON object with key "query", extract it.
+    try:
+        data = json.loads(query)
+        if isinstance(data, dict) and "query" in data:
+            query = data["query"]
+    except Exception:
+        pass
+
+    # Replace invalid label syntax with a valid pattern.
+    if "b:Entity|Chunk" in query:
+        query = query.replace("b:Entity|Chunk", "b")
+        # If no WHERE clause is present in the MATCH clause, add one.
+        match_clause = query.split("WITH")[0]
+        if "WHERE" not in match_clause:
+            query = query.replace("MATCH (a:Entity)-[r]->(b)", "MATCH (a:Entity)-[r]->(b)\nWHERE b:Entity OR b:Chunk")
+    # Replace type(b) with type(r) since b is a node.
+    if "type(b)" in query:
+        query = query.replace("type(b)", "type(r)")
+    return query
+
 def _postprocess_output_cypher(output_cypher: str) -> str:
-    # Try to extract content between triple backticks.
     if "```" in output_cypher:
         parts = output_cypher.split("```")
-        # Assume the first code block contains the Cypher query.
         code = parts[1]
         if code.lower().startswith("cypher"):
             code = code[len("cypher"):].strip()
         return code.strip()
-    # Fallback: Remove extraneous text.
     partition_by = "**Explanation:**"
     output_cypher, _, _ = output_cypher.partition(partition_by)
     return output_cypher.strip("`\n").lstrip("cypher\n").strip("`\n ")
@@ -281,178 +314,11 @@ def format_natural_response(response: str) -> str:
             return response
     return response
 
-# =============================================================================
-# ASYNCHRONOUS OPENAI & EMBEDDING API CLIENT CLASSES
-# =============================================================================
-class AsyncOpenAI:
-    def __init__(self, api_key: str, model: str, base_url: str, temperature: float, stop: List[str], timeout: int):
-        self.api_key = api_key
-        self.model = model
-        self.base_url = base_url
-        self.temperature = temperature
-        self.stop = stop
-        self.timeout = timeout
+# --- MISSING LOGIC ADDED BELOW ---
 
-    async def invoke(self, messages: List[Dict[str, str]]) -> str:
-        payload = {"model": self.model, "messages": messages, "temperature": self.temperature, "stop": self.stop}
-        logger.debug(f"LLM Payload Sent: {json.dumps(payload, indent=2)}")
-        headers = {"Authorization": f"Bearer {self.api_key}"}
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
-            response = await client.post(self.base_url, json=payload, headers=headers)
-            response.raise_for_status()
-            data = response.json()
-            content = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-            return content
-
-    async def invoke_json(self, messages: List[Dict[str, str]], fallback: bool = True) -> Union[dict, list]:
-        primary_messages = [{"role": "system", "content": "You are a professional assistant. Your response MUST be a "
-                                                          "valid JSON object with no additional text, markdown formatting, "
-                                                          "code blocks, or commentary."}] + messages
-        response_text = await self.invoke(primary_messages)
-        logger.debug("Raw LLM response: " + repr(response_text))
-        try:
-            parsed = parse_strict_json(response_text)
-            return parsed
-        except Exception as e:
-            logger.warning("Initial JSON parsing failed: " + str(e))
-            if fallback:
-                fallback_messages = [{"role": "system", "content": "You are a professional assistant. IMPORTANT: "
-                                                                   "Return ONLY a valid JSON object with no extra "
-                                                                   "text, markdown formatting, code blocks, "
-                                                                   "or commentary."}] + messages
-                fallback_response_text = await self.invoke(fallback_messages)
-                logger.debug("Fallback LLM response:\n" + fallback_response_text)
-                try:
-                    parsed = parse_strict_json(fallback_response_text)
-                    return parsed
-                except Exception as e2:
-                    logger.error("Fallback JSON parsing failed: " + str(e2))
-                    return {}
-            else:
-                return {}
-
-class AsyncEmbeddingAPIClient:
-    def __init__(self):
-        self.embedding_api_url = os.getenv("EMBEDDING_API_URL", "http://localhost/api/embed")
-        self.timeout = OPENAI_API_TIMEOUT
-        self.logger = logging.getLogger("EmbeddingAPIClient")
-        self.cache = {}
-
-    def _get_text_hash(self, text: str) -> str:
-        return hashlib.md5(text.encode('utf-8')).hexdigest()
-
-    async def get_embedding(self, text: str) -> List[float]:
-        text_hash = self._get_text_hash(text)
-        if text_hash in self.cache:
-            self.logger.info(f"Embedding for text (hash: {text_hash}) retrieved from cache.")
-            return self.cache[text_hash]
-        self.logger.info("Requesting embedding for text (first 50 chars): %s", text[:50])
-        payload = {"model": "mxbai-embed-large", "input": text}
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
-            response = await client.post(self.embedding_api_url, json=payload, headers={"Content-Type": "application/json"})
-            response.raise_for_status()
-            embedding = response.json().get("embeddings", [[]])[0]
-            if not embedding:
-                raise ValueError(f"Empty embedding returned for text: {text[:50]}")
-            self.logger.debug("Received embedding of length: %d", len(embedding))
-            self.cache[text_hash] = embedding
-            return embedding
-
-    async def get_embeddings(self, texts: List[str]) -> List[List[float]]:
-        tasks = [self.get_embedding(text) for text in texts]
-        return await asyncio.gather(*tasks)
-
-# -----------------------------------------------------------------------------
-# Synchronous wrappers for asynchronous API clients.
-# -----------------------------------------------------------------------------
-class SyncOpenAI:
-    def __init__(self, api_key: str, model: str, base_url: str, temperature: float, stop: List[str], timeout: int):
-        self.async_llm = AsyncOpenAI(api_key, model, base_url, temperature, stop, timeout)
-
-    def invoke(self, messages: List[Dict[str, str]]) -> str:
-        return run_async(self.async_llm.invoke(messages))
-
-    def invoke_json(self, messages: List[Dict[str, str]], fallback: bool = True) -> Union[dict, list]:
-        return run_async(self.async_llm.invoke_json(messages, fallback))
-
-class SyncEmbeddingAPIClient:
-    def __init__(self):
-        self.async_client = AsyncEmbeddingAPIClient()
-
-    def get_embedding(self, text: str) -> List[float]:
-        return run_async(self.async_client.get_embedding(text))
-
-    def get_embeddings(self, texts: List[str]) -> List[List[float]]:
-        return run_async(self.async_client.get_embeddings(texts))
-
-# Create a global synchronous embedding client instance.
-sync_embedding_client = SyncEmbeddingAPIClient()
-
-# Alias OpenAI to SyncOpenAI so that existing references work.
-OpenAI = SyncOpenAI
-
-# =============================================================================
-# GRAPH DATABASE HELPER FUNCTIONS & CLASSES (Synchronous)
-# =============================================================================
-def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
-    from numpy import dot
-    from numpy.linalg import norm
-    return dot(vec1, vec2) / (norm(vec1) * norm(vec2) + 1e-8)
-
-def select_relevant_communities(query: str, community_reports: List[Union[str, dict]], top_k: int = GLOBAL_SEARCH_TOP_N,
-                                threshold: float = RELEVANCE_THRESHOLD) -> List[Tuple[str, float]]:
-    query_embedding = sync_embedding_client.get_embedding(query)
-    scored_reports = []
-    for report in community_reports:
-        if isinstance(report, dict) and "embedding" in report:
-            report_embedding = report["embedding"]
-            summary_text = report["summary"]
-        else:
-            summary_text = report
-            report_embedding = sync_embedding_client.get_embedding(report)
-        score = cosine_similarity(query_embedding, report_embedding)
-        logger.info("Computed cosine similarity for community report snippet '%s...' is %.4f", summary_text[:50], score)
-        if score >= threshold:
-            scored_reports.append((summary_text, score))
-        else:
-            logger.info("Filtered out community report snippet '%s...' with score %.4f (threshold: %.2f)",
-                        summary_text[:50], score, threshold)
-    scored_reports.sort(key=lambda x: x[1], reverse=True)
-    logger.info("Selected community reports after filtering:")
-    for rep, score in scored_reports:
-        logger.info("Score: %.4f, Snippet: %s", score, rep[:100])
-    return scored_reports[:top_k]
-
-def clean_empty_chunks():
-    query = """
-    MATCH (c:Chunk)
-    WHERE c.text IS NULL OR TRIM(c.text) = ""
-    DETACH DELETE c
-    """
-    try:
-        deleted_count = run_cypher_query(query)
-        logger.info(f"Cleaned up {len(deleted_count)} empty or invalid chunks from the database.")
-    except Exception as e:
-        logger.error(f"Error cleaning empty chunks: {e}")
-
-def clean_empty_nodes():
-    query = """
-    MATCH (n)
-    WHERE size(keys(n)) = 0 AND NOT (n)-[]-()
-    DELETE n
-    """
-    try:
-        deleted_count = run_cypher_query(query)
-        logger.info(f"Cleaned up {len(deleted_count)} empty nodes from the database.")
-    except Exception as e:
-        logger.error(f"Error cleaning empty nodes: {e}")
-
-# -----------------------------------------------------------------------------
-# Asynchronous Coreference Resolution
-# -----------------------------------------------------------------------------
 async def resolve_coreferences_in_parts(text: str) -> str:
     async_client = AsyncOpenAI(api_key=OPENAI_API_KEY, model=OPENAI_MODEL,
-                               base_url=OPENAI_BASE_URL, temperature=OPENAI_TEMPERATURE, stop=OPENAI_STOP, timeout=OPENAI_API_TIMEOUT)
+                                 base_url=OPENAI_BASE_URL, temperature=OPENAI_TEMPERATURE, stop=OPENAI_STOP, timeout=OPENAI_API_TIMEOUT)
     words = text.split()
     parts = [" ".join(words[i:i + COREF_WORD_LIMIT]) for i in range(0, len(words), COREF_WORD_LIMIT)]
 
@@ -462,7 +328,7 @@ async def resolve_coreferences_in_parts(text: str) -> str:
             "Ensure no unresolved pronouns like 'he', 'she', 'himself', etc. remain. "
             "If the referenced entity is unclear, make an intelligent guess based on context.\n\n" + part)
         try:
-            resolved_text = await async_client.invoke([
+            resolved_text = await async_llm.invoke([
                 {"role": "system", "content": "You are a professional text refiner skilled in coreference resolution."},
                 {"role": "user", "content": prompt}
             ])
@@ -507,40 +373,115 @@ def extract_entities_with_llm(text: str) -> List[Dict[str, str]]:
         logger.error(f"NER extraction error: {e}")
         return []
 
+# --- END OF MISSING LOGIC ---
+
+def get_refined_system_message() -> str:
+    return (
+        "You are a professional assistant. Your response MUST be a valid JSON object with no additional text, "
+        "markdown formatting, or commentary. Ensure the JSON is complete and properly formatted with matching opening "
+        "and closing braces. If there is an error, return a JSON object with a key 'error' and a descriptive message."
+    )
+
 # =============================================================================
-# GRAPH DATABASE HELPER FUNCTIONS & CLASSES (Synchronous)
+# ASYNCHRONOUS OPENAI & EMBEDDING API CLIENT CLASSES
+# =============================================================================
+class AsyncOpenAI:
+    def __init__(self, api_key: str, model: str, base_url: str, temperature: float, stop: List[str], timeout: int):
+        self.api_key = api_key
+        self.model = model
+        self.base_url = base_url
+        self.temperature = temperature
+        self.stop = stop
+        self.timeout = timeout
+
+    async def invoke(self, messages: List[Dict[str, str]]) -> str:
+        payload = {"model": self.model, "messages": messages, "temperature": self.temperature, "stop": self.stop}
+        logger.debug(f"LLM Payload Sent: {json.dumps(payload, indent=2)}")
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+            response = await client.post(self.base_url, json=payload, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+            return content
+
+    async def invoke_json(self, messages: List[Dict[str, str]], fallback: bool = True) -> Union[dict, list]:
+        primary_messages = [{"role": "system", "content": get_refined_system_message()}] + messages
+        response_text = await self.invoke(primary_messages)
+        logger.debug("Raw LLM response: " + repr(response_text))
+        try:
+            parsed = parse_strict_json(response_text)
+            return parsed
+        except Exception as e:
+            logger.warning("Initial JSON parsing failed: " + str(e))
+            if fallback:
+                fallback_messages = [{"role": "system", "content": get_refined_system_message()}] + messages
+                fallback_response_text = await self.invoke(fallback_messages)
+                logger.debug("Fallback LLM response:\n" + fallback_response_text)
+                try:
+                    parsed = parse_strict_json(fallback_response_text)
+                    return parsed
+                except Exception as e2:
+                    logger.error("Fallback JSON parsing failed: " + str(e2))
+                    return {"error": "Failed to parse JSON response after fallback."}
+            else:
+                return {"error": "Failed to parse JSON response."}
+
+class AsyncEmbeddingAPIClient:
+    def __init__(self):
+        self.embedding_api_url = os.getenv("EMBEDDING_API_URL", "http://localhost/api/embed")
+        self.timeout = OPENAI_API_TIMEOUT
+        self.logger = logging.getLogger("EmbeddingAPIClient")
+        self.cache = {}
+
+    def _get_text_hash(self, text: str) -> str:
+        return hashlib.md5(text.encode('utf-8')).hexdigest()
+
+    async def get_embedding(self, text: str) -> List[float]:
+        text_hash = self._get_text_hash(text)
+        if text_hash in self.cache:
+            self.logger.info(f"Embedding for text (hash: {text_hash}) retrieved from cache.")
+            return self.cache[text_hash]
+        self.logger.info("Requesting embedding for text (first 50 chars): %s", text[:50])
+        payload = {"model": "mxbai-embed-large", "input": text}
+        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+            response = await client.post(self.embedding_api_url, json=payload, headers={"Content-Type": "application/json"})
+            response.raise_for_status()
+            embedding = response.json().get("embeddings", [[]])[0]
+            if not embedding:
+                raise ValueError(f"Empty embedding returned for text: {text[:50]}")
+            self.logger.debug("Received embedding of length: %d", len(embedding))
+            self.cache[text_hash] = embedding
+            return embedding
+
+    async def get_embeddings(self, texts: List[str]) -> List[List[float]]:
+        tasks = [self.get_embedding(text) for text in texts]
+        return await asyncio.gather(*tasks)
+
+# Global asynchronous client instances
+async_llm = AsyncOpenAI(
+    api_key=OPENAI_API_KEY,
+    model=OPENAI_MODEL,
+    base_url=OPENAI_BASE_URL,
+    temperature=OPENAI_TEMPERATURE,
+    stop=OPENAI_STOP,
+    timeout=OPENAI_API_TIMEOUT
+)
+
+async_embedding_client = AsyncEmbeddingAPIClient()
+
+# =============================================================================
+# GRAPH DATABASE HELPER FUNCTIONS & CLASSES (Asynchronous LLM Calls)
 # =============================================================================
 class GraphManager:
-    def __init__(self):
-        pass
-
-    def _merge_entity(self, session, name: str, doc_id: str, chunk_id: int):
-        query = """
-        MERGE (e:Entity {name: $name, doc_id: $doc_id})
-        MERGE (e)-[:MENTIONED_IN]->(c:Chunk {id: $cid, doc_id: $doc_id})
-        """
-        session.run(query, name=name, doc_id=doc_id, cid=chunk_id)
-
-    def _merge_cooccurrence(self, session, name_a: str, name_b: str, doc_id: str):
-        query = """
-            MATCH (a:Entity {name: $name_a, doc_id: $doc_id})-[:MENTIONED_IN]->(c:Chunk)
-            MATCH (b:Entity {name: $name_b, doc_id: $doc_id})-[:MENTIONED_IN]->(c)
-            MERGE (entity_a:Entity {name: $name_a, doc_id: $doc_id})
-            MERGE (entity_b:Entity {name: $name_b, doc_id: $doc_id})
-            ON CREATE SET entity_a.created_at = timestamp()
-            ON CREATE SET entity_b.created_at = timestamp()
-            MERGE (entity_a)-[:CO_OCCURS_WITH]->(entity_b)
-        """
-        session.run(query, name_a=name_a, name_b=name_b, doc_id=doc_id)
-
-    def build_graph(self, chunks: List[str], metadata_list: List[Dict[str, any]]) -> None:
+    async def build_graph(self, chunks: List[str], metadata_list: List[Dict[str, Any]]) -> None:
         with driver.session() as session:
             for i, (chunk, meta) in enumerate(zip(chunks, metadata_list)):
                 if not chunk.strip() or chunk.strip().isdigit():
                     logger.warning(f"Skipping empty or numeric chunk with ID {i}")
                     continue
                 try:
-                    chunk_embedding = sync_embedding_client.get_embedding(chunk)
+                    chunk_embedding = await async_embedding_client.get_embedding(chunk)
                 except Exception as e:
                     logger.error(f"Error generating embedding for chunk: {chunk} - {e}")
                     continue
@@ -560,10 +501,7 @@ class GraphManager:
                             timestamp=meta.get("timestamp"), embedding=chunk_embedding)
                 logger.info(f"Added chunk {i} with text: {chunk[:100]}...")
                 try:
-                    client = OpenAI(api_key=OPENAI_API_KEY, model=OPENAI_MODEL,
-                                    base_url=OPENAI_BASE_URL,
-                                    temperature=OPENAI_TEMPERATURE, stop=OPENAI_STOP, timeout=OPENAI_API_TIMEOUT)
-                    summary = client.invoke([
+                    summary = await async_llm.invoke([
                         {"role": "system", "content": "Summarize the following text into relationships in the format: Entity1 -> Entity2 [strength: X.X]. Do not add extra commentary."},
                         {"role": "user", "content": chunk}
                     ])
@@ -593,7 +531,7 @@ class GraphManager:
                                         cid=i)
         logger.info("Graph construction complete.")
 
-    def reproject_graph(self, graph_name: str = GRAPH_NAME, doc_id: Optional[str] = None) -> None:
+    async def reproject_graph(self, graph_name: str = GRAPH_NAME, doc_id: Optional[str] = None) -> None:
         with driver.session() as session:
             exists_record = session.run("CALL gds.graph.exists($graph_name) YIELD exists",
                                         graph_name=graph_name).single()
@@ -617,16 +555,16 @@ class GraphManagerExtended:
     def __init__(self, driver):
         self.driver = driver
 
-    def store_community_summaries(self, doc_id: str) -> None:
+    async def store_community_summaries(self, doc_id: str) -> None:
         with self.driver.session() as session:
             communities = detect_communities(doc_id)
             logger.debug(f"Detected communities for doc_id {doc_id}: {communities}")
-            llm = OpenAI(api_key=OPENAI_API_KEY, model=OPENAI_MODEL, base_url=OPENAI_BASE_URL,
-                         temperature=OPENAI_TEMPERATURE, stop=OPENAI_STOP, timeout=OPENAI_API_TIMEOUT)
+            llm = AsyncOpenAI(api_key=OPENAI_API_KEY, model=OPENAI_MODEL, base_url=OPENAI_BASE_URL,
+                              temperature=OPENAI_TEMPERATURE, stop=OPENAI_STOP, timeout=OPENAI_API_TIMEOUT)
             if not communities:
                 logger.warning(f"No communities detected for doc_id {doc_id}. Creating default summary.")
                 default_summary = "No communities detected."
-                default_embedding = sync_embedding_client.get_embedding(default_summary)
+                default_embedding = await async_embedding_client.get_embedding(default_summary)
                 store_query = """
                 CREATE (cs:CommunitySummary {doc_id: $doc_id, community: 'default', summary: $summary, embedding: $embedding, timestamp: $timestamp})
                 """
@@ -651,15 +589,15 @@ class GraphManagerExtended:
                               "Avoid vague fillers.\n\n" + aggregated_text)
                     logger.info(f"Aggregated text for community {comm}: {aggregated_text}")
                     try:
-                        summary = llm.invoke([{"role": "system",
-                                               "content": "You are a professional summarization assistant. Do not use your prior knowledge and only use knowledge from the provided text."},
-                                              {"role": "user", "content": prompt}])
+                        summary = await llm.invoke([{"role": "system",
+                                                     "content": "You are a professional summarization assistant. Do not use your prior knowledge and only use knowledge from the provided text."},
+                                                    {"role": "user", "content": prompt}])
                     except Exception as e:
                         logger.error(f"Failed to generate summary for community {comm}: {e}")
                         summary = "No summary available due to error."
                     logger.debug(f"Storing summary for community {comm}: {summary}")
                     try:
-                        summary_embedding = sync_embedding_client.get_embedding(summary)
+                        summary_embedding = await async_embedding_client.get_embedding(summary)
                     except Exception as e:
                         logger.error(f"Failed to generate embedding for summary of community {comm}: {e}")
                         summary_embedding = []
@@ -670,7 +608,7 @@ class GraphManagerExtended:
                     session.run(store_query, doc_id=doc_id, community=comm, summary=summary,
                                 embedding=summary_embedding, timestamp=datetime.now().isoformat())
 
-    def get_stored_community_summaries(self, doc_id: Optional[str] = None) -> dict:
+    async def get_stored_community_summaries(self, doc_id: Optional[str] = None) -> dict:
         with self.driver.session() as session:
             if doc_id:
                 query = """
@@ -721,38 +659,36 @@ class GraphManagerWrapper:
     def __init__(self):
         self.manager = graph_manager
 
-    def build_graph(self, chunks: List[str], metadata_list: List[Dict[str, Any]]) -> None:
-        self.manager.build_graph(chunks, metadata_list)
+    async def build_graph(self, chunks: List[str], metadata_list: List[Dict[str, Any]]) -> None:
+        await self.manager.build_graph(chunks, metadata_list)
 
-    def reproject_graph(self, graph_name: str = GRAPH_NAME, doc_id: Optional[str] = None) -> None:
-        self.manager.reproject_graph(graph_name, doc_id)
+    async def reproject_graph(self, graph_name: str = GRAPH_NAME, doc_id: Optional[str] = None) -> None:
+        await self.manager.reproject_graph(graph_name, doc_id)
 
-    def store_community_summaries(self, doc_id: str) -> None:
+    async def store_community_summaries(self, doc_id: str) -> None:
         extended = GraphManagerExtended(driver)
-        extended.store_community_summaries(doc_id)
+        await extended.store_community_summaries(doc_id)
 
-    def get_stored_community_summaries(self, doc_id: Optional[str] = None) -> dict:
+    async def get_stored_community_summaries(self, doc_id: Optional[str] = None) -> dict:
         extended = GraphManagerExtended(driver)
-        return extended.get_stored_community_summaries(doc_id)
+        return await extended.get_stored_community_summaries(doc_id)
 
 graph_manager_wrapper = GraphManagerWrapper()
 
-def global_search_map_reduce(question: str, conversation_history: Optional[str] = None, doc_id: Optional[str] = None,
+async def global_search_map_reduce(question: str, conversation_history: Optional[str] = None, doc_id: Optional[str] = None,
                              chunk_size: int = GLOBAL_SEARCH_CHUNK_SIZE, top_n: int = GLOBAL_SEARCH_TOP_N,
                              batch_size: int = GLOBAL_SEARCH_BATCH_SIZE) -> str:
-    summaries = graph_manager_wrapper.get_stored_community_summaries(doc_id=doc_id)
+    summaries = await graph_manager_wrapper.get_stored_community_summaries(doc_id=doc_id)
     if not summaries:
         raise HTTPException(status_code=500, detail="No community summaries available. Please re-index the dataset.")
     community_reports = list(summaries.values())
     random.shuffle(community_reports)
-    selected_reports_with_scores = select_relevant_communities(question, community_reports)
+    selected_reports_with_scores = await asyncio.to_thread(select_relevant_communities, question, community_reports)
     if not selected_reports_with_scores:
         selected_reports_with_scores = [(report, 0) for report in community_reports[:top_n]]
     logger.info("Selected community reports for dynamic selection:")
     for report, score in selected_reports_with_scores:
         logger.info("Score: %.4f, Snippet: %s", score, report[:100])
-    llm_instance = OpenAI(api_key=OPENAI_API_KEY, model=OPENAI_MODEL, base_url=OPENAI_BASE_URL,
-                          temperature=OPENAI_TEMPERATURE, stop=OPENAI_STOP, timeout=OPENAI_API_TIMEOUT)
     intermediate_points = []
     for report, _ in selected_reports_with_scores:
         chunks = chunk_text(report, max_chunk_size=chunk_size)
@@ -768,7 +704,7 @@ def global_search_map_reduce(question: str, conversation_history: Optional[str] 
                 batch_prompt += f"\n\nChunk {idx}:\n\"\"\"\n{chunk}\n\"\"\""
             batch_prompt += f"\n\nUser Query:\n\"\"\"\n{question}\n\"\"\""
             try:
-                response = llm_instance.invoke_json(
+                response = await async_llm.invoke_json(
                     [{"role": "system", "content": "You are a professional extraction assistant."},
                      {"role": "user", "content": batch_prompt}])
                 points = response
@@ -806,7 +742,7 @@ def global_search_map_reduce(question: str, conversation_history: Optional[str] 
         Ensure that your answer is extensive, uses complete sentences, and provides a deep, detailed explanation based solely on the supplied context.
         """
     try:
-        final_answer = llm_instance.invoke_json([{"role": "system",
+        final_answer = await async_llm.invoke_json([{"role": "system",
                                                   "content": "You are a professional assistant providing detailed answers based solely on provided information. Infer insights when possible. Your response MUST be a valid JSON object."},
                                                  {"role": "user", "content": reduce_prompt}])
         if isinstance(final_answer, dict) and "summary" in final_answer:
@@ -816,42 +752,67 @@ def global_search_map_reduce(question: str, conversation_history: Optional[str] 
         final_answer = f"Error during reduce step: {e}"
     return final_answer
 
+def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
+    from numpy import dot
+    from numpy.linalg import norm
+    return dot(vec1, vec2) / (norm(vec1) * norm(vec2) + 1e-8)
+
+def select_relevant_communities(query: str, community_reports: List[Union[str, dict]], top_k: int = GLOBAL_SEARCH_TOP_N,
+                                threshold: float = RELEVANCE_THRESHOLD) -> List[Tuple[str, float]]:
+    query_embedding = run_async(async_embedding_client.get_embedding(query))
+    scored_reports = []
+    for report in community_reports:
+        if isinstance(report, dict) and "embedding" in report:
+            report_embedding = report["embedding"]
+            summary_text = report["summary"]
+        else:
+            summary_text = report
+            report_embedding = run_async(async_embedding_client.get_embedding(report))
+        score = cosine_similarity(query_embedding, report_embedding)
+        logger.info("Computed cosine similarity for community report snippet '%s...' is %.4f", summary_text[:50], score)
+        if score >= threshold:
+            scored_reports.append((summary_text, score))
+        else:
+            logger.info("Filtered out community report snippet '%s...' with score %.4f (threshold: %.2f)",
+                        summary_text[:50], score, threshold)
+    scored_reports.sort(key=lambda x: x[1], reverse=True)
+    logger.info("Selected community reports after filtering:")
+    for rep, score in scored_reports:
+        logger.info("Score: %.4f, Snippet: %s", score, rep[:100])
+    return scored_reports[:top_k]
+
 # =============================================================================
-# TEXT2CYPHER RETRIEVER STUB
+# TEXT2CYPHER RETRIEVER (Asynchronous Version)
 # =============================================================================
-# Modified Text2CypherRetriever that uses the Hugging Face text2cypher model.
 class Text2CypherRetriever:
-    def __init__(self, driver, llm_instance: OpenAI, schema: str = "(:Actor)-[:ActedIn]->(:Movie)"):
+    def __init__(self, driver, llm_instance: AsyncOpenAI, schema: str = "(:Entity)-[:MENTIONED_IN]->(:Chunk)"):
         self.driver = driver
         self.llm = llm_instance
         self.schema = schema
 
-    def get_cypher(self, question: str) -> List[dict]:
+    async def get_cypher(self, question: str) -> List[dict]:
         instruction = (
-            "Generate a Cypher query for a Neo4j graph database using only the provided schema. "
-            "Schema: {schema}. Question: {question}. "
-            "Return valid JSON with a single key 'cypher_query' containing only the Cypher query. "
-            "Ensure the query uses exactly the provided labels and relationships."
+            "Generate a Cypher query that not only retrieves entities (e.g., names, organization, location) and their relationships but also fetches the 'text' field from all related Chunk nodes. This text data should be used as context when generating the comprehensive answer."
         )
         prompt = instruction.format(schema=self.schema, question=question)
         messages = [
-            {"role": "system", "content": "You are a professional assistant. Your response MUST be valid JSON with no extra text."},
+            {"role": "system", "content": "You are a professional assistant. Your response MUST be valid JSON with no extra commentary."},
             {"role": "user", "content": prompt}
         ]
-        raw_response = self.llm.invoke_json(messages, fallback=True)
+        raw_response = await self.llm.invoke_json(messages, fallback=True)
         if isinstance(raw_response, (dict, list)):
             raw_response = json.dumps(raw_response)
         cypher_query = extract_cypher_query(raw_response)
-        validated_query = validate_and_refine_query(cypher_query, question, self.llm)
+        cypher_query = fix_cypher_query(cypher_query)
+        validated_query = await validate_and_refine_query(cypher_query, question, self.llm)
         return [{
             "question": question,
             "cypher_query": validated_query,
-            "explanation": "Generated using avinashm/text2cypher with refined prompt and query validation."
+            "explanation": "Generated using text2cypher with refined prompt to retrieve chunk texts and related data."
         }]
 
-
 # =============================================================================
-# FASTAPI ENDPOINTS (Modified to be asynchronous where possible)
+# FASTAPI ENDPOINTS
 # =============================================================================
 app = FastAPI(title="Graph RAG API", description="End-to-end Graph Database RAG on Neo4j", version="1.0.0")
 
@@ -888,7 +849,7 @@ async def upload_documents(files: List[UploadFile] = File(...)):
         all_chunks.extend(chunks)
         meta_list.extend([meta] * len(chunks))
     try:
-        await asyncio.to_thread(graph_manager.build_graph, all_chunks, meta_list)
+        await graph_manager_wrapper.build_graph(all_chunks, meta_list)
     except Exception as e:
         logger.error(f"Graph building error: {e}")
         raise HTTPException(status_code=500, detail=f"Graph building error: {e}")
@@ -897,25 +858,13 @@ async def upload_documents(files: List[UploadFile] = File(...)):
     unique_doc_ids = set(meta["doc_id"] for meta in metadata)
     for doc_id in unique_doc_ids:
         try:
-            await asyncio.to_thread(graph_manager_wrapper.store_community_summaries, doc_id)
+            await graph_manager_wrapper.store_community_summaries(doc_id)
         except Exception as e:
             logger.error(f"Error storing community summaries for doc_id {doc_id}: {e}")
     return {"message": "Documents processed, graph updated, and community summaries stored successfully."}
 
-
-# Modified ask_question endpoint that uses the new Text2CypherRetriever.
 @app.post("/ask_question")
 async def ask_question(request: QuestionRequest):
-    async_llm = AsyncOpenAI(
-        api_key=OPENAI_API_KEY,
-        model=OPENAI_MODEL,  # For rewriting and final synthesis.
-        base_url=OPENAI_BASE_URL,
-        temperature=OPENAI_TEMPERATURE,
-        stop=OPENAI_STOP,
-        timeout=OPENAI_API_TIMEOUT
-    )
-
-    # Rewrite question if previous conversation exists.
     if request.previous_conversations:
         rewrite_prompt = (
             f"Based on the previous conversation: '{request.previous_conversations}', "
@@ -928,17 +877,20 @@ async def ask_question(request: QuestionRequest):
         logger.debug(f"Rewritten query: {rewritten_query}")
         request.question = rewritten_query.strip()
 
-    # Instantiate an LLM client for text-to-Cypher conversion.
-    cypher_llm = OpenAI(
+    cypher_llm = AsyncOpenAI(
         api_key=OPENAI_API_KEY,
-        model="avinashm/text2cypher",
+        model="hf.co/avinashm/text2cypher",
         base_url=OPENAI_BASE_URL,
         temperature=0.2,
         stop=OPENAI_STOP,
         timeout=OPENAI_API_TIMEOUT
     )
-    retriever = Text2CypherRetriever(driver, cypher_llm, schema="(:Actor)-[:ActedIn]->(:Movie)")
-    generated_queries = retriever.get_cypher(request.question)
+
+    dynamic_schema = get_schema_from_neo4j()
+    logger.info(f"Dynamic schema: {dynamic_schema[:200]}...")
+
+    retriever = Text2CypherRetriever(driver, cypher_llm, schema=dynamic_schema)
+    generated_queries = await retriever.get_cypher(request.question)
 
     async def process_query(item: dict) -> dict:
         question_text = item.get("question", "")
@@ -946,7 +898,7 @@ async def ask_question(request: QuestionRequest):
         query_output = {}
         if cypher_query:
             try:
-                query_output["cypher_output"] = run_cypher_query(cypher_query)
+                query_output["cypher_output"] = await asyncio.to_thread(run_cypher_query, cypher_query)
             except Exception as e:
                 query_output["cypher_output"] = {"error": str(e)}
         answer_prompt = (
@@ -957,8 +909,7 @@ async def ask_question(request: QuestionRequest):
             "If no data is returned, explain potential reasons and suggest corrective actions."
         )
         llm_answer = await async_llm.invoke([
-            {"role": "system",
-             "content": "You are a professional assistant answering based solely on the provided data."},
+            {"role": "system", "content": "You are a professional assistant answering based solely on the provided data."},
             {"role": "user", "content": answer_prompt}
         ])
         return {
@@ -985,7 +936,7 @@ async def ask_question(request: QuestionRequest):
 
 @app.post("/global_search")
 async def global_search(request: GlobalSearchRequest):
-    answer = global_search_map_reduce(
+    answer = await global_search_map_reduce(
         question=request.question,
         conversation_history=request.previous_conversations,
         doc_id=request.doc_id,
@@ -996,64 +947,39 @@ async def global_search(request: GlobalSearchRequest):
     logger.debug(f"Raw search answer: {answer}")
     return {"answer": format_natural_response(answer)}
 
-
 @app.post("/local_search")
-def local_search(request: LocalSearchRequest):
-    """
-    Local Search Endpoint with Prioritization & Filtering
-
-    This implementation performs the following:
-      1. Retrieves community summaries (filtered by doc_id if provided).
-      2. Computes the embedding for the user query using sync_embedding_client.
-      3. Calculates cosine similarity between the query and each community summary's embedding.
-      4. Filters and ranks the summaries based on a threshold, including only the top-k.
-      5. Retrieves document chunks (filtered by doc_id if provided).
-      6. Combines conversation history, filtered community summaries, and document chunks into a final prompt.
-      7. Invokes the LLM to generate an answer strictly based on the provided context.
-    """
-    # --- 1. Conversation History Context ---
+async def local_search(request: LocalSearchRequest):
     conversation_context = (
         f"Conversation History:\n{request.previous_conversations}\n\n"
         if request.previous_conversations else ""
     )
 
-    # --- 2. Retrieve and Filter Community Summaries ---
-    # Fetch summaries by doc_id if provided; otherwise, use global summaries.
     if request.doc_id:
-        summaries = graph_manager_wrapper.get_stored_community_summaries(doc_id=request.doc_id)
+        summaries = await graph_manager_wrapper.get_stored_community_summaries(doc_id=request.doc_id)
     else:
-        summaries = graph_manager_wrapper.get_stored_community_summaries()
+        summaries = await graph_manager_wrapper.get_stored_community_summaries()
 
     if summaries:
-        # Compute embedding for the user query using the global synchronous embedding client.
-        query_embedding = sync_embedding_client.get_embedding(request.question)
+        query_embedding = await async_embedding_client.get_embedding(request.question)
         scored_summaries = []
-        # Compute cosine similarity between the query embedding and each summary's embedding.
         for comm, info in summaries.items():
             if info.get("embedding"):
                 summary_embedding = info["embedding"]
                 score = cosine_similarity(query_embedding, summary_embedding)
                 scored_summaries.append((comm, info["summary"], score))
-
-        # Filter out low-scoring summaries (e.g., threshold = 0.3) and sort descending by similarity score.
         threshold = 0.3
         filtered_summaries = [
             (comm, summary, score) for comm, summary, score in scored_summaries if score >= threshold
         ]
         filtered_summaries.sort(key=lambda x: x[2], reverse=True)
-
-        # Limit to top_k results (e.g., top 3).
         top_k = 3
         top_summaries = filtered_summaries[:top_k]
-
-        # Build the community context text including similarity scores (for debugging).
         community_context = "Community Summaries (ranked by similarity):\n" + "\n".join(
             [f"{comm}: {summary} (Score: {score:.2f})" for comm, summary, score in top_summaries]
         ) + "\n"
     else:
         community_context = "No community summaries available.\n"
 
-    # --- 3. Retrieve Document Text Units (Chunks) ---
     if request.doc_id:
         text_unit_query = """
         MATCH (c:Chunk)
@@ -1061,14 +987,14 @@ def local_search(request: LocalSearchRequest):
         RETURN c.text AS chunk_text
         LIMIT 5
         """
-        text_unit_results = run_cypher_query(text_unit_query, {"doc_id": request.doc_id})
+        text_unit_results = await asyncio.to_thread(run_cypher_query, text_unit_query, {"doc_id": request.doc_id})
     else:
         text_unit_query = """
         MATCH (c:Chunk)
         RETURN c.text AS chunk_text
         LIMIT 5
         """
-        text_unit_results = run_cypher_query(text_unit_query)
+        text_unit_results = await asyncio.to_thread(run_cypher_query, text_unit_query)
 
     if text_unit_results:
         text_unit_context = "Document Text Units:\n" + "\n---\n".join(
@@ -1077,10 +1003,8 @@ def local_search(request: LocalSearchRequest):
     else:
         text_unit_context = "No document text units found.\n"
 
-    # --- 4. Combine All Contexts ---
     combined_context = conversation_context + community_context + text_unit_context
 
-    # --- 5. Build the Final Prompt ---
     prompt_template = (
         "You are a professional assistant who answers queries strictly based on the provided context.\n\n"
         "Context:\n{context}\n\n"
@@ -1090,28 +1014,15 @@ def local_search(request: LocalSearchRequest):
     prompt = prompt_template.format(context=combined_context, question=request.question)
     logger.debug(f"Local search prompt:\n{prompt}")
 
-    # --- 6. Invoke the LLM ---
-    llm_instance = OpenAI(
-        api_key=OPENAI_API_KEY,
-        model=OPENAI_MODEL,
-        base_url=OPENAI_BASE_URL,
-        temperature=OPENAI_TEMPERATURE,
-        stop=OPENAI_STOP,
-        timeout=OPENAI_API_TIMEOUT  # Pass the timeout parameter here
-    )
-    answer = llm_instance.invoke([
-        {"role": "system",
-         "content": "You are a professional assistant who answers strictly based on the provided context."},
+    answer = await async_llm.invoke([
+        {"role": "system", "content": "You are a professional assistant who answers strictly based on the provided context."},
         {"role": "user", "content": prompt}
     ])
 
     return {"local_search_answer": answer}
 
-
 @app.post("/drift_search")
 async def drift_search(request: DriftSearchRequest):
-    async_llm = AsyncOpenAI(api_key=OPENAI_API_KEY, model=OPENAI_MODEL, base_url=OPENAI_BASE_URL,
-                            temperature=OPENAI_TEMPERATURE, stop=OPENAI_STOP, timeout=OPENAI_API_TIMEOUT)
     if request.previous_conversations:
         rewrite_prompt = (f"Based on the following conversation history:\n\n{request.previous_conversations}\n\n"
                           f"rewrite the new query '{request.question}' into a standalone, unambiguous query.")
@@ -1120,14 +1031,14 @@ async def drift_search(request: DriftSearchRequest):
             {"role": "user", "content": rewrite_prompt}
         ])
         request.question = rewritten_query.strip()
-    summaries = graph_manager_wrapper.get_stored_community_summaries(doc_id=request.doc_id)
+    summaries = await graph_manager_wrapper.get_stored_community_summaries(doc_id=request.doc_id)
     if not summaries:
         if request.doc_id:
             return {"drift_search_answer": f"No community summaries found for doc_id {request.doc_id}. Please re-index the dataset or try without specifying a doc_id."}
         else:
             return {"drift_search_answer": "No community summaries available. Please re-index the dataset."}
     community_reports = [v["summary"] for v in summaries.values() if v.get("summary")]
-    selected_reports = select_relevant_communities(request.question, community_reports)
+    selected_reports = await asyncio.to_thread(select_relevant_communities, request.question, community_reports)
     global_context = "\n\n".join([rep for rep, score in selected_reports])
     conversation_context = f"Conversation History:\n{request.previous_conversations}\n\n" if request.previous_conversations else ""
     primer_prompt = (
@@ -1137,9 +1048,7 @@ async def drift_search(request: DriftSearchRequest):
         f"{conversation_context}"
         "Answer the following query by generating a hypothetical answer and listing follow-up questions that could "
         "further refine the query."
-        "Return your output as a strict JSON object with the keys: 'intermediate_answer', 'follow_up_queries' (a JSON "
-        "array), and 'score' (a confidence score),"
-        "and do not include any markdown formatting, code blocks, or extra commentary.\n\n"
+        "Return your output as a strict JSON object with the keys: 'intermediate_answer', 'follow_up_queries' (a JSON array), and 'score' (a confidence score), and do not include any markdown formatting, code blocks, or extra commentary.\n\n"
         f"Query: {request.question}"
     )
     primer_result = await async_llm.invoke_json([
@@ -1164,7 +1073,7 @@ async def drift_search(request: DriftSearchRequest):
         params = {"keyword": follow_up_text}
         if request.doc_id:
             params["doc_id"] = request.doc_id
-        chunk_results = run_cypher_query(local_chunk_query, params)
+        chunk_results = await asyncio.to_thread(run_cypher_query, local_chunk_query, params)
         if chunk_results:
             chunks = [res.get("chunk_text", "") for res in chunk_results if res.get("chunk_text")]
             local_context_text += "Related Document Chunks:\n" + "\n---\n".join(chunks) + "\n"
@@ -1189,7 +1098,8 @@ async def drift_search(request: DriftSearchRequest):
         f"{drift_hierarchy}\n\n"
         "Based solely on the above information, provide a final, comprehensive answer to the original query. "
         "Return your answer as plain text without any additional commentary.\n\n"
-        f"Original Query: {request.question}")
+        f"Original Query: {request.question}"
+    )
     final_answer = await async_llm.invoke([
         {"role": "system", "content": "You are a professional assistant."},
         {"role": "user", "content": reduction_prompt}
@@ -1203,7 +1113,7 @@ async def list_documents():
             MATCH (c:Chunk)
             RETURN DISTINCT c.doc_id AS doc_id, c.document_name AS document_name, c.timestamp AS timestamp
         """
-        results = run_cypher_query(query)
+        results = await asyncio.to_thread(run_cypher_query, query)
         return {"documents": results}
     except Exception as e:
         logger.error(f"Error listing documents: {e}")
@@ -1216,11 +1126,11 @@ async def delete_document(request: DeleteDocumentRequest):
     try:
         if request.doc_id:
             query = "MATCH (n) WHERE n.doc_id = $doc_id DETACH DELETE n"
-            run_cypher_query(query, {"doc_id": request.doc_id})
+            await asyncio.to_thread(run_cypher_query, query, {"doc_id": request.doc_id})
             message = f"Document with doc_id {request.doc_id} deleted successfully."
         else:
             query = "MATCH (n) WHERE n.document_name = $document_name DETACH DELETE n"
-            run_cypher_query(query, {"document_name": request.document_name})
+            await asyncio.to_thread(run_cypher_query, query, {"document_name": request.document_name})
             message = f"Document with name {request.document_name} deleted successfully."
         return {"message": message}
     except Exception as e:
@@ -1239,7 +1149,7 @@ async def get_communities(doc_id: Optional[str] = None):
 @app.get("/community_summaries")
 async def community_summaries(doc_id: Optional[str] = None):
     try:
-        summaries = graph_manager_wrapper.get_stored_community_summaries(doc_id)
+        summaries = await graph_manager_wrapper.get_stored_community_summaries(doc_id)
         return {"community_summaries": summaries}
     except Exception as e:
         logger.error(f"Error generating community summaries: {e}")
