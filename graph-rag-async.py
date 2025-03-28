@@ -154,6 +154,17 @@ def clean_empty_nodes():
         session.run(query)
         logger.info("Cleaned empty Entity nodes.")
 
+# Helper to extract code if returned inside triple backticks.
+def extract_cypher_code(raw_query: str) -> str:
+    """
+    If the LLM returns a code block (using triple backticks), extract only the Cypher code.
+    Otherwise, return the stripped raw output.
+    """
+    pattern = re.compile(r"```(?:cypher)?\s*(.*?)\s*```", re.DOTALL)
+    matches = pattern.findall(raw_query)
+    if matches:
+        return matches[0].strip()
+    return raw_query.strip()
 
 async def rewrite_query_if_needed(question: str, conversation_history: Optional[str]) -> str:
     """
@@ -174,8 +185,8 @@ async def rewrite_query_if_needed(question: str, conversation_history: Optional[
 
 def get_schema_from_neo4j() -> str:
     """
-    Use the optimal schema collection Cypher to retrieve the schema.
-    This query returns a list of nodes and relationships.
+    Retrieve the schema using an optimal schema collection query.
+    This query returns nodes and relationships (ignoring fields like embeddings).
     """
     optimal_schema_query = """
     CALL () {
@@ -202,15 +213,53 @@ def get_schema_from_neo4j() -> str:
         logger.error(f"Error retrieving schema: {e}")
         return "Error retrieving schema from Neo4j."
         
+async def extract_entity_keywords(question: str) -> list:
+    """
+    Dynamically extract entity names from the given question using the LLM.
+    The response should be a JSON list of strings.
+    """
+    prompt = f"Extract entity names from the following question as a JSON list of strings:\n{question}"
+    try:
+        response = await async_llm.invoke_json([
+            {"role": "system", "content": "You are an expert in entity extraction."},
+            {"role": "user", "content": prompt}
+        ])
+        if isinstance(response, list):
+            return response
+        elif isinstance(response, dict) and "entities" in response:
+            return response["entities"]
+        else:
+            return []
+    except Exception as e:
+        logger.error(f"Error extracting keywords: {e}")
+        # Fallback heuristic: return first two words if extraction fails.
+        return question.split()[:2]
+        
 async def generate_valid_cypher(question: str, max_iterations: int = 5) -> str:
     """
-    Iteratively generate and validate a Cypher query that retrieves only the 'text' field from Chunk nodes.
-    Each iteration sends a minimal prompt with any feedback.
+    Iteratively generate and validate a Cypher query that retrieves the 'text' field from Chunk nodes.
+    Instead of hardcoding keywords, dynamically extract entity names from the question and use them
+    to build a query that:
+      - MATCHes Entity nodes whose names match each extracted keyword using a case-insensitive regex (e.g. '(?i).*<keyword>.*').
+      - MATCHes a Chunk node that is connected to all these Entity nodes via MENTIONED_IN relationships.
+      - Uses WITH clauses or subqueries to avoid Cartesian products.
+      - RETURNs c.text AS chunk_text.
+    Return only the Cypher query with no additional commentary.
     """
+    # Dynamically extract entity keywords from the question.
+    keywords = await extract_entity_keywords(question)
+    if not keywords or len(keywords) < 2:
+        # Fallback: use first two words from the question if extraction fails.
+        keywords = question.split()[:2]
+    keywords_str = ", ".join(keywords)
+    
     current_prompt = (
-        f"Generate a Cypher query that retrieves the 'text' field from Chunk nodes relevant to the question: \"{question}\". "
-        "Your query must use MATCH to locate nodes labeled 'Chunk' and RETURN only the 'text' property (alias it as chunk_text). "
-        "Do not include any extra properties or commentary."
+        f"Given the question: \"{question}\", and the extracted entity keywords: {keywords_str}, "
+        "generate a Cypher query that retrieves the 'text' field from Chunk nodes connected to all Entity nodes matching these keywords. "
+        "For each keyword, match an Entity node using a case-insensitive regex (e.g. use '(?i).*<keyword>.*'). "
+        "Then match a Chunk node that is connected to these Entity nodes via the MENTIONED_IN relationship. "
+        "Avoid Cartesian products by using WITH clauses or subqueries. "
+        "Return c.text AS chunk_text. Return only the Cypher query with no extra commentary."
     )
     iteration = 0
     while iteration < max_iterations:
@@ -219,24 +268,27 @@ async def generate_valid_cypher(question: str, max_iterations: int = 5) -> str:
             {"role": "system", "content": "You are a professional Cypher generator."},
             {"role": "user", "content": current_prompt}
         ])
-        cypher_query = raw_query.strip()
-        # Basic validation: Check that the query uses MATCH, returns 'chunk_text' from a Chunk, and includes RETURN.
-        if ("MATCH" in cypher_query and "RETURN" in cypher_query and "Chunk" in cypher_query and ("text" in cypher_query or "chunk_text" in cypher_query)):
+        cypher_query = extract_cypher_code(raw_query)
+        logger.info(f"Iteration {iteration} generated query: {cypher_query}")
+        # Check that the query contains required elements.
+        if ("MATCH" in cypher_query and "RETURN" in cypher_query and "Entity" in cypher_query 
+            and "Chunk" in cypher_query and ("text" in cypher_query or "chunk_text" in cypher_query)
+            and "MENTIONED_IN" in cypher_query):
             try:
-                # Optional: run the query in explain mode (or a dummy run) to check for syntax.
+                # Try a dummy execution to validate syntax.
                 _ = await asyncio.to_thread(run_cypher_query, cypher_query)
-                logger.info(f"Valid Cypher generated in iteration {iteration}: {cypher_query}")
                 return cypher_query
             except Exception as e:
                 feedback = f"Syntax error: {e}."
         else:
-            feedback = "Query does not contain required elements. Ensure you MATCH Chunk nodes and RETURN only the 'text' field as chunk_text."
-        # Prepare prompt feedback for the next iteration.
+            feedback = ("Query missing required elements. Ensure you MATCH Entity nodes using case-insensitive regex for each extracted keyword, "
+                        "MATCH a connected Chunk node via MENTIONED_IN, and RETURN the chunk text as chunk_text.")
         current_prompt = (
             f"Previous query:\n{cypher_query}\nFeedback: {feedback}\n"
-            "Please generate a corrected Cypher query that retrieves only the 'text' field from Chunk nodes, alias it as chunk_text, and ignore all other fields."
+            "Please generate a corrected Cypher query that meets these criteria dynamically based on the extracted keywords. "
+            "Return only the query without extra commentary."
         )
-        logger.info(f"Iteration {iteration}: {feedback}")
+        logger.info(f"Iteration {iteration} feedback: {feedback}")
     raise Exception("Failed to generate valid Cypher query after multiple iterations.")
         
 async def validate_and_refine_query(initial_query: str, question: str, llm_instance: AsyncOpenAI) -> str:
@@ -952,60 +1004,59 @@ async def upload_documents(files: List[UploadFile] = File(...)):
 
 @app.post("/ask_question")
 async def ask_question(request: QuestionRequest):
-    # Rewrite the query if previous conversation exists.
+    # Rewrite the question if conversation history exists.
     request.question = await rewrite_query_if_needed(request.question, request.previous_conversations)
-
-    # Retrieve the optimal schema (if needed, it may be used for context in LLM feedback)
+    
+    # Retrieve the schema (if needed for context).
     dynamic_schema = get_schema_from_neo4j()
     logger.info(f"Dynamic schema (optimal query): {dynamic_schema[:200]}...")
-
-    # Instead of using Text2CypherRetriever, generate a valid Cypher query iteratively.
+    
+    # Generate a valid Cypher query dynamically.
     try:
         valid_cypher = await generate_valid_cypher(request.question)
     except Exception as e:
         logger.error(f"Error generating valid Cypher query: {e}")
         raise HTTPException(status_code=500, detail=f"Error generating Cypher query: {e}")
-
-    # Execute the generated query. Expect the query to return results containing a 'chunk_text' field.
+    
+    # Execute the generated query; expect results with a 'chunk_text' field.
     try:
         query_output = await asyncio.to_thread(run_cypher_query, valid_cypher)
     except Exception as e:
         logger.error(f"Error executing Cypher query: {e}")
         raise HTTPException(status_code=500, detail=f"Error executing Cypher query: {e}")
-
-    # Filter out only the 'chunk_text' values from the query output (ignoring other fields like embeddings)
+    
+    # Safely extract only the 'chunk_text' values.
     relevant_results = []
     for record in query_output:
-        # Assume that the LLM generated query aliases the text field as 'chunk_text'
-        if "chunk_text" in record and record["chunk_text"].strip():
-            relevant_results.append(record["chunk_text"])
+        chunk_text = record.get("chunk_text")
+        if chunk_text and isinstance(chunk_text, str) and chunk_text.strip():
+            relevant_results.append(chunk_text.strip())
     if not relevant_results:
         relevant_results.append("No relevant text data found.")
-
-    # Build a concise context using only the chunk texts.
-    context = "\n".join(relevant_results[:10])  # limit to first 10 for brevity
-
-    # Create a final prompt to generate a detailed answer based solely on the minimal context.
+    
+    # Build a minimal context from a limited number of chunk texts.
+    context = "\n".join(relevant_results[:10])
+    
+    # Build the final prompt to generate a detailed answer.
     answer_prompt = (
         f"User Question: {request.question}\n\n"
         f"Relevant Document Texts:\n{context}\n\n"
-        "Based solely on the above texts, provide a detailed answer to the question. "
-        "Do not use any external knowledge."
+        "Based solely on the above texts, provide a detailed answer to the question. Do not use any external knowledge."
     )
-
+    
     final_answer = await async_llm.invoke([
         {"role": "system", "content": "You are a professional assistant answering based solely on provided document texts."},
         {"role": "user", "content": answer_prompt}
     ])
-
     combined_response = format_natural_response(final_answer.strip())
+    
     return {
         "user_question": request.question,
         "generated_cypher": valid_cypher,
         "query_output": query_output,
         "combined_response": combined_response
     }
-
+    
 @app.post("/global_search")
 async def global_search(request: GlobalSearchRequest):
     # Rewrite the query if previous conversation exists.
