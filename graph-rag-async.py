@@ -140,6 +140,22 @@ class GlobalSearchRequest(BaseModel):
 # =============================================================================
 # UTILITY FUNCTIONS
 # =============================================================================
+async def rewrite_query_if_needed(question: str, conversation_history: Optional[str]) -> str:
+    """
+    If conversation history is provided, rewrite the query into a standalone query.
+    Otherwise, return the original question.
+    """
+    if conversation_history:
+        rewrite_prompt = (
+            f"Based on the previous conversation: '{conversation_history}', "
+            f"rewrite the query: '{question}' into a standalone query."
+        )
+        rewritten_query = await async_llm.invoke([
+            {"role": "system", "content": "You are a professional query rewriting assistant."},
+            {"role": "user", "content": rewrite_prompt}
+        ])
+        return rewritten_query.strip()
+    return question
 
 def get_schema_from_neo4j() -> str:
     try:
@@ -314,7 +330,6 @@ def format_natural_response(response: str) -> str:
             return response
     return response
 
-# --- MISSING LOGIC ADDED BELOW ---
 
 async def resolve_coreferences_in_parts(text: str) -> str:
     async_client = AsyncOpenAI(api_key=OPENAI_API_KEY, model=OPENAI_MODEL,
@@ -865,17 +880,11 @@ async def upload_documents(files: List[UploadFile] = File(...)):
 
 @app.post("/ask_question")
 async def ask_question(request: QuestionRequest):
-    if request.previous_conversations:
-        rewrite_prompt = (
-            f"Based on the previous conversation: '{request.previous_conversations}', "
-            f"rewrite the query: '{request.question}' into a standalone query."
-        )
-        rewritten_query = await async_llm.invoke([
-            {"role": "system", "content": "You are a professional query rewriting assistant."},
-            {"role": "user", "content": rewrite_prompt}
-        ])
-        logger.debug(f"Rewritten query: {rewritten_query}")
-        request.question = rewritten_query.strip()
+    # Rewrite the query if previous conversation exists.
+    request.question = await rewrite_query_if_needed(request.question, request.previous_conversations)
+
+    dynamic_schema = get_schema_from_neo4j()
+    logger.info(f"Dynamic schema: {dynamic_schema[:200]}...")
 
     cypher_llm = AsyncOpenAI(
         api_key=OPENAI_API_KEY,
@@ -885,10 +894,6 @@ async def ask_question(request: QuestionRequest):
         stop=OPENAI_STOP,
         timeout=OPENAI_API_TIMEOUT
     )
-
-    dynamic_schema = get_schema_from_neo4j()
-    logger.info(f"Dynamic schema: {dynamic_schema[:200]}...")
-
     retriever = Text2CypherRetriever(driver, cypher_llm, schema=dynamic_schema)
     generated_queries = await retriever.get_cypher(request.question)
 
@@ -936,6 +941,9 @@ async def ask_question(request: QuestionRequest):
 
 @app.post("/global_search")
 async def global_search(request: GlobalSearchRequest):
+    # Rewrite the query if previous conversation exists.
+    request.question = await rewrite_query_if_needed(request.question, request.previous_conversations)
+    
     answer = await global_search_map_reduce(
         question=request.question,
         conversation_history=request.previous_conversations,
@@ -949,6 +957,9 @@ async def global_search(request: GlobalSearchRequest):
 
 @app.post("/local_search")
 async def local_search(request: LocalSearchRequest):
+    # Rewrite the query if previous conversation exists.
+    request.question = await rewrite_query_if_needed(request.question, request.previous_conversations)
+    
     conversation_context = (
         f"Conversation History:\n{request.previous_conversations}\n\n"
         if request.previous_conversations else ""
@@ -1004,7 +1015,6 @@ async def local_search(request: LocalSearchRequest):
         text_unit_context = "No document text units found.\n"
 
     combined_context = conversation_context + community_context + text_unit_context
-
     prompt_template = (
         "You are a professional assistant who answers queries strictly based on the provided context.\n\n"
         "Context:\n{context}\n\n"
@@ -1018,19 +1028,13 @@ async def local_search(request: LocalSearchRequest):
         {"role": "system", "content": "You are a professional assistant who answers strictly based on the provided context."},
         {"role": "user", "content": prompt}
     ])
-
     return {"local_search_answer": answer}
 
 @app.post("/drift_search")
 async def drift_search(request: DriftSearchRequest):
-    if request.previous_conversations:
-        rewrite_prompt = (f"Based on the following conversation history:\n\n{request.previous_conversations}\n\n"
-                          f"rewrite the new query '{request.question}' into a standalone, unambiguous query.")
-        rewritten_query = await async_llm.invoke([
-            {"role": "system", "content": "You are a professional query rewriting assistant."},
-            {"role": "user", "content": rewrite_prompt}
-        ])
-        request.question = rewritten_query.strip()
+    # Rewrite the query if previous conversation exists.
+    request.question = await rewrite_query_if_needed(request.question, request.previous_conversations)
+    
     summaries = await graph_manager_wrapper.get_stored_community_summaries(doc_id=request.doc_id)
     if not summaries:
         if request.doc_id:
@@ -1066,7 +1070,7 @@ async def drift_search(request: DriftSearchRequest):
         local_chunk_query = """
             MATCH (c:Chunk)
             WHERE toLower(c.text) CONTAINS toLower($keyword)
-            """
+        """
         if request.doc_id:
             local_chunk_query += " AND c.doc_id = $doc_id"
         local_chunk_query += "\nRETURN c.text AS chunk_text\nLIMIT 5"
