@@ -140,6 +140,21 @@ class GlobalSearchRequest(BaseModel):
 # =============================================================================
 # UTILITY FUNCTIONS
 # =============================================================================
+def clean_empty_chunks():
+    with driver.session() as session:
+        # Delete any Chunk nodes where the 'text' property is NULL or only whitespace.
+        query = "MATCH (c:Chunk) WHERE c.text IS NULL OR trim(c.text) = '' DETACH DELETE c"
+        session.run(query)
+        logger.info("Cleaned empty Chunk nodes.")
+
+def clean_empty_nodes():
+    with driver.session() as session:
+        # Delete any Entity nodes where the 'name' property is NULL or only whitespace.
+        query = "MATCH (n:Entity) WHERE n.name IS NULL OR trim(n.name) = '' DETACH DELETE n"
+        session.run(query)
+        logger.info("Cleaned empty Entity nodes.")
+
+
 async def rewrite_query_if_needed(question: str, conversation_history: Optional[str]) -> str:
     """
     If conversation history is provided, rewrite the query into a standalone query.
@@ -158,14 +173,71 @@ async def rewrite_query_if_needed(question: str, conversation_history: Optional[
     return question
 
 def get_schema_from_neo4j() -> str:
+    """
+    Use the optimal schema collection Cypher to retrieve the schema.
+    This query returns a list of nodes and relationships.
+    """
+    optimal_schema_query = """
+    CALL () {
+      MATCH (n1)-[r]->(n2)
+      WITH DISTINCT labels(n1) AS sourceNodeLabels, type(r) AS relationshipType, labels(n2) AS targetNodeLabels, keys(r) AS relationshipProperties
+      UNWIND sourceNodeLabels AS sourceLabel
+      UNWIND targetNodeLabels AS targetLabel
+      UNWIND relationshipProperties AS relProp
+      RETURN 'Relationship' AS ElementType, relationshipType AS Type, sourceLabel AS SourceNode, targetLabel AS TargetNode, collect(DISTINCT relProp) AS PropertyFields
+      UNION
+      MATCH (n)
+      WITH DISTINCT labels(n) AS nodeLabels, keys(n) AS properties
+      UNWIND nodeLabels AS label
+      UNWIND properties AS prop
+      RETURN 'Node' AS ElementType, label AS Type, null AS SourceNode, null AS TargetNode, collect(DISTINCT prop) AS PropertyFields
+    }
+    RETURN ElementType, Type, SourceNode, TargetNode, PropertyFields
+    ORDER BY ElementType, Type
+    """
     try:
-        # Run the APOC procedure to fetch the schema
-        schema_result = run_cypher_query("CALL apoc.meta.schema()")
-        # Optionally, process the result to format it nicely for your LLM
+        schema_result = run_cypher_query(optimal_schema_query)
         return json.dumps(schema_result, indent=2)
     except Exception as e:
         logger.error(f"Error retrieving schema: {e}")
         return "Error retrieving schema from Neo4j."
+        
+async def generate_valid_cypher(question: str, max_iterations: int = 5) -> str:
+    """
+    Iteratively generate and validate a Cypher query that retrieves only the 'text' field from Chunk nodes.
+    Each iteration sends a minimal prompt with any feedback.
+    """
+    current_prompt = (
+        f"Generate a Cypher query that retrieves the 'text' field from Chunk nodes relevant to the question: \"{question}\". "
+        "Your query must use MATCH to locate nodes labeled 'Chunk' and RETURN only the 'text' property (alias it as chunk_text). "
+        "Do not include any extra properties or commentary."
+    )
+    iteration = 0
+    while iteration < max_iterations:
+        iteration += 1
+        raw_query = await async_llm.invoke([
+            {"role": "system", "content": "You are a professional Cypher generator."},
+            {"role": "user", "content": current_prompt}
+        ])
+        cypher_query = raw_query.strip()
+        # Basic validation: Check that the query uses MATCH, returns 'chunk_text' from a Chunk, and includes RETURN.
+        if ("MATCH" in cypher_query and "RETURN" in cypher_query and "Chunk" in cypher_query and ("text" in cypher_query or "chunk_text" in cypher_query)):
+            try:
+                # Optional: run the query in explain mode (or a dummy run) to check for syntax.
+                _ = await asyncio.to_thread(run_cypher_query, cypher_query)
+                logger.info(f"Valid Cypher generated in iteration {iteration}: {cypher_query}")
+                return cypher_query
+            except Exception as e:
+                feedback = f"Syntax error: {e}."
+        else:
+            feedback = "Query does not contain required elements. Ensure you MATCH Chunk nodes and RETURN only the 'text' field as chunk_text."
+        # Prepare prompt feedback for the next iteration.
+        current_prompt = (
+            f"Previous query:\n{cypher_query}\nFeedback: {feedback}\n"
+            "Please generate a corrected Cypher query that retrieves only the 'text' field from Chunk nodes, alias it as chunk_text, and ignore all other fields."
+        )
+        logger.info(f"Iteration {iteration}: {feedback}")
+    raise Exception("Failed to generate valid Cypher query after multiple iterations.")
         
 async def validate_and_refine_query(initial_query: str, question: str, llm_instance: AsyncOpenAI) -> str:
     results = await asyncio.to_thread(run_cypher_query, initial_query)
@@ -883,61 +955,56 @@ async def ask_question(request: QuestionRequest):
     # Rewrite the query if previous conversation exists.
     request.question = await rewrite_query_if_needed(request.question, request.previous_conversations)
 
+    # Retrieve the optimal schema (if needed, it may be used for context in LLM feedback)
     dynamic_schema = get_schema_from_neo4j()
-    logger.info(f"Dynamic schema: {dynamic_schema[:200]}...")
+    logger.info(f"Dynamic schema (optimal query): {dynamic_schema[:200]}...")
 
-    cypher_llm = AsyncOpenAI(
-        api_key=OPENAI_API_KEY,
-        model="hf.co/avinashm/text2cypher",
-        base_url=OPENAI_BASE_URL,
-        temperature=0.2,
-        stop=OPENAI_STOP,
-        timeout=OPENAI_API_TIMEOUT
+    # Instead of using Text2CypherRetriever, generate a valid Cypher query iteratively.
+    try:
+        valid_cypher = await generate_valid_cypher(request.question)
+    except Exception as e:
+        logger.error(f"Error generating valid Cypher query: {e}")
+        raise HTTPException(status_code=500, detail=f"Error generating Cypher query: {e}")
+
+    # Execute the generated query. Expect the query to return results containing a 'chunk_text' field.
+    try:
+        query_output = await asyncio.to_thread(run_cypher_query, valid_cypher)
+    except Exception as e:
+        logger.error(f"Error executing Cypher query: {e}")
+        raise HTTPException(status_code=500, detail=f"Error executing Cypher query: {e}")
+
+    # Filter out only the 'chunk_text' values from the query output (ignoring other fields like embeddings)
+    relevant_results = []
+    for record in query_output:
+        # Assume that the LLM generated query aliases the text field as 'chunk_text'
+        if "chunk_text" in record and record["chunk_text"].strip():
+            relevant_results.append(record["chunk_text"])
+    if not relevant_results:
+        relevant_results.append("No relevant text data found.")
+
+    # Build a concise context using only the chunk texts.
+    context = "\n".join(relevant_results[:10])  # limit to first 10 for brevity
+
+    # Create a final prompt to generate a detailed answer based solely on the minimal context.
+    answer_prompt = (
+        f"User Question: {request.question}\n\n"
+        f"Relevant Document Texts:\n{context}\n\n"
+        "Based solely on the above texts, provide a detailed answer to the question. "
+        "Do not use any external knowledge."
     )
-    retriever = Text2CypherRetriever(driver, cypher_llm, schema=dynamic_schema)
-    generated_queries = await retriever.get_cypher(request.question)
 
-    async def process_query(item: dict) -> dict:
-        question_text = item.get("question", "")
-        cypher_query = item.get("cypher_query", "")
-        query_output = {}
-        if cypher_query:
-            try:
-                query_output["cypher_output"] = await asyncio.to_thread(run_cypher_query, cypher_query)
-            except Exception as e:
-                query_output["cypher_output"] = {"error": str(e)}
-        answer_prompt = (
-            f"Given the following data for the question:\n{question_text}\n\n"
-            f"Cypher Query:\n{cypher_query}\n\n"
-            f"Query Output:\n{json.dumps(query_output.get('cypher_output'), indent=2)}\n\n"
-            "Provide a detailed answer based solely on this information. "
-            "If no data is returned, explain potential reasons and suggest corrective actions."
-        )
-        llm_answer = await async_llm.invoke([
-            {"role": "system", "content": "You are a professional assistant answering based solely on the provided data."},
-            {"role": "user", "content": answer_prompt}
-        ])
-        return {
-            "question": question_text,
-            "llm_response": llm_answer.strip(),
-            "cypher_query": cypher_query,
-            "query_output": query_output.get("cypher_output")
-        }
-
-    final_answers = await asyncio.gather(*(process_query(item) for item in generated_queries))
-    primary = final_answers[0] if final_answers else {"cypher_query": "", "query_output": {}}
-    combined_prompt = build_enhanced_final_prompt(request.question, [a["llm_response"] for a in final_answers],
-                                                  primary["cypher_query"], primary.get("query_output", {}))
-    combined_llm_response = await async_llm.invoke([
-        {"role": "system", "content": "You are a professional assistant synthesizing multiple sources."},
-        {"role": "user", "content": combined_prompt}
+    final_answer = await async_llm.invoke([
+        {"role": "system", "content": "You are a professional assistant answering based solely on provided document texts."},
+        {"role": "user", "content": answer_prompt}
     ])
-    final_response = {
+
+    combined_response = format_natural_response(final_answer.strip())
+    return {
         "user_question": request.question,
-        "combined_response": format_natural_response(combined_llm_response.strip()),
-        "answers": final_answers
+        "generated_cypher": valid_cypher,
+        "query_output": query_output,
+        "combined_response": combined_response
     }
-    return final_response
 
 @app.post("/global_search")
 async def global_search(request: GlobalSearchRequest):
