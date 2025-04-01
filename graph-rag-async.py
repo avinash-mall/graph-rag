@@ -90,6 +90,7 @@ GLOBAL_SEARCH_TOP_N = int(os.getenv("GLOBAL_SEARCH_TOP_N") or "5")
 GLOBAL_SEARCH_BATCH_SIZE = int(os.getenv("GLOBAL_SEARCH_BATCH_SIZE") or "20")
 RELEVANCE_THRESHOLD = float(os.getenv("RELEVANCE_THRESHOLD") or "0.1")
 COREF_WORD_LIMIT = int(os.getenv("COREF_WORD_LIMIT", "8000"))
+CYPHER_QUERY_LIMIT = int(os.getenv("CYPHER_QUERY_LIMIT", "5"))
 
 # Logging Configuration (optional)
 LOG_DIR = os.getenv("LOG_DIR", "logs")
@@ -456,17 +457,25 @@ def chunk_text(text: str, max_chunk_size: int = 512) -> List[str]:
         chunks.append(current_chunk.strip())
     return chunks
 def run_cypher_query(query: str, parameters: Dict[str, Any] = {}) -> List[Dict[str, Any]]:
-    logger.debug(f"Running Cypher query: {query} with parameters: {parameters}")
+    # Log parameters only if provided.
+    if parameters:
+        logger.debug(f"Running Cypher query: {query} with parameters: {parameters}")
+    else:
+        logger.debug(f"Running Cypher query: {query}")
     try:
         with driver.session() as session:
             result = session.run(query, **parameters)
             data = [record.data() for record in result]
-            logger.debug(f"Query result: {data}")
+            # For logging, filter out any keys related to embeddings.
+            data_for_log = []
+            for record in data:
+                filtered_record = {k: v for k, v in record.items() if k.lower() != "embedding"}
+                data_for_log.append(filtered_record)
+            logger.debug(f"Query result: {data_for_log}")
             return data
     except Exception as e:
         logger.error(f"Error executing query: {query}. Error: {e}")
         raise HTTPException(status_code=500, detail=f"Neo4j query execution error: {e}")
-
 
 def build_llm_answer_prompt(query_context: dict) -> str:
     prompt = f"""Given the data extracted from the graph database:
@@ -1136,194 +1145,133 @@ async def upload_documents(files: List[UploadFile] = File(...)):
     return {"message": "Documents processed, graph updated, and community summaries stored successfully."}
 
 
-@app.post("/ask_question")
-async def ask_question(request: QuestionRequest):
-    # Step 1: Rewrite the question if conversation history exists.
-    request.question = await rewrite_query_if_needed(request.question, request.previous_conversations)
-
-    # Step 2: Retrieve the dynamic schema output (for logging or context).
-    dynamic_schema = get_schema_from_neo4j()
-    logger.info(f"Dynamic schema (optimal query): {dynamic_schema[:200]}...")
-
-    # Step 3: Extract an entity from the user query and select the best matching entity from Neo4j.
+@app.post("/cypher_search")
+async def cypher_search(request: QuestionRequest):
+    # Step 1: Extract candidate entities from the user query.
     candidate_entities = await extract_entity_keywords(request.question)
-    extracted_entity = candidate_entities[0] if candidate_entities else ""
-    query_entities = "MATCH (e:Entity) RETURN e.name AS name, e.embedding AS embedding"
-    entity_results = await asyncio.to_thread(run_cypher_query, query_entities)
-    top_entity = extracted_entity  # default to the extracted entity
-    top_score = -1
-    if extracted_entity:
-        try:
-            extracted_embedding = await async_embedding_client.get_embedding(extracted_entity)
-        except Exception as e:
-            logger.error(f"Error getting embedding for extracted entity: {e}")
-            extracted_embedding = None
-        if extracted_embedding:
-            for record in entity_results:
+    final_entities = []
+
+    # Retrieve all stored entities from Neo4j.
+    stored_entities = await asyncio.to_thread(run_cypher_query, "MATCH (e:Entity) RETURN e.name AS name, e.embedding AS embedding")
+
+    # For each candidate, compute cosine similarity and select the top matching stored entity.
+    if candidate_entities:
+        for candidate in candidate_entities:
+            try:
+                candidate_embedding = await async_embedding_client.get_embedding(candidate)
+            except Exception as e:
+                logger.error(f"Error getting embedding for candidate '{candidate}': {e}")
+                continue
+
+            top_match = None
+            top_score = -1
+            for record in stored_entities:
                 name = record.get("name", "")
                 embedding = record.get("embedding")
                 if embedding:
-                    score = cosine_similarity(extracted_embedding, embedding)
+                    score = cosine_similarity(candidate_embedding, embedding)
                     if score > top_score:
                         top_score = score
-                        top_entity = name
-    logger.info(f"Top entity for query: {top_entity} with score {top_score}")
+                        top_match = name
+            if top_match:
+                final_entities.append(top_match)
 
-    # Step 4: Build few-shot examples with the selected top_entity.
-    few_shot_example_1 = f"""MATCH (start:Entity {{name: "{top_entity}"}})
-OPTIONAL MATCH (start)-[:RELATES_TO]->(related:Entity)
-OPTIONAL MATCH (related)-[:MENTIONED_IN]->(chunk:Chunk)
-RETURN start.name AS StartingEntity, related.name AS RelatedEntity, chunk.text AS ChunkText;"""
-    few_shot_example_2 = f"""MATCH (start:Entity {{name: "{top_entity}"}})-[:RELATES_TO]->(related:Entity)
-OPTIONAL MATCH (related)-[:MENTIONED_IN]->(chunk:Chunk)
-RETURN related.name AS RelatedEntity, collect(chunk.text) AS ChunkTexts;"""
+    # Remove duplicates.
+    final_entities = list(set(final_entities))
 
-    # Step 5: Prepare the schema queries as context.
-    schema_query_1 = "call apoc.meta.schema()"
-    schema_query_2 = """CALL () {
-      MATCH (n1)-[r]->(n2)
-      WITH DISTINCT labels(n1) AS sourceNodeLabels, type(r) AS relationshipType, labels(n2) AS targetNodeLabels, keys(r) AS relationshipProperties
-      UNWIND sourceNodeLabels AS sourceLabel
-      UNWIND targetNodeLabels AS targetLabel
-      UNWIND relationshipProperties AS relProp
-      RETURN 'Relationship' AS ElementType, relationshipType AS Type, sourceLabel AS SourceNode, targetLabel AS TargetNode, collect(DISTINCT relProp) AS PropertyFields
-      UNION
-      MATCH (n)
-      WITH DISTINCT labels(n) AS nodeLabels, keys(n) AS properties
-      UNWIND nodeLabels AS label
-      UNWIND properties AS prop
-      RETURN 'Node' AS ElementType, label AS Type, null AS SourceNode, null AS TargetNode, collect(DISTINCT prop) AS PropertyFields
-    }
-    RETURN ElementType, Type, SourceNode, TargetNode, PropertyFields
-    ORDER BY ElementType, Type"""
-
-    # Step 6: Build a custom prompt for candidate Cypher query generation.
-    custom_context = f"""
-Schema Query 1:
-{schema_query_1}
-
-Schema Query 2:
-{schema_query_2}
-
-Few-Shot Example 1:
-{few_shot_example_1}
-
-Few-Shot Example 2:
-{few_shot_example_2}
-
-Additionally, please generate a fuzzy match Cypher query.
-
-User Question:
-{request.question}
-    """
-    messages = [
-        {"role": "system", "content": "You are a professional Cypher query generator. Your response MUST be valid JSON containing a list of query strings."},
-        {"role": "user", "content": custom_context}
-    ]
-    try:
-        candidate_queries = await async_llm.invoke_json(messages)
-        if not isinstance(candidate_queries, list):
-            candidate_queries = [candidate_queries]
-    except Exception as e:
-        logger.error(f"Error generating candidate queries: {e}")
-        candidate_queries = []
-
-    # Fallback candidate query if none was generated.
-    if not candidate_queries:
-        candidate_queries = [
-            "MATCH (e:Entity)-[:MENTIONED_IN]->(c:Chunk) WHERE c.text IS NOT NULL RETURN c.text AS chunk_text LIMIT 10"
-        ]
-
-    logger.debug("Candidate queries generated: %s", candidate_queries)
-    valid_cypher = candidate_queries[0]
-    logger.info(f"Selected candidate Cypher: {valid_cypher}")
-
-    # Step 7: Execute the selected Cypher query.
-    try:
-        query_output = await asyncio.to_thread(run_cypher_query, valid_cypher)
-    except Exception as e:
-        logger.error(f"Error executing Cypher query: {e}")
-        raise HTTPException(status_code=500, detail=f"Error executing Cypher query: {e}")
-
-    # Step 8: Extract relevant text chunks.
-    relevant_results = []
-    for record in query_output:
-        chunk_text = record.get("chunk_text")
-        if chunk_text and isinstance(chunk_text, str) and chunk_text.strip():
-            relevant_results.append(chunk_text.strip())
-    if not relevant_results:
-        relevant_results.append("No relevant text data found.")
-
-    # --- MAP STEP: Extract key points from each text chunk ---
-    async def extract_key_points(chunk: str, query: str) -> list:
-        map_prompt = (
-            "Extract key points from the following text chunk that are relevant to answering the user query. "
-            "Return a JSON array where each element is an object with keys 'point' (a short key detail) and 'rating' (a number from 1 to 100).\n\n"
-            "Text chunk:\n\"\"\"\n" + chunk + "\n\"\"\"\n"
-            "User Query: " + query
-        )
+    results = []
+    # Step 2: If no matching entities were found, use the fallback query.
+    if not final_entities:
+        fallback_query = f"""
+        MATCH (e:Entity)
+        WHERE apoc.text.jaroWinklerDistance(e.name, "{request.question}") > 0.8
+        WITH e
+        MATCH (e)-[:RELATES_TO]->(related:Entity)
+        OPTIONAL MATCH (related)-[:MENTIONED_IN]->(chunk:Chunk)
+        RETURN e.name AS MatchedEntity, related.name AS RelatedEntity, collect(chunk.text) AS ChunkTexts
+        LIMIT {CYPHER_QUERY_LIMIT};
+        """
         try:
-            result = await async_llm.invoke_json([
-                {"role": "system", "content": "You are a professional extraction assistant."},
-                {"role": "user", "content": map_prompt}
-            ])
-            if isinstance(result, list):
-                return result
-            else:
-                logger.error("Mapping result is not a list.")
-                return []
+            query_result = await asyncio.to_thread(run_cypher_query, fallback_query)
+            results.append(query_result)
         except Exception as e:
-            logger.error(f"Error in mapping step for chunk: {e}")
-            return []
+            logger.error(f"Error executing fallback query: {e}")
+            raise HTTPException(status_code=500, detail=f"Error executing fallback query: {e}")
+    else:
+        # Step 3: For each extracted entity, generate and execute the three Cypher queries.
+        for entity in final_entities:
+            query_a = f"""
+            MATCH (start:Entity {{name: "{entity}"}})
+            OPTIONAL MATCH (start)-[:RELATES_TO]->(related:Entity)
+            OPTIONAL MATCH (related)-[:MENTIONED_IN]->(chunk:Chunk)
+            RETURN start.name AS StartingEntity, related.name AS RelatedEntity, chunk.text AS ChunkText
+            LIMIT {CYPHER_QUERY_LIMIT};
+            """
+            query_b = f"""
+            MATCH (start:Entity {{name: "{entity}"}})-[:RELATES_TO]->(related:Entity)
+            OPTIONAL MATCH (related)-[:MENTIONED_IN]->(chunk:Chunk)
+            RETURN related.name AS RelatedEntity, collect(chunk.text) AS ChunkTexts
+            LIMIT {CYPHER_QUERY_LIMIT};
+            """
+            query_c = f"""
+            MATCH (start:Entity {{name: "{entity}"}})
+            OPTIONAL MATCH (start)-[:RELATES_TO]->(related:Entity)
+            OPTIONAL MATCH (related)-[:MENTIONED_IN]->(chunk:Chunk)
+            RETURN start.name AS StartingEntity, related.name AS RelatedEntity, chunk.text AS ChunkText
+            LIMIT {CYPHER_QUERY_LIMIT};
+            """
+            for q in [query_a, query_b, query_c]:
+                try:
+                    qr = await asyncio.to_thread(run_cypher_query, q)
+                    results.append(qr)
+                except Exception as e:
+                    logger.error(f"Error executing query for entity '{entity}': {e}")
 
-    # Process all chunks concurrently.
-    mapping_tasks = [extract_key_points(chunk, request.question) for chunk in relevant_results]
-    mapped_results = await asyncio.gather(*mapping_tasks)
-    # Flatten the list of lists.
-    intermediate_points = [pt for sublist in mapped_results for pt in sublist]
+    # Step 4: Map Reduce – aggregate all returned text chunks without duplicates.
+    processed_chunks = set()
+    aggregated_text = ""
+    for res in results:
+        for record in res:
+            if "ChunkText" in record and record["ChunkText"]:
+                chunk = record["ChunkText"].strip()
+                if chunk and chunk not in processed_chunks:
+                    processed_chunks.add(chunk)
+                    aggregated_text += " " + chunk
+            elif "ChunkTexts" in record and record["ChunkTexts"]:
+                for chunk in record["ChunkTexts"]:
+                    chunk = chunk.strip()
+                    if chunk and chunk not in processed_chunks:
+                        processed_chunks.add(chunk)
+                        aggregated_text += " " + chunk
+            elif "MatchedEntity" in record and "ChunkTexts" in record:
+                if record["ChunkTexts"]:
+                    for chunk in record["ChunkTexts"]:
+                        chunk = chunk.strip()
+                        if chunk and chunk not in processed_chunks:
+                            processed_chunks.add(chunk)
+                            aggregated_text += " " + chunk
+    aggregated_text = aggregated_text.strip()
 
-    logger.debug("Intermediate key points extracted (unsorted): %s", intermediate_points)
-
-    # --- REDUCE STEP: Aggregate key points into a final answer ---
-    # Sort the key points by rating (safely handling non-dictionary items).
-    intermediate_points_sorted = sorted(
-        intermediate_points,
-        key=lambda x: x.get("rating", 0) if isinstance(x, dict) else 0,
-        reverse=True
-    )
-    # Take the top N key points.
-    top_n = 10
-    selected_points = intermediate_points_sorted[:top_n]
-    # Build the reduce prompt.
-    reduce_prompt = (
-        "Using the following intermediate key points extracted from the document texts:\n" +
-        json.dumps(selected_points, indent=2) +
-        "\n\nand the user query: \"" + request.question + "\", "
-        "generate a detailed answer that synthesizes the information. "
-        "Return your answer as a JSON object with keys 'summary', 'key_points' (a list), and 'detailed_explanation'."
+    # Step 5: Use the aggregated text (plus the original query) to generate a final answer.
+    final_prompt = (
+        f"User Query: {request.question}\n\n"
+        f"Extracted Graph Data:\n{aggregated_text}\n\n"
+        "Based solely on the above information, provide a detailed answer to the query."
     )
     try:
-        final_answer_reduce = await async_llm.invoke_json([
-            {"role": "system", "content": "You are a professional assistant synthesizing information."},
-            {"role": "user", "content": reduce_prompt}
+        final_answer = await async_llm.invoke([
+            {"role": "system", "content": "You are a professional assistant."},
+            {"role": "user", "content": final_prompt}
         ])
     except Exception as e:
-        logger.error(f"Error in reduce step: {e}")
-        raise HTTPException(status_code=500, detail=f"Error in reduce step: {e}")
-
-    # Format the final answer.
-    combined_response = format_natural_response(json.dumps(final_answer_reduce))
-    logger.debug("Final synthesized answer: %s", combined_response)
+        logger.error(f"Error generating final answer: {e}")
+        raise HTTPException(status_code=500, detail=f"Error generating final answer: {e}")
 
     return {
-        "user_question": request.question,
-        "candidate_queries": candidate_queries,
-        "selected_query": valid_cypher,
-        "query_output": query_output,
-        "intermediate_key_points": intermediate_points_sorted,
-        "final_answer": combined_response
+        "final_answer": final_answer,
+        "aggregated_text": aggregated_text,
+        "executed_queries": results
     }
-
 
 @app.post("/global_search")
 async def global_search(request: GlobalSearchRequest):
