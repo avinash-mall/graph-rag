@@ -24,6 +24,7 @@ from fastapi import FastAPI, HTTPException, UploadFile, File
 from neo4j import GraphDatabase
 from pydantic import BaseModel
 
+
 # -----------------------------------------------------------------------------
 # Helper function to run asynchronous coroutines without calling asyncio.run()
 # inside an already running event loop.
@@ -35,15 +36,18 @@ def run_async(coro):
         loop = None
     if loop and loop.is_running():
         result_container = {}
+        new_loop = None  # Initialize new_loop outside the inner function.
         def run():
+            nonlocal new_loop  # Declare nonlocal to modify the outer new_loop.
+            new_loop = asyncio.new_event_loop()
             try:
-                new_loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(new_loop)
                 result_container["result"] = new_loop.run_until_complete(coro)
             except Exception as e:
                 result_container["result"] = e
             finally:
-                new_loop.close()
+                if new_loop:
+                    new_loop.close()
         thread = threading.Thread(target=run)
         thread.start()
         thread.join()
@@ -53,7 +57,6 @@ def run_async(coro):
         return result
     else:
         return asyncio.run(coro)
-
 # -----------------------------------------------------------------------------
 # Disable warnings and load environment variables
 # -----------------------------------------------------------------------------
@@ -110,6 +113,7 @@ logger.info(f"Logging initialized with level: {LOG_LEVEL}")
 # -----------------------------------------------------------------------------
 driver = GraphDatabase.driver(DB_URL, auth=(DB_USERNAME, DB_PASSWORD))
 
+
 # -----------------------------------------------------------------------------
 # Pydantic Models for Request Bodies
 # -----------------------------------------------------------------------------
@@ -118,24 +122,29 @@ class QuestionRequest(BaseModel):
     doc_id: Optional[Union[str, List[str]]] = None
     previous_conversations: Optional[str] = None
 
+
 class DeleteDocumentRequest(BaseModel):
     doc_id: Optional[str] = None
     document_name: Optional[str] = None
+
 
 class LocalSearchRequest(BaseModel):
     question: str
     doc_id: Optional[str] = None
     previous_conversations: Optional[str] = None
 
+
 class DriftSearchRequest(BaseModel):
     question: str
     previous_conversations: Optional[str] = None
     doc_id: Optional[str] = None
 
+
 class GlobalSearchRequest(BaseModel):
     question: str
     previous_conversations: Optional[str] = None
     doc_id: Optional[str] = None
+
 
 # =============================================================================
 # UTILITY FUNCTIONS
@@ -147,6 +156,7 @@ def clean_empty_chunks():
         session.run(query)
         logger.info("Cleaned empty Chunk nodes.")
 
+
 def clean_empty_nodes():
     with driver.session() as session:
         # Delete any Entity nodes where the 'name' property is NULL or only whitespace.
@@ -154,18 +164,17 @@ def clean_empty_nodes():
         session.run(query)
         logger.info("Cleaned empty Entity nodes.")
 
+
 # Helper to extract code if returned inside triple backticks.
 def extract_cypher_code(raw_query: str) -> str:
-    """
-    If the LLM returns a code block (using triple backticks), extract only the Cypher code.
-    Otherwise, return the stripped raw output.
-    """
-    pattern = re.compile(r"```(?:cypher)?\s*(.*?)\s*```", re.DOTALL)
+    pattern = re.compile(r"```(?:cypher)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
     matches = pattern.findall(raw_query)
     if matches:
         return matches[0].strip()
+    # Fallback: if the raw query appears to be a query (contains MATCH and RETURN), return it as is.
+    if "MATCH" in raw_query and "RETURN" in raw_query:
+        return raw_query.strip()
     return raw_query.strip()
-
 async def rewrite_query_if_needed(question: str, conversation_history: Optional[str]) -> str:
     """
     If conversation history is provided, rewrite the query into a standalone query.
@@ -183,11 +192,8 @@ async def rewrite_query_if_needed(question: str, conversation_history: Optional[
         return rewritten_query.strip()
     return question
 
+
 def get_schema_from_neo4j() -> str:
-    """
-    Retrieve the schema using an optimal schema collection query.
-    This query returns nodes and relationships (ignoring fields like embeddings).
-    """
     optimal_schema_query = """
     CALL () {
       MATCH (n1)-[r]->(n2)
@@ -212,7 +218,6 @@ def get_schema_from_neo4j() -> str:
     except Exception as e:
         logger.error(f"Error retrieving schema: {e}")
         return "Error retrieving schema from Neo4j."
-        
 async def extract_entity_keywords(question: str) -> list:
     """
     Dynamically extract entity names from the given question using the LLM.
@@ -234,7 +239,8 @@ async def extract_entity_keywords(question: str) -> list:
         logger.error(f"Error extracting keywords: {e}")
         # Fallback heuristic: return first two words if extraction fails.
         return question.split()[:2]
-        
+
+
 async def generate_valid_cypher(question: str, max_iterations: int = 5) -> str:
     """
     Iteratively generate and validate a Cypher query that retrieves the 'text' field from Chunk nodes.
@@ -252,7 +258,7 @@ async def generate_valid_cypher(question: str, max_iterations: int = 5) -> str:
         # Fallback: use first two words from the question if extraction fails.
         keywords = question.split()[:2]
     keywords_str = ", ".join(keywords)
-    
+
     current_prompt = (
         f"Given the question: \"{question}\", and the extracted entity keywords: {keywords_str}, "
         "generate a Cypher query that retrieves the 'text' field from Chunk nodes connected to all Entity nodes matching these keywords. "
@@ -264,16 +270,16 @@ async def generate_valid_cypher(question: str, max_iterations: int = 5) -> str:
     iteration = 0
     while iteration < max_iterations:
         iteration += 1
-        raw_query = await async_llm.invoke([
+        raw_query = await async_llm_query.invoke([
             {"role": "system", "content": "You are a professional Cypher generator."},
             {"role": "user", "content": current_prompt}
         ])
         cypher_query = extract_cypher_code(raw_query)
         logger.info(f"Iteration {iteration} generated query: {cypher_query}")
         # Check that the query contains required elements.
-        if ("MATCH" in cypher_query and "RETURN" in cypher_query and "Entity" in cypher_query 
-            and "Chunk" in cypher_query and ("text" in cypher_query or "chunk_text" in cypher_query)
-            and "MENTIONED_IN" in cypher_query):
+        if ("MATCH" in cypher_query and "RETURN" in cypher_query and "Entity" in cypher_query
+                and "Chunk" in cypher_query and ("text" in cypher_query or "chunk_text" in cypher_query)
+                and "MENTIONED_IN" in cypher_query):
             try:
                 # Try a dummy execution to validate syntax.
                 _ = await asyncio.to_thread(run_cypher_query, cypher_query)
@@ -281,8 +287,9 @@ async def generate_valid_cypher(question: str, max_iterations: int = 5) -> str:
             except Exception as e:
                 feedback = f"Syntax error: {e}."
         else:
-            feedback = ("Query missing required elements. Ensure you MATCH Entity nodes using case-insensitive regex for each extracted keyword, "
-                        "MATCH a connected Chunk node via MENTIONED_IN, and RETURN the chunk text as chunk_text.")
+            feedback = (
+                "Query missing required elements. Ensure you MATCH Entity nodes using case-insensitive regex for each extracted keyword, "
+                "MATCH a connected Chunk node via MENTIONED_IN, and RETURN the chunk text as chunk_text.")
         current_prompt = (
             f"Previous query:\n{cypher_query}\nFeedback: {feedback}\n"
             "Please generate a corrected Cypher query that meets these criteria dynamically based on the extracted keywords. "
@@ -290,7 +297,8 @@ async def generate_valid_cypher(question: str, max_iterations: int = 5) -> str:
         )
         logger.info(f"Iteration {iteration} feedback: {feedback}")
     raise Exception("Failed to generate valid Cypher query after multiple iterations.")
-        
+
+
 async def validate_and_refine_query(initial_query: str, question: str, llm_instance: AsyncOpenAI) -> str:
     results = await asyncio.to_thread(run_cypher_query, initial_query)
     if results:
@@ -302,7 +310,8 @@ async def validate_and_refine_query(initial_query: str, question: str, llm_insta
         "Return valid JSON with key 'cypher_query'."
     )
     messages = [
-        {"role": "system", "content": "You are a professional assistant. Return ONLY valid JSON with no extra commentary."},
+        {"role": "system",
+         "content": "You are a professional assistant. Return ONLY valid JSON with no extra commentary."},
         {"role": "user", "content": fallback_prompt}
     ]
     raw_response = await llm_instance.invoke_json(messages, fallback=True)
@@ -310,8 +319,10 @@ async def validate_and_refine_query(initial_query: str, question: str, llm_insta
         raw_response = json.dumps(raw_response)
     refined_query = extract_cypher_query(raw_response)
     fallback_results = await asyncio.to_thread(run_cypher_query, refined_query)
-    return refined_query if fallback_results else refined_query
-
+    if fallback_results:
+        return refined_query
+    else:
+        raise Exception("Fallback query execution returned no results.")
 def build_enhanced_final_prompt(question: str, responses: List[str], query: str, query_output: dict) -> str:
     return (
         f"User Question: {question}\n\n"
@@ -321,6 +332,41 @@ def build_enhanced_final_prompt(question: str, responses: List[str], query: str,
         "If the query output is empty, explain possible reasons (e.g., schema mismatch or missing data) "
         "and suggest corrective actions. Do not include external knowledge."
     )
+
+# A helper function to generate candidate Cypher queries.
+async def generate_candidate_queries(question_history: list[str], context_data: str, candidate_count: int = 3) -> list[
+    str]:
+    current_question = question_history[-1] if question_history else ""
+    # Updated system prompt to instruct the LLM to alias the actual property 'text' as 'chunk_text'
+    system_prompt = (
+        "You are a professional Cypher query generator. The correct label names in the database are exactly 'Entity' and 'Chunk'. "
+        "Based on the context data provided below—which includes structured information (entities, relationships, community reports) "
+        "and unstructured document text chunks—generate {} candidate Cypher queries. Each query must dynamically match Entity nodes "
+        "using case-insensitive regex (e.g., '(?i).*keyword.*') based on keywords extracted from the current question, then find a Chunk node "
+        "connected via the MENTIONED_IN relationship. Use WITH clauses or subqueries to avoid Cartesian products and return only the chunk's text "
+        "as 'chunk_text'. IMPORTANT: Since the Chunk nodes store their text in the property 'text', your query must return it as: RETURN c.text AS chunk_text. "
+        "Output your results strictly as a JSON array of query strings with no extra commentary."
+    ).format(candidate_count)
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": f"Context data:\n{context_data}\n\nCurrent question:\n{current_question}"}
+    ]
+
+    try:
+        response = await async_llm.invoke_json(messages)
+        candidate_queries = response if isinstance(response, list) else []
+    except Exception as e:
+        logger.error(f"Error generating candidate queries: {e}")
+        candidate_queries = []
+
+    # Fallback: if no candidate queries were generated, provide a default candidate query.
+    if not candidate_queries:
+        candidate_queries = [
+            "MATCH (e:Entity)-[:MENTIONED_IN]->(c:Chunk) WHERE c.text IS NOT NULL RETURN c.text AS chunk_text LIMIT 10"
+        ]
+
+    return candidate_queries
 
 def extract_cypher_query(response_text: str) -> str:
     try:
@@ -333,6 +379,7 @@ def extract_cypher_query(response_text: str) -> str:
     except Exception as e:
         logger.error(f"Error parsing JSON: {e}")
     return _postprocess_output_cypher(response_text)
+
 
 def fix_cypher_query(query: str) -> str:
     # If the query is wrapped in a JSON object with key "query", extract it.
@@ -355,6 +402,7 @@ def fix_cypher_query(query: str) -> str:
         query = query.replace("type(b)", "type(r)")
     return query
 
+
 def _postprocess_output_cypher(output_cypher: str) -> str:
     if "```" in output_cypher:
         parts = output_cypher.split("```")
@@ -365,6 +413,7 @@ def _postprocess_output_cypher(output_cypher: str) -> str:
     partition_by = "**Explanation:**"
     output_cypher, _, _ = output_cypher.partition(partition_by)
     return output_cypher.strip("`\n").lstrip("cypher\n").strip("`\n ")
+
 
 def parse_strict_json(response_text: str) -> Union[dict, list]:
     try:
@@ -377,6 +426,7 @@ def parse_strict_json(response_text: str) -> Union[dict, list]:
             logger.error("json5 parsing also failed: " + str(e2))
             raise e2
 
+
 def clean_text(text: str) -> str:
     if not isinstance(text, str):
         logger.error(f"Received non-string content for text cleaning: {type(text)}")
@@ -385,9 +435,15 @@ def clean_text(text: str) -> str:
     logger.debug(f"Cleaned text: {cleaned_text[:100]}...")
     return cleaned_text
 
+
 def chunk_text(text: str, max_chunk_size: int = 512) -> List[str]:
     sentences = [s.strip() for s in blingfire.text_to_sentences(text).splitlines() if s.strip()]
-    unique_sentences = list(set(sentences))
+    unique_sentences = []
+    seen = set()
+    for s in sentences:
+        if s not in seen:
+            seen.add(s)
+            unique_sentences.append(s)
     chunks = []
     current_chunk = ""
     for s in unique_sentences:
@@ -399,7 +455,6 @@ def chunk_text(text: str, max_chunk_size: int = 512) -> List[str]:
     if current_chunk:
         chunks.append(current_chunk.strip())
     return chunks
-
 def run_cypher_query(query: str, parameters: Dict[str, Any] = {}) -> List[Dict[str, Any]]:
     logger.debug(f"Running Cypher query: {query} with parameters: {parameters}")
     try:
@@ -411,6 +466,7 @@ def run_cypher_query(query: str, parameters: Dict[str, Any] = {}) -> List[Dict[s
     except Exception as e:
         logger.error(f"Error executing query: {query}. Error: {e}")
         raise HTTPException(status_code=500, detail=f"Neo4j query execution error: {e}")
+
 
 def build_llm_answer_prompt(query_context: dict) -> str:
     prompt = f"""Given the data extracted from the graph database:
@@ -429,12 +485,14 @@ General Query Output:
 Provide a detailed answer to the query based solely on the information above."""
     return prompt.strip()
 
+
 def build_combined_answer_prompt(user_question: str, responses: List[str]) -> str:
     prompt = f"User Question: {user_question}\n\nThe following responses were generated for different aspects of your query:\n"
     for idx, resp in enumerate(responses, start=1):
         prompt += f"{idx}. {resp}\n"
     prompt += "\nBased on the above responses, provide a final comprehensive answer that directly addresses the original question. Do not use your prior knowledge and only use knowledge from the provided text."
     return prompt.strip()
+
 
 def format_natural_response(response: str) -> str:
     logger.info(f"Raw LLM Response: {repr(response)}")
@@ -457,15 +515,16 @@ def format_natural_response(response: str) -> str:
 
 async def resolve_coreferences_in_parts(text: str) -> str:
     async_client = AsyncOpenAI(api_key=OPENAI_API_KEY, model=OPENAI_MODEL,
-                                 base_url=OPENAI_BASE_URL, temperature=OPENAI_TEMPERATURE, stop=OPENAI_STOP, timeout=OPENAI_API_TIMEOUT)
+                               base_url=OPENAI_BASE_URL, temperature=OPENAI_TEMPERATURE, stop=OPENAI_STOP,
+                               timeout=OPENAI_API_TIMEOUT)
     words = text.split()
     parts = [" ".join(words[i:i + COREF_WORD_LIMIT]) for i in range(0, len(words), COREF_WORD_LIMIT)]
 
     async def process_part(part: str, idx: int) -> str:
         prompt = (
-            "Resolve all ambiguous pronouns and vague references in the following text by replacing them with their appropriate entities. "
-            "Ensure no unresolved pronouns like 'he', 'she', 'himself', etc. remain. "
-            "If the referenced entity is unclear, make an intelligent guess based on context.\n\n" + part)
+                "Resolve all ambiguous pronouns and vague references in the following text by replacing them with their appropriate entities. "
+                "Ensure no unresolved pronouns like 'he', 'she', 'himself', etc. remain. "
+                "If the referenced entity is unclear, make an intelligent guess based on context.\n\n" + part)
         try:
             resolved_text = await async_llm.invoke([
                 {"role": "system", "content": "You are a professional text refiner skilled in coreference resolution."},
@@ -482,6 +541,7 @@ async def resolve_coreferences_in_parts(text: str) -> str:
     filtered_text = re.sub(r'\b(he|she|it|they|him|her|them|his|her|their|its|himself|herself|his partner)\b', '',
                            combined_text, flags=re.IGNORECASE)
     return filtered_text.strip()
+
 
 def extract_entities_with_llm(text: str) -> List[Dict[str, str]]:
     client = AsyncOpenAI(api_key=OPENAI_API_KEY, model=OPENAI_MODEL, base_url=OPENAI_BASE_URL,
@@ -512,6 +572,7 @@ def extract_entities_with_llm(text: str) -> List[Dict[str, str]]:
         logger.error(f"NER extraction error: {e}")
         return []
 
+
 # --- END OF MISSING LOGIC ---
 
 def get_refined_system_message() -> str:
@@ -520,6 +581,7 @@ def get_refined_system_message() -> str:
         "markdown formatting, or commentary. Ensure the JSON is complete and properly formatted with matching opening "
         "and closing braces. If there is an error, return a JSON object with a key 'error' and a descriptive message."
     )
+
 
 # =============================================================================
 # ASYNCHRONOUS OPENAI & EMBEDDING API CLIENT CLASSES
@@ -566,6 +628,7 @@ class AsyncOpenAI:
             else:
                 return {"error": "Failed to parse JSON response."}
 
+
 class AsyncEmbeddingAPIClient:
     def __init__(self):
         self.embedding_api_url = os.getenv("EMBEDDING_API_URL", "http://localhost/api/embed")
@@ -584,18 +647,26 @@ class AsyncEmbeddingAPIClient:
         self.logger.info("Requesting embedding for text (first 50 chars): %s", text[:50])
         payload = {"model": "mxbai-embed-large", "input": text}
         async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
-            response = await client.post(self.embedding_api_url, json=payload, headers={"Content-Type": "application/json"})
+            response = await client.post(
+                url=self.embedding_api_url,
+                json=payload,
+                headers={"Content-Type": "application/json"}
+            )
             response.raise_for_status()
-            embedding = response.json().get("embeddings", [[]])[0]
+            response_json = response.json()
+            embeddings = response_json.get("embeddings", None)
+            if not embeddings or not isinstance(embeddings, list) or len(embeddings) == 0:
+                raise ValueError(f"Empty or invalid embedding response for text: {text[:50]}")
+            embedding = embeddings[0]
             if not embedding:
-                raise ValueError(f"Empty embedding returned for text: {text[:50]}")
-            self.logger.debug("Received embedding of length: %d", len(embedding))
+                raise ValueError("Empty embedding returned for text: " + text[:50])
             self.cache[text_hash] = embedding
             return embedding
 
     async def get_embeddings(self, texts: List[str]) -> List[List[float]]:
         tasks = [self.get_embedding(text) for text in texts]
         return await asyncio.gather(*tasks)
+
 
 # Global asynchronous client instances
 async_llm = AsyncOpenAI(
@@ -607,7 +678,17 @@ async_llm = AsyncOpenAI(
     timeout=OPENAI_API_TIMEOUT
 )
 
+async_llm_query = AsyncOpenAI(
+    api_key=OPENAI_API_KEY,
+    model="hf.co/avinashm/text2cypher",  # Fine-tuned model for query generation.
+    base_url=OPENAI_BASE_URL,
+    temperature=0.0,
+    stop=OPENAI_STOP,
+    timeout=OPENAI_API_TIMEOUT
+)
+
 async_embedding_client = AsyncEmbeddingAPIClient()
+
 
 # =============================================================================
 # GRAPH DATABASE HELPER FUNCTIONS & CLASSES (Asynchronous LLM Calls)
@@ -641,7 +722,8 @@ class GraphManager:
                 logger.info(f"Added chunk {i} with text: {chunk[:100]}...")
                 try:
                     summary = await async_llm.invoke([
-                        {"role": "system", "content": "Summarize the following text into relationships in the format: Entity1 -> Entity2 [strength: X.X]. Do not add extra commentary."},
+                        {"role": "system",
+                         "content": "Summarize the following text into relationships in the format: Entity1 -> Entity2 [strength: X.X]. Do not add extra commentary."},
                         {"role": "user", "content": chunk}
                     ])
                 except Exception as e:
@@ -657,17 +739,38 @@ class GraphManager:
                             match = re.search(r"\[strength:\s*(\d\.\d)\]", line)
                             if match:
                                 weight = float(match.group(1))
+                            try:
+                                # Compute embeddings for the entity names with error handling.
+                                source_embedding = await async_embedding_client.get_embedding(source)
+                                target_embedding = await async_embedding_client.get_embedding(target)
+                            except Exception as e:
+                                logger.error(f"Error generating embedding for entity: {e}")
+                                continue  # Skip this relationship if embeddings cannot be computed
+
+                            # Updated query to merge Entity nodes with their embeddings
                             rel_query = """
                                 MERGE (a:Entity {name: $source, doc_id: $doc_id})
+                                ON CREATE SET a.embedding = $source_embedding
+                                ON MATCH SET a.embedding = $source_embedding
                                 MERGE (b:Entity {name: $target, doc_id: $doc_id})
+                                ON CREATE SET b.embedding = $target_embedding
+                                ON MATCH SET b.embedding = $target_embedding
                                 MERGE (a)-[r:RELATES_TO {weight: $weight}]->(b)
                                 WITH a, b
                                 MATCH (c:Chunk {id: $cid, doc_id: $doc_id})
                                 MERGE (a)-[:MENTIONED_IN]->(c)
                                 MERGE (b)-[:MENTIONED_IN]->(c)
                             """
-                            session.run(rel_query, source=source, target=target, weight=weight, doc_id=meta["doc_id"],
-                                        cid=i)
+                            session.run(
+                                rel_query,
+                                source=source,
+                                target=target,
+                                weight=weight,
+                                doc_id=meta["doc_id"],
+                                cid=i,
+                                source_embedding=source_embedding,
+                                target_embedding=target_embedding
+                            )
         logger.info("Graph construction complete.")
 
     async def reproject_graph(self, graph_name: str = GRAPH_NAME, doc_id: Optional[str] = None) -> None:
@@ -688,7 +791,9 @@ class GraphManager:
                             config=config)
             logger.info("Graph projection complete.")
 
+
 graph_manager = GraphManager()
+
 
 class GraphManagerExtended:
     def __init__(self, driver):
@@ -767,6 +872,7 @@ class GraphManagerExtended:
                 summaries[comm] = {"summary": record["summary"], "embedding": record["embedding"]}
             return summaries
 
+
 def detect_communities(doc_id: Optional[str] = None) -> dict:
     communities = {}
     with driver.session() as session:
@@ -794,6 +900,7 @@ def detect_communities(doc_id: Optional[str] = None) -> dict:
             session.run("MATCH (n:DocEntity {doc_id: $doc_id}) REMOVE n:DocEntity", doc_id=doc_id)
     return communities
 
+
 class GraphManagerWrapper:
     def __init__(self):
         self.manager = graph_manager
@@ -812,11 +919,14 @@ class GraphManagerWrapper:
         extended = GraphManagerExtended(driver)
         return await extended.get_stored_community_summaries(doc_id)
 
+
 graph_manager_wrapper = GraphManagerWrapper()
 
-async def global_search_map_reduce(question: str, conversation_history: Optional[str] = None, doc_id: Optional[str] = None,
-                             chunk_size: int = GLOBAL_SEARCH_CHUNK_SIZE, top_n: int = GLOBAL_SEARCH_TOP_N,
-                             batch_size: int = GLOBAL_SEARCH_BATCH_SIZE) -> str:
+
+async def global_search_map_reduce(question: str, conversation_history: Optional[str] = None,
+                                   doc_id: Optional[str] = None,
+                                   chunk_size: int = GLOBAL_SEARCH_CHUNK_SIZE, top_n: int = GLOBAL_SEARCH_TOP_N,
+                                   batch_size: int = GLOBAL_SEARCH_BATCH_SIZE) -> str:
     summaries = await graph_manager_wrapper.get_stored_community_summaries(doc_id=doc_id)
     if not summaries:
         raise HTTPException(status_code=500, detail="No community summaries available. Please re-index the dataset.")
@@ -852,7 +962,10 @@ async def global_search_map_reduce(question: str, conversation_history: Optional
                 logger.error(f"Batch processing error: {e}")
     logger.info("Intermediate key points extracted (unsorted):")
     for pt in intermediate_points:
-        logger.info("Key point: %s, Rating: %s", pt.get("point"), pt.get("rating"))
+        if isinstance(pt, dict):
+            logger.info("Key point: %s, Rating: %s", pt.get("point"), pt.get("rating"))
+        else:
+            logger.info("Key point: %s", pt)
     intermediate_points_sorted = sorted(intermediate_points, key=lambda x: x.get("rating") or 0, reverse=True)
     selected_points = intermediate_points_sorted[:top_n]
     aggregated_context = "\n".join([f"{pt['point']} (Rating: {pt['rating']})" for pt in selected_points])
@@ -882,8 +995,8 @@ async def global_search_map_reduce(question: str, conversation_history: Optional
         """
     try:
         final_answer = await async_llm.invoke_json([{"role": "system",
-                                                  "content": "You are a professional assistant providing detailed answers based solely on provided information. Infer insights when possible. Your response MUST be a valid JSON object."},
-                                                 {"role": "user", "content": reduce_prompt}])
+                                                     "content": "You are a professional assistant providing detailed answers based solely on provided information. Infer insights when possible. Your response MUST be a valid JSON object."},
+                                                    {"role": "user", "content": reduce_prompt}])
         if isinstance(final_answer, dict) and "summary" in final_answer:
             return format_natural_response(json.dumps(final_answer))
         return "Here's the provided content:\n\n" + json.dumps(final_answer, indent=2)
@@ -891,10 +1004,12 @@ async def global_search_map_reduce(question: str, conversation_history: Optional
         final_answer = f"Error during reduce step: {e}"
     return final_answer
 
+
 def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
     from numpy import dot
     from numpy.linalg import norm
     return dot(vec1, vec2) / (norm(vec1) * norm(vec2) + 1e-8)
+
 
 def select_relevant_communities(query: str, community_reports: List[Union[str, dict]], top_k: int = GLOBAL_SEARCH_TOP_N,
                                 threshold: float = RELEVANCE_THRESHOLD) -> List[Tuple[str, float]]:
@@ -920,6 +1035,7 @@ def select_relevant_communities(query: str, community_reports: List[Union[str, d
         logger.info("Score: %.4f, Snippet: %s", score, rep[:100])
     return scored_reports[:top_k]
 
+
 # =============================================================================
 # TEXT2CYPHER RETRIEVER (Asynchronous Version)
 # =============================================================================
@@ -935,7 +1051,8 @@ class Text2CypherRetriever:
         )
         prompt = instruction.format(schema=self.schema, question=question)
         messages = [
-            {"role": "system", "content": "You are a professional assistant. Your response MUST be valid JSON with no extra commentary."},
+            {"role": "system",
+             "content": "You are a professional assistant. Your response MUST be valid JSON with no extra commentary."},
             {"role": "user", "content": prompt}
         ]
         raw_response = await self.llm.invoke_json(messages, fallback=True)
@@ -950,10 +1067,12 @@ class Text2CypherRetriever:
             "explanation": "Generated using text2cypher with refined prompt to retrieve chunk texts and related data."
         }]
 
+
 # =============================================================================
 # FASTAPI ENDPOINTS
 # =============================================================================
 app = FastAPI(title="Graph RAG API", description="End-to-end Graph Database RAG on Neo4j", version="1.0.0")
+
 
 @app.post("/upload_documents")
 async def upload_documents(files: List[UploadFile] = File(...)):
@@ -1002,30 +1121,113 @@ async def upload_documents(files: List[UploadFile] = File(...)):
             logger.error(f"Error storing community summaries for doc_id {doc_id}: {e}")
     return {"message": "Documents processed, graph updated, and community summaries stored successfully."}
 
+
 @app.post("/ask_question")
 async def ask_question(request: QuestionRequest):
-    # Rewrite the question if conversation history exists.
+    # Step 1: Rewrite the question if conversation history exists.
     request.question = await rewrite_query_if_needed(request.question, request.previous_conversations)
-    
-    # Retrieve the schema (if needed for context).
+
+    # Step 2: Retrieve the dynamic schema output (for logging or context).
     dynamic_schema = get_schema_from_neo4j()
     logger.info(f"Dynamic schema (optimal query): {dynamic_schema[:200]}...")
-    
-    # Generate a valid Cypher query dynamically.
+
+    # Step 3: Extract an entity from the user query and select the best matching entity from Neo4j.
+    candidate_entities = await extract_entity_keywords(request.question)
+    extracted_entity = candidate_entities[0] if candidate_entities else ""
+    query_entities = "MATCH (e:Entity) RETURN e.name AS name, e.embedding AS embedding"
+    entity_results = await asyncio.to_thread(run_cypher_query, query_entities)
+    top_entity = extracted_entity  # default to the extracted entity
+    top_score = -1
+    if extracted_entity:
+        try:
+            extracted_embedding = await async_embedding_client.get_embedding(extracted_entity)
+        except Exception as e:
+            logger.error(f"Error getting embedding for extracted entity: {e}")
+            extracted_embedding = None
+        if extracted_embedding:
+            for record in entity_results:
+                name = record.get("name", "")
+                embedding = record.get("embedding")
+                if embedding:
+                    score = cosine_similarity(extracted_embedding, embedding)
+                    if score > top_score:
+                        top_score = score
+                        top_entity = name
+    logger.info(f"Top entity for query: {top_entity} with score {top_score}")
+
+    # Step 4: Build few-shot examples with the selected top_entity.
+    few_shot_example_1 = f"""MATCH (start:Entity {{name: "{top_entity}"}})
+OPTIONAL MATCH (start)-[:RELATES_TO]->(related:Entity)
+OPTIONAL MATCH (related)-[:MENTIONED_IN]->(chunk:Chunk)
+RETURN start.name AS StartingEntity, related.name AS RelatedEntity, chunk.text AS ChunkText;"""
+    few_shot_example_2 = f"""MATCH (start:Entity {{name: "{top_entity}"}})-[:RELATES_TO]->(related:Entity)
+OPTIONAL MATCH (related)-[:MENTIONED_IN]->(chunk:Chunk)
+RETURN related.name AS RelatedEntity, collect(chunk.text) AS ChunkTexts;"""
+
+    # Step 5: Prepare the schema queries as context.
+    schema_query_1 = "call apoc.meta.schema()"
+    schema_query_2 = """CALL () {
+      MATCH (n1)-[r]->(n2)
+      WITH DISTINCT labels(n1) AS sourceNodeLabels, type(r) AS relationshipType, labels(n2) AS targetNodeLabels, keys(r) AS relationshipProperties
+      UNWIND sourceNodeLabels AS sourceLabel
+      UNWIND targetNodeLabels AS targetLabel
+      UNWIND relationshipProperties AS relProp
+      RETURN 'Relationship' AS ElementType, relationshipType AS Type, sourceLabel AS SourceNode, targetLabel AS TargetNode, collect(DISTINCT relProp) AS PropertyFields
+      UNION
+      MATCH (n)
+      WITH DISTINCT labels(n) AS nodeLabels, keys(n) AS properties
+      UNWIND nodeLabels AS label
+      UNWIND properties AS prop
+      RETURN 'Node' AS ElementType, label AS Type, null AS SourceNode, null AS TargetNode, collect(DISTINCT prop) AS PropertyFields
+    }
+    RETURN ElementType, Type, SourceNode, TargetNode, PropertyFields
+    ORDER BY ElementType, Type"""
+
+    # Step 6: Build a custom prompt to provide to the Cypher generation LLM.
+    custom_context = f"""
+Schema Query 1:
+{schema_query_1}
+
+Schema Query 2:
+{schema_query_2}
+
+Few-Shot Example 1:
+{few_shot_example_1}
+
+Few-Shot Example 2:
+{few_shot_example_2}
+
+Additionally, please generate a fuzzy match Cypher query.
+
+User Question:
+{request.question}
+    """
+
+    # Step 7: Use the custom prompt to generate candidate Cypher queries.
+    messages = [
+        {"role": "system", "content": "You are a professional Cypher query generator. Your response MUST be valid JSON containing a list of query strings."},
+        {"role": "user", "content": custom_context}
+    ]
     try:
-        valid_cypher = await generate_valid_cypher(request.question)
+        candidate_queries = await async_llm.invoke_json(messages)
+        if not isinstance(candidate_queries, list):
+            candidate_queries = [candidate_queries]
     except Exception as e:
-        logger.error(f"Error generating valid Cypher query: {e}")
-        raise HTTPException(status_code=500, detail=f"Error generating Cypher query: {e}")
-    
-    # Execute the generated query; expect results with a 'chunk_text' field.
+        logger.error(f"Error generating candidate queries: {e}")
+        candidate_queries = []
+
+    # For demonstration, select the first candidate.
+    valid_cypher = candidate_queries[0] if candidate_queries else ""
+    logger.info(f"Selected candidate Cypher: {valid_cypher}")
+
+    # Step 8: Execute the selected Cypher query.
     try:
         query_output = await asyncio.to_thread(run_cypher_query, valid_cypher)
     except Exception as e:
         logger.error(f"Error executing Cypher query: {e}")
         raise HTTPException(status_code=500, detail=f"Error executing Cypher query: {e}")
-    
-    # Safely extract only the 'chunk_text' values.
+
+    # Step 9: Extract relevant chunk text values.
     relevant_results = []
     for record in query_output:
         chunk_text = record.get("chunk_text")
@@ -1033,35 +1235,34 @@ async def ask_question(request: QuestionRequest):
             relevant_results.append(chunk_text.strip())
     if not relevant_results:
         relevant_results.append("No relevant text data found.")
-    
-    # Build a minimal context from a limited number of chunk texts.
-    context = "\n".join(relevant_results[:10])
-    
-    # Build the final prompt to generate a detailed answer.
+
+    final_context = "\n".join(relevant_results[:10])
     answer_prompt = (
         f"User Question: {request.question}\n\n"
-        f"Relevant Document Texts:\n{context}\n\n"
+        f"Relevant Document Texts:\n{final_context}\n\n"
         "Based solely on the above texts, provide a detailed answer to the question. Do not use any external knowledge."
     )
-    
+
+    # Step 10: Generate the final answer.
     final_answer = await async_llm.invoke([
         {"role": "system", "content": "You are a professional assistant answering based solely on provided document texts."},
         {"role": "user", "content": answer_prompt}
     ])
     combined_response = format_natural_response(final_answer.strip())
-    
+
     return {
         "user_question": request.question,
-        "generated_cypher": valid_cypher,
+        "candidate_queries": candidate_queries,
+        "selected_query": valid_cypher,
         "query_output": query_output,
         "combined_response": combined_response
     }
-    
+
 @app.post("/global_search")
 async def global_search(request: GlobalSearchRequest):
     # Rewrite the query if previous conversation exists.
     request.question = await rewrite_query_if_needed(request.question, request.previous_conversations)
-    
+
     answer = await global_search_map_reduce(
         question=request.question,
         conversation_history=request.previous_conversations,
@@ -1073,11 +1274,12 @@ async def global_search(request: GlobalSearchRequest):
     logger.debug(f"Raw search answer: {answer}")
     return {"answer": format_natural_response(answer)}
 
+
 @app.post("/local_search")
 async def local_search(request: LocalSearchRequest):
     # Rewrite the query if previous conversation exists.
     request.question = await rewrite_query_if_needed(request.question, request.previous_conversations)
-    
+
     conversation_context = (
         f"Conversation History:\n{request.previous_conversations}\n\n"
         if request.previous_conversations else ""
@@ -1143,20 +1345,23 @@ async def local_search(request: LocalSearchRequest):
     logger.debug(f"Local search prompt:\n{prompt}")
 
     answer = await async_llm.invoke([
-        {"role": "system", "content": "You are a professional assistant who answers strictly based on the provided context."},
+        {"role": "system",
+         "content": "You are a professional assistant who answers strictly based on the provided context."},
         {"role": "user", "content": prompt}
     ])
     return {"local_search_answer": answer}
+
 
 @app.post("/drift_search")
 async def drift_search(request: DriftSearchRequest):
     # Rewrite the query if previous conversation exists.
     request.question = await rewrite_query_if_needed(request.question, request.previous_conversations)
-    
+
     summaries = await graph_manager_wrapper.get_stored_community_summaries(doc_id=request.doc_id)
     if not summaries:
         if request.doc_id:
-            return {"drift_search_answer": f"No community summaries found for doc_id {request.doc_id}. Please re-index the dataset or try without specifying a doc_id."}
+            return {
+                "drift_search_answer": f"No community summaries found for doc_id {request.doc_id}. Please re-index the dataset or try without specifying a doc_id."}
         else:
             return {"drift_search_answer": "No community summaries available. Please re-index the dataset."}
     community_reports = [v["summary"] for v in summaries.values() if v.get("summary")]
@@ -1228,6 +1433,7 @@ async def drift_search(request: DriftSearchRequest):
     ])
     return {"drift_search_answer": final_answer.strip(), "drift_hierarchy": drift_hierarchy}
 
+
 @app.get("/documents")
 async def list_documents():
     try:
@@ -1240,6 +1446,7 @@ async def list_documents():
     except Exception as e:
         logger.error(f"Error listing documents: {e}")
         raise HTTPException(status_code=500, detail="Error listing documents")
+
 
 @app.delete("/delete_document")
 async def delete_document(request: DeleteDocumentRequest):
@@ -1259,6 +1466,7 @@ async def delete_document(request: DeleteDocumentRequest):
         logger.error(f"Error deleting document: {e}")
         raise HTTPException(status_code=500, detail=f"Error deleting document: {e}")
 
+
 @app.get("/communities")
 async def get_communities(doc_id: Optional[str] = None):
     try:
@@ -1267,6 +1475,7 @@ async def get_communities(doc_id: Optional[str] = None):
     except Exception as e:
         logger.error(f"Error detecting communities: {e}")
         raise HTTPException(status_code=500, detail=f"Error detecting communities: {e}")
+
 
 @app.get("/community_summaries")
 async def community_summaries(doc_id: Optional[str] = None):
@@ -1277,10 +1486,13 @@ async def community_summaries(doc_id: Optional[str] = None):
         logger.error(f"Error generating community summaries: {e}")
         raise HTTPException(status_code=500, detail=f"Error generating community summaries: {e}")
 
+
 @app.get("/")
 async def root():
     return {"message": "GraphRAG API is running."}
 
+
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host=APP_HOST, port=APP_PORT)
