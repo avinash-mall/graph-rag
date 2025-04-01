@@ -966,33 +966,47 @@ async def global_search_map_reduce(question: str, conversation_history: Optional
             logger.info("Key point: %s, Rating: %s", pt.get("point"), pt.get("rating"))
         else:
             logger.info("Key point: %s", pt)
-    intermediate_points_sorted = sorted(intermediate_points, key=lambda x: x.get("rating") or 0, reverse=True)
+    # Sorting intermediate points with safe type checking
+    intermediate_points_sorted = sorted(
+        intermediate_points,
+        key=lambda x: x.get("rating", 0) if isinstance(x, dict) else 0,
+        reverse=True
+    )
+
     selected_points = intermediate_points_sorted[:top_n]
-    aggregated_context = "\n".join([f"{pt['point']} (Rating: {pt['rating']})" for pt in selected_points])
+
+    # Build aggregated context: if a point is not a dictionary, treat it as a string with a default rating of 0.
+    aggregated_context = "\n".join(
+        [f"{pt['point']} (Rating: {pt['rating']})" if isinstance(pt, dict) else f"{pt} (Rating: 0)" for pt in
+         selected_points]
+    )
+
     conv_text = f"Conversation History: {conversation_history}\n" if conversation_history else ""
+
     reduce_prompt = f"""
-        You are a professional assistant specialized in synthesizing detailed information from provided data.
-        Your task is to analyze the following list of intermediate key points and the original user query, and then generate a comprehensive answer that fully explains the topic using only the provided information. 
-        Using ONLY the following intermediate key points:
-        {json.dumps(intermediate_points_sorted[:top_n], indent=2)}
-        and the original user query: "{question}",
-        generate a detailed answer that directly addresses the query.
-        Please follow these instructions:
-        1. Produce a detailed summary that directly and thoroughly answers the user’s query.
-        2. Include a list of the key points along with their ratings exactly as provided.
-        3. Provide an extended detailed explanation that weaves together all key points, elaborating on how each contributes to the overall answer.
-        4. Do not use any external knowledge; rely solely on the provided key points.
-        5. Return your response strictly in the following JSON format:
-            {{
-            "summary": "Your detailed answer summary here",
-            "key_points": [
-                {{"point": "key detail", "rating": "1-100"}},
-                {{"point": "another detail", "rating": "1-100"}}
-            ],
-            "detailed_explanation": "A comprehensive explanation that connects all key points and fully addresses the query."
-            }}
-        Ensure that your answer is extensive, uses complete sentences, and provides a deep, detailed explanation based solely on the supplied context.
-        """
+    {conv_text}You are a professional assistant specialized in synthesizing detailed information from provided data.
+    Your task is to analyze the following list of intermediate key points and the original user query, and then generate a comprehensive answer that fully explains the topic using only the provided information.
+    Using ONLY the following intermediate key points:
+    {json.dumps(intermediate_points_sorted[:top_n], indent=2)}
+    and the original user query: "{question}",
+    generate a detailed answer that directly addresses the query.
+    Please follow these instructions:
+    1. Produce a detailed summary that directly and thoroughly answers the user’s query.
+    2. Include a list of the key points along with their ratings exactly as provided.
+    3. Provide an extended detailed explanation that weaves together all key points, elaborating on how each contributes to the overall answer.
+    4. Do not use any external knowledge; rely solely on the provided key points.
+    5. Return your response strictly in the following JSON format:
+        {{
+        "summary": "Your detailed answer summary here",
+        "key_points": [
+            {{"point": "key detail", "rating": "1-100"}},
+            {{"point": "another detail", "rating": "1-100"}}
+        ],
+        "detailed_explanation": "A comprehensive explanation that connects all key points and fully addresses the query."
+        }}
+    Ensure that your answer is extensive, uses complete sentences, and provides a deep, detailed explanation based solely on the supplied context.
+    """
+
     try:
         final_answer = await async_llm.invoke_json([{"role": "system",
                                                      "content": "You are a professional assistant providing detailed answers based solely on provided information. Infer insights when possible. Your response MUST be a valid JSON object."},
@@ -1183,7 +1197,7 @@ RETURN related.name AS RelatedEntity, collect(chunk.text) AS ChunkTexts;"""
     RETURN ElementType, Type, SourceNode, TargetNode, PropertyFields
     ORDER BY ElementType, Type"""
 
-    # Step 6: Build a custom prompt to provide to the Cypher generation LLM.
+    # Step 6: Build a custom prompt for candidate Cypher query generation.
     custom_context = f"""
 Schema Query 1:
 {schema_query_1}
@@ -1202,8 +1216,6 @@ Additionally, please generate a fuzzy match Cypher query.
 User Question:
 {request.question}
     """
-
-    # Step 7: Use the custom prompt to generate candidate Cypher queries.
     messages = [
         {"role": "system", "content": "You are a professional Cypher query generator. Your response MUST be valid JSON containing a list of query strings."},
         {"role": "user", "content": custom_context}
@@ -1216,18 +1228,24 @@ User Question:
         logger.error(f"Error generating candidate queries: {e}")
         candidate_queries = []
 
-    # For demonstration, select the first candidate.
-    valid_cypher = candidate_queries[0] if candidate_queries else ""
+    # Fallback candidate query if none was generated.
+    if not candidate_queries:
+        candidate_queries = [
+            "MATCH (e:Entity)-[:MENTIONED_IN]->(c:Chunk) WHERE c.text IS NOT NULL RETURN c.text AS chunk_text LIMIT 10"
+        ]
+
+    logger.debug("Candidate queries generated: %s", candidate_queries)
+    valid_cypher = candidate_queries[0]
     logger.info(f"Selected candidate Cypher: {valid_cypher}")
 
-    # Step 8: Execute the selected Cypher query.
+    # Step 7: Execute the selected Cypher query.
     try:
         query_output = await asyncio.to_thread(run_cypher_query, valid_cypher)
     except Exception as e:
         logger.error(f"Error executing Cypher query: {e}")
         raise HTTPException(status_code=500, detail=f"Error executing Cypher query: {e}")
 
-    # Step 9: Extract relevant chunk text values.
+    # Step 8: Extract relevant text chunks.
     relevant_results = []
     for record in query_output:
         chunk_text = record.get("chunk_text")
@@ -1236,27 +1254,76 @@ User Question:
     if not relevant_results:
         relevant_results.append("No relevant text data found.")
 
-    final_context = "\n".join(relevant_results[:10])
-    answer_prompt = (
-        f"User Question: {request.question}\n\n"
-        f"Relevant Document Texts:\n{final_context}\n\n"
-        "Based solely on the above texts, provide a detailed answer to the question. Do not use any external knowledge."
-    )
+    # --- MAP STEP: Extract key points from each text chunk ---
+    async def extract_key_points(chunk: str, query: str) -> list:
+        map_prompt = (
+            "Extract key points from the following text chunk that are relevant to answering the user query. "
+            "Return a JSON array where each element is an object with keys 'point' (a short key detail) and 'rating' (a number from 1 to 100).\n\n"
+            "Text chunk:\n\"\"\"\n" + chunk + "\n\"\"\"\n"
+            "User Query: " + query
+        )
+        try:
+            result = await async_llm.invoke_json([
+                {"role": "system", "content": "You are a professional extraction assistant."},
+                {"role": "user", "content": map_prompt}
+            ])
+            if isinstance(result, list):
+                return result
+            else:
+                logger.error("Mapping result is not a list.")
+                return []
+        except Exception as e:
+            logger.error(f"Error in mapping step for chunk: {e}")
+            return []
 
-    # Step 10: Generate the final answer.
-    final_answer = await async_llm.invoke([
-        {"role": "system", "content": "You are a professional assistant answering based solely on provided document texts."},
-        {"role": "user", "content": answer_prompt}
-    ])
-    combined_response = format_natural_response(final_answer.strip())
+    # Process all chunks concurrently.
+    mapping_tasks = [extract_key_points(chunk, request.question) for chunk in relevant_results]
+    mapped_results = await asyncio.gather(*mapping_tasks)
+    # Flatten the list of lists.
+    intermediate_points = [pt for sublist in mapped_results for pt in sublist]
+
+    logger.debug("Intermediate key points extracted (unsorted): %s", intermediate_points)
+
+    # --- REDUCE STEP: Aggregate key points into a final answer ---
+    # Sort the key points by rating (safely handling non-dictionary items).
+    intermediate_points_sorted = sorted(
+        intermediate_points,
+        key=lambda x: x.get("rating", 0) if isinstance(x, dict) else 0,
+        reverse=True
+    )
+    # Take the top N key points.
+    top_n = 10
+    selected_points = intermediate_points_sorted[:top_n]
+    # Build the reduce prompt.
+    reduce_prompt = (
+        "Using the following intermediate key points extracted from the document texts:\n" +
+        json.dumps(selected_points, indent=2) +
+        "\n\nand the user query: \"" + request.question + "\", "
+        "generate a detailed answer that synthesizes the information. "
+        "Return your answer as a JSON object with keys 'summary', 'key_points' (a list), and 'detailed_explanation'."
+    )
+    try:
+        final_answer_reduce = await async_llm.invoke_json([
+            {"role": "system", "content": "You are a professional assistant synthesizing information."},
+            {"role": "user", "content": reduce_prompt}
+        ])
+    except Exception as e:
+        logger.error(f"Error in reduce step: {e}")
+        raise HTTPException(status_code=500, detail=f"Error in reduce step: {e}")
+
+    # Format the final answer.
+    combined_response = format_natural_response(json.dumps(final_answer_reduce))
+    logger.debug("Final synthesized answer: %s", combined_response)
 
     return {
         "user_question": request.question,
         "candidate_queries": candidate_queries,
         "selected_query": valid_cypher,
         "query_output": query_output,
-        "combined_response": combined_response
+        "intermediate_key_points": intermediate_points_sorted,
+        "final_answer": combined_response
     }
+
 
 @app.post("/global_search")
 async def global_search(request: GlobalSearchRequest):
