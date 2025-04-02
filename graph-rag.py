@@ -24,12 +24,16 @@ from fastapi import FastAPI, HTTPException, UploadFile, File
 from neo4j import GraphDatabase
 from pydantic import BaseModel
 
-
 # -----------------------------------------------------------------------------
-# Helper function to run asynchronous coroutines without calling asyncio.run()
-# inside an already running event loop.
+# Helper function to run asynchronous coroutines in a thread-safe manner.
+# This function allows execution of async coroutines from synchronous contexts.
 # -----------------------------------------------------------------------------
 def run_async(coro):
+    """
+    Run an asynchronous coroutine safely without calling asyncio.run() within a running loop.
+    :param coro: The coroutine to run.
+    :return: The result of the coroutine execution.
+    """
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
@@ -57,17 +61,18 @@ def run_async(coro):
         return result
     else:
         return asyncio.run(coro)
+
 # -----------------------------------------------------------------------------
 # Disable warnings and load environment variables
 # -----------------------------------------------------------------------------
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-load_dotenv()
+load_dotenv()  # Load variables from the .env file
 
 # -----------------------------------------------------------------------------
 # Application & Global Configuration
 # -----------------------------------------------------------------------------
-APP_HOST = os.getenv("APP_HOST") or "0.0.0.0"
-APP_PORT = int(os.getenv("APP_PORT") or "8000")
+APP_HOST = os.getenv("APP_HOST") or "0.0.0.0"  # Host address for the application
+APP_PORT = int(os.getenv("APP_PORT") or "8000")  # Port for the application
 
 # Graph & Neo4j Configuration
 GRAPH_NAME = os.getenv("GRAPH_NAME")
@@ -110,13 +115,14 @@ logger = logging.getLogger("GraphRAG")
 logger.info(f"Logging initialized with level: {LOG_LEVEL}")
 
 # -----------------------------------------------------------------------------
-# Neo4j Driver Setup
+# Neo4j Driver Setup: Creates a driver instance for connecting to the Neo4j database.
 # -----------------------------------------------------------------------------
 driver = GraphDatabase.driver(DB_URL, auth=(DB_USERNAME, DB_PASSWORD))
 
 
 # -----------------------------------------------------------------------------
 # Pydantic Models for Request Bodies
+# These classes define the expected JSON payload structure for API endpoints.
 # -----------------------------------------------------------------------------
 class QuestionRequest(BaseModel):
     question: str
@@ -150,7 +156,11 @@ class GlobalSearchRequest(BaseModel):
 # =============================================================================
 # UTILITY FUNCTIONS
 # =============================================================================
+
 def clean_empty_chunks():
+    """
+    Delete Chunk nodes in Neo4j with empty or null 'text' property.
+    """
     with driver.session() as session:
         # Delete any Chunk nodes where the 'text' property is NULL or only whitespace.
         query = "MATCH (c:Chunk) WHERE c.text IS NULL OR trim(c.text) = '' DETACH DELETE c"
@@ -159,6 +169,9 @@ def clean_empty_chunks():
 
 
 def clean_empty_nodes():
+    """
+    Delete Entity nodes in Neo4j with empty or null 'name' property.
+    """
     with driver.session() as session:
         # Delete any Entity nodes where the 'name' property is NULL or only whitespace.
         query = "MATCH (n:Entity) WHERE n.name IS NULL OR trim(n.name) = '' DETACH DELETE n"
@@ -166,8 +179,12 @@ def clean_empty_nodes():
         logger.info("Cleaned empty Entity nodes.")
 
 
-# Helper to extract code if returned inside triple backticks.
 def extract_cypher_code(raw_query: str) -> str:
+    """
+    Extract Cypher code from a raw string that may contain code block formatting.
+    :param raw_query: The raw string potentially containing a cypher code block.
+    :return: Extracted cypher code as a string.
+    """
     pattern = re.compile(r"```(?:cypher)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
     matches = pattern.findall(raw_query)
     if matches:
@@ -176,10 +193,13 @@ def extract_cypher_code(raw_query: str) -> str:
     if "MATCH" in raw_query and "RETURN" in raw_query:
         return raw_query.strip()
     return raw_query.strip()
+
 async def rewrite_query_if_needed(question: str, conversation_history: Optional[str]) -> str:
     """
-    If conversation history is provided, rewrite the query into a standalone query.
-    Otherwise, return the original question.
+    Rewrite a user query into a standalone query if conversation history is provided.
+    :param question: The original user query.
+    :param conversation_history: The previous conversation context.
+    :return: A standalone query string.
     """
     if conversation_history:
         rewrite_prompt = (
@@ -193,36 +213,11 @@ async def rewrite_query_if_needed(question: str, conversation_history: Optional[
         return rewritten_query.strip()
     return question
 
-
-def get_schema_from_neo4j() -> str:
-    optimal_schema_query = """
-    CALL () {
-      MATCH (n1)-[r]->(n2)
-      WITH DISTINCT labels(n1) AS sourceNodeLabels, type(r) AS relationshipType, labels(n2) AS targetNodeLabels, keys(r) AS relationshipProperties
-      UNWIND sourceNodeLabels AS sourceLabel
-      UNWIND targetNodeLabels AS targetLabel
-      UNWIND relationshipProperties AS relProp
-      RETURN 'Relationship' AS ElementType, relationshipType AS Type, sourceLabel AS SourceNode, targetLabel AS TargetNode, collect(DISTINCT relProp) AS PropertyFields
-      UNION
-      MATCH (n)
-      WITH DISTINCT labels(n) AS nodeLabels, keys(n) AS properties
-      UNWIND nodeLabels AS label
-      UNWIND properties AS prop
-      RETURN 'Node' AS ElementType, label AS Type, null AS SourceNode, null AS TargetNode, collect(DISTINCT prop) AS PropertyFields
-    }
-    RETURN ElementType, Type, SourceNode, TargetNode, PropertyFields
-    ORDER BY ElementType, Type
-    """
-    try:
-        schema_result = run_cypher_query(optimal_schema_query)
-        return json.dumps(schema_result, indent=2)
-    except Exception as e:
-        logger.error(f"Error retrieving schema: {e}")
-        return "Error retrieving schema from Neo4j."
 async def extract_entity_keywords(question: str) -> list:
     """
-    Dynamically extract entity names from the given question using the LLM.
-    The response should be a JSON list of strings.
+    Extract entity names from the given question using an LLM.
+    :param question: The user question.
+    :return: A list of extracted entity keywords.
     """
     prompt = f"Extract entity names from the following question as a JSON list of strings:\n{question}"
     try:
@@ -241,66 +236,14 @@ async def extract_entity_keywords(question: str) -> list:
         # Fallback heuristic: return first two words if extraction fails.
         return question.split()[:2]
 
-
-async def generate_valid_cypher(question: str, max_iterations: int = 5) -> str:
-    """
-    Iteratively generate and validate a Cypher query that retrieves the 'text' field from Chunk nodes.
-    Instead of hardcoding keywords, dynamically extract entity names from the question and use them
-    to build a query that:
-      - MATCHes Entity nodes whose names match each extracted keyword using a case-insensitive regex (e.g. '(?i).*<keyword>.*').
-      - MATCHes a Chunk node that is connected to all these Entity nodes via MENTIONED_IN relationships.
-      - Uses WITH clauses or subqueries to avoid Cartesian products.
-      - RETURNs c.text AS chunk_text.
-    Return only the Cypher query with no additional commentary.
-    """
-    # Dynamically extract entity keywords from the question.
-    keywords = await extract_entity_keywords(question)
-    if not keywords or len(keywords) < 2:
-        # Fallback: use first two words from the question if extraction fails.
-        keywords = question.split()[:2]
-    keywords_str = ", ".join(keywords)
-
-    current_prompt = (
-        f"Given the question: \"{question}\", and the extracted entity keywords: {keywords_str}, "
-        "generate a Cypher query that retrieves the 'text' field from Chunk nodes connected to all Entity nodes matching these keywords. "
-        "For each keyword, match an Entity node using a case-insensitive regex (e.g. use '(?i).*<keyword>.*'). "
-        "Then match a Chunk node that is connected to these Entity nodes via the MENTIONED_IN relationship. "
-        "Avoid Cartesian products by using WITH clauses or subqueries. "
-        "Return c.text AS chunk_text. Return only the Cypher query with no extra commentary."
-    )
-    iteration = 0
-    while iteration < max_iterations:
-        iteration += 1
-        raw_query = await async_llm_query.invoke([
-            {"role": "system", "content": "You are a professional Cypher generator."},
-            {"role": "user", "content": current_prompt}
-        ])
-        cypher_query = extract_cypher_code(raw_query)
-        logger.info(f"Iteration {iteration} generated query: {cypher_query}")
-        # Check that the query contains required elements.
-        if ("MATCH" in cypher_query and "RETURN" in cypher_query and "Entity" in cypher_query
-                and "Chunk" in cypher_query and ("text" in cypher_query or "chunk_text" in cypher_query)
-                and "MENTIONED_IN" in cypher_query):
-            try:
-                # Try a dummy execution to validate syntax.
-                _ = await asyncio.to_thread(run_cypher_query, cypher_query)
-                return cypher_query
-            except Exception as e:
-                feedback = f"Syntax error: {e}."
-        else:
-            feedback = (
-                "Query missing required elements. Ensure you MATCH Entity nodes using case-insensitive regex for each extracted keyword, "
-                "MATCH a connected Chunk node via MENTIONED_IN, and RETURN the chunk text as chunk_text.")
-        current_prompt = (
-            f"Previous query:\n{cypher_query}\nFeedback: {feedback}\n"
-            "Please generate a corrected Cypher query that meets these criteria dynamically based on the extracted keywords. "
-            "Return only the query without extra commentary."
-        )
-        logger.info(f"Iteration {iteration} feedback: {feedback}")
-    raise Exception("Failed to generate valid Cypher query after multiple iterations.")
-
-
 async def validate_and_refine_query(initial_query: str, question: str, llm_instance: AsyncOpenAI) -> str:
+    """
+    Validate an initial Cypher query and refine it using an LLM if it returns no results.
+    :param initial_query: The initial generated Cypher query.
+    :param question: The original user question.
+    :param llm_instance: An instance of AsyncOpenAI to call for refining the query.
+    :return: A validated and refined Cypher query.
+    """
     results = await asyncio.to_thread(run_cypher_query, initial_query)
     if results:
         return initial_query
@@ -324,52 +267,13 @@ async def validate_and_refine_query(initial_query: str, question: str, llm_insta
         return refined_query
     else:
         raise Exception("Fallback query execution returned no results.")
-def build_enhanced_final_prompt(question: str, responses: List[str], query: str, query_output: dict) -> str:
-    return (
-        f"User Question: {question}\n\n"
-        f"Generated Cypher Query: {query}\n\n"
-        f"Query Output: {json.dumps(query_output, indent=2)}\n\n"
-        "Based solely on the provided data, generate a comprehensive answer. "
-        "If the query output is empty, explain possible reasons (e.g., schema mismatch or missing data) "
-        "and suggest corrective actions. Do not include external knowledge."
-    )
-
-# A helper function to generate candidate Cypher queries.
-async def generate_candidate_queries(question_history: list[str], context_data: str, candidate_count: int = 3) -> list[
-    str]:
-    current_question = question_history[-1] if question_history else ""
-    # Updated system prompt to instruct the LLM to alias the actual property 'text' as 'chunk_text'
-    system_prompt = (
-        "You are a professional Cypher query generator. The correct label names in the database are exactly 'Entity' and 'Chunk'. "
-        "Based on the context data provided below—which includes structured information (entities, relationships, community reports) "
-        "and unstructured document text chunks—generate {} candidate Cypher queries. Each query must dynamically match Entity nodes "
-        "using case-insensitive regex (e.g., '(?i).*keyword.*') based on keywords extracted from the current question, then find a Chunk node "
-        "connected via the MENTIONED_IN relationship. Use WITH clauses or subqueries to avoid Cartesian products and return only the chunk's text "
-        "as 'chunk_text'. IMPORTANT: Since the Chunk nodes store their text in the property 'text', your query must return it as: RETURN c.text AS chunk_text. "
-        "Output your results strictly as a JSON array of query strings with no extra commentary."
-    ).format(candidate_count)
-
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": f"Context data:\n{context_data}\n\nCurrent question:\n{current_question}"}
-    ]
-
-    try:
-        response = await async_llm.invoke_json(messages)
-        candidate_queries = response if isinstance(response, list) else []
-    except Exception as e:
-        logger.error(f"Error generating candidate queries: {e}")
-        candidate_queries = []
-
-    # Fallback: if no candidate queries were generated, provide a default candidate query.
-    if not candidate_queries:
-        candidate_queries = [
-            "MATCH (e:Entity)-[:MENTIONED_IN]->(c:Chunk) WHERE c.text IS NOT NULL RETURN c.text AS chunk_text LIMIT 10"
-        ]
-
-    return candidate_queries
 
 def extract_cypher_query(response_text: str) -> str:
+    """
+    Extract the Cypher query from a JSON response or raw text.
+    :param response_text: The text containing the Cypher query.
+    :return: The extracted Cypher query.
+    """
     try:
         data = parse_strict_json(response_text)
         if isinstance(data, dict):
@@ -381,8 +285,12 @@ def extract_cypher_query(response_text: str) -> str:
         logger.error(f"Error parsing JSON: {e}")
     return _postprocess_output_cypher(response_text)
 
-
 def fix_cypher_query(query: str) -> str:
+    """
+    Fix common issues in a generated Cypher query.
+    :param query: The generated Cypher query.
+    :return: The corrected Cypher query.
+    """
     # If the query is wrapped in a JSON object with key "query", extract it.
     try:
         data = json.loads(query)
@@ -403,8 +311,12 @@ def fix_cypher_query(query: str) -> str:
         query = query.replace("type(b)", "type(r)")
     return query
 
-
 def _postprocess_output_cypher(output_cypher: str) -> str:
+    """
+    Post-process the output Cypher query by removing code block formatting.
+    :param output_cypher: The raw Cypher query output.
+    :return: Cleaned Cypher query.
+    """
     if "```" in output_cypher:
         parts = output_cypher.split("```")
         code = parts[1]
@@ -415,8 +327,12 @@ def _postprocess_output_cypher(output_cypher: str) -> str:
     output_cypher, _, _ = output_cypher.partition(partition_by)
     return output_cypher.strip("`\n").lstrip("cypher\n").strip("`\n ")
 
-
 def parse_strict_json(response_text: str) -> Union[dict, list]:
+    """
+    Parse a string into JSON using standard json and fallback to json5 if needed.
+    :param response_text: The string to parse.
+    :return: The parsed JSON object.
+    """
     try:
         return json.loads(response_text)
     except json.JSONDecodeError as e:
@@ -427,8 +343,12 @@ def parse_strict_json(response_text: str) -> Union[dict, list]:
             logger.error("json5 parsing also failed: " + str(e2))
             raise e2
 
-
 def clean_text(text: str) -> str:
+    """
+    Clean text by removing non-printable characters and extra whitespace.
+    :param text: The original text.
+    :return: The cleaned text.
+    """
     if not isinstance(text, str):
         logger.error(f"Received non-string content for text cleaning: {type(text)}")
         return ""
@@ -436,8 +356,13 @@ def clean_text(text: str) -> str:
     logger.debug(f"Cleaned text: {cleaned_text[:100]}...")
     return cleaned_text
 
-
 def chunk_text(text: str, max_chunk_size: int = 512) -> List[str]:
+    """
+    Split text into chunks with a maximum size, preserving sentence boundaries.
+    :param text: The input text.
+    :param max_chunk_size: The maximum allowed chunk size.
+    :return: A list of text chunks.
+    """
     sentences = [s.strip() for s in blingfire.text_to_sentences(text).splitlines() if s.strip()]
     unique_sentences = []
     seen = set()
@@ -456,7 +381,14 @@ def chunk_text(text: str, max_chunk_size: int = 512) -> List[str]:
     if current_chunk:
         chunks.append(current_chunk.strip())
     return chunks
+
 def run_cypher_query(query: str, parameters: Dict[str, Any] = {}) -> List[Dict[str, Any]]:
+    """
+    Execute a Cypher query against the Neo4j database.
+    :param query: The Cypher query string.
+    :param parameters: Optional dictionary of query parameters.
+    :return: A list of dictionaries representing query results.
+    """
     # Log parameters only if provided.
     if parameters:
         logger.debug(f"Running Cypher query: {query} with parameters: {parameters}")
@@ -477,33 +409,12 @@ def run_cypher_query(query: str, parameters: Dict[str, Any] = {}) -> List[Dict[s
         logger.error(f"Error executing query: {query}. Error: {e}")
         raise HTTPException(status_code=500, detail=f"Neo4j query execution error: {e}")
 
-def build_llm_answer_prompt(query_context: dict) -> str:
-    prompt = f"""Given the data extracted from the graph database:
-
-Question: {query_context.get('question')}
-
-Standard Query Output:
-{json.dumps(query_context.get('standard_query_output'), indent=2)}
-
-Fuzzy Query Output:
-{json.dumps(query_context.get('fuzzy_query_output'), indent=2)}
-
-General Query Output:
-{json.dumps(query_context.get('general_query_output'), indent=2)}
-
-Provide a detailed answer to the query based solely on the information above."""
-    return prompt.strip()
-
-
-def build_combined_answer_prompt(user_question: str, responses: List[str]) -> str:
-    prompt = f"User Question: {user_question}\n\nThe following responses were generated for different aspects of your query:\n"
-    for idx, resp in enumerate(responses, start=1):
-        prompt += f"{idx}. {resp}\n"
-    prompt += "\nBased on the above responses, provide a final comprehensive answer that directly addresses the original question. Do not use your prior knowledge and only use knowledge from the provided text."
-    return prompt.strip()
-
-
 def format_natural_response(response: str) -> str:
+    """
+    Format the natural language response from the LLM, parsing JSON if necessary.
+    :param response: The raw response string.
+    :return: Formatted response string.
+    """
     logger.info(f"Raw LLM Response: {repr(response)}")
     response = response.strip()
     if (response.startswith("{") and response.endswith("}")) or (response.startswith("[") and response.endswith("]")):
@@ -521,8 +432,12 @@ def format_natural_response(response: str) -> str:
             return response
     return response
 
-
 async def resolve_coreferences_in_parts(text: str) -> str:
+    """
+    Resolve ambiguous pronouns and vague references in text using an LLM.
+    :param text: The input text.
+    :return: The text with resolved coreferences.
+    """
     async_client = AsyncOpenAI(api_key=OPENAI_API_KEY, model=OPENAI_MODEL,
                                base_url=OPENAI_BASE_URL, temperature=OPENAI_TEMPERATURE, stop=OPENAI_STOP,
                                timeout=OPENAI_API_TIMEOUT)
@@ -530,6 +445,12 @@ async def resolve_coreferences_in_parts(text: str) -> str:
     parts = [" ".join(words[i:i + COREF_WORD_LIMIT]) for i in range(0, len(words), COREF_WORD_LIMIT)]
 
     async def process_part(part: str, idx: int) -> str:
+        """
+        Process a part of the text to resolve coreferences.
+        :param part: The text part.
+        :param idx: The index of the part.
+        :return: The processed text part.
+        """
         prompt = (
                 "Resolve all ambiguous pronouns and vague references in the following text by replacing them with their appropriate entities. "
                 "Ensure no unresolved pronouns like 'he', 'she', 'himself', etc. remain. "
@@ -551,51 +472,24 @@ async def resolve_coreferences_in_parts(text: str) -> str:
                            combined_text, flags=re.IGNORECASE)
     return filtered_text.strip()
 
-
-def extract_entities_with_llm(text: str) -> List[Dict[str, str]]:
-    client = AsyncOpenAI(api_key=OPENAI_API_KEY, model=OPENAI_MODEL, base_url=OPENAI_BASE_URL,
-                         temperature=OPENAI_TEMPERATURE, stop=OPENAI_STOP)
-    prompt = ("Extract all named entities from the following text. "
-              "For each entity, provide its name and type (e.g., cardinal value, date value, event name, building name, "
-              "geo-political entity, language name, law name, money name, person name, organization name, location name, "
-              "affiliation, ordinal value, percent value, product name, quantity value, time value, name of work of art). "
-              "If uncertain, label it as 'UNKNOWN'. "
-              "Return ONLY a valid JSON array (without any additional text or markdown) in the exact format: "
-              '[{"name": "entity name", "type": "entity type"}].'
-              "\n\n" + text)
-    try:
-        response = run_async(client.invoke_json([
-            {"role": "system", "content": "You are a professional NER extraction assistant."},
-            {"role": "user", "content": prompt}
-        ]))
-        if isinstance(response, dict) and "entities" in response:
-            entities = response["entities"]
-        elif isinstance(response, list):
-            entities = response
-        else:
-            raise ValueError("Unexpected JSON structure in NER response")
-        filtered_entities = [entity for entity in entities if
-                             entity.get('name', '').strip() and entity.get('type', '').strip()]
-        return filtered_entities
-    except Exception as e:
-        logger.error(f"NER extraction error: {e}")
-        return []
-
-
-# --- END OF MISSING LOGIC ---
-
 def get_refined_system_message() -> str:
+    """
+    Get a refined system message instructing the LLM to return valid JSON.
+    :return: The system message string.
+    """
     return (
         "You are a professional assistant. Your response MUST be a valid JSON object with no additional text, "
         "markdown formatting, or commentary. Ensure the JSON is complete and properly formatted with matching opening "
         "and closing braces. If there is an error, return a JSON object with a key 'error' and a descriptive message."
     )
 
-
 # =============================================================================
 # ASYNCHRONOUS OPENAI & EMBEDDING API CLIENT CLASSES
 # =============================================================================
 class AsyncOpenAI:
+    """
+    Asynchronous client for interacting with the OpenAI API.
+    """
     def __init__(self, api_key: str, model: str, base_url: str, temperature: float, stop: List[str], timeout: int):
         self.api_key = api_key
         self.model = model
@@ -605,6 +499,11 @@ class AsyncOpenAI:
         self.timeout = timeout
 
     async def invoke(self, messages: List[Dict[str, str]]) -> str:
+        """
+        Invoke the LLM with a list of messages.
+        :param messages: List of messages (dictionaries) with roles and content.
+        :return: The LLM's response content as a string.
+        """
         payload = {"model": self.model, "messages": messages, "temperature": self.temperature, "stop": self.stop}
         logger.debug(f"LLM Payload Sent: {json.dumps(payload, indent=2)}")
         headers = {"Authorization": f"Bearer {self.api_key}"}
@@ -616,6 +515,12 @@ class AsyncOpenAI:
             return content
 
     async def invoke_json(self, messages: List[Dict[str, str]], fallback: bool = True) -> Union[dict, list]:
+        """
+        Invoke the LLM and parse its response as JSON.
+        :param messages: List of messages for the LLM.
+        :param fallback: Whether to attempt a fallback if JSON parsing fails.
+        :return: The parsed JSON response.
+        """
         primary_messages = [{"role": "system", "content": get_refined_system_message()}] + messages
         response_text = await self.invoke(primary_messages)
         logger.debug("Raw LLM response: " + repr(response_text))
@@ -639,6 +544,9 @@ class AsyncOpenAI:
 
 
 class AsyncEmbeddingAPIClient:
+    """
+    Asynchronous client for fetching embeddings via the embedding API.
+    """
     def __init__(self):
         self.embedding_api_url = os.getenv("EMBEDDING_API_URL", "http://localhost/api/embed")
         self.timeout = OPENAI_API_TIMEOUT
@@ -646,9 +554,19 @@ class AsyncEmbeddingAPIClient:
         self.cache = {}
 
     def _get_text_hash(self, text: str) -> str:
+        """
+        Compute an MD5 hash for the input text.
+        :param text: The input text.
+        :return: The MD5 hash string.
+        """
         return hashlib.md5(text.encode('utf-8')).hexdigest()
 
     async def get_embedding(self, text: str) -> List[float]:
+        """
+        Get the embedding for a given text, using caching.
+        :param text: The input text.
+        :return: A list of floats representing the embedding.
+        """
         text_hash = self._get_text_hash(text)
         if text_hash in self.cache:
             self.logger.info(f"Embedding for text (hash: {text_hash}) retrieved from cache.")
@@ -673,11 +591,16 @@ class AsyncEmbeddingAPIClient:
             return embedding
 
     async def get_embeddings(self, texts: List[str]) -> List[List[float]]:
+        """
+        Get embeddings for a list of texts.
+        :param texts: A list of text strings.
+        :return: A list of embedding vectors.
+        """
         tasks = [self.get_embedding(text) for text in texts]
         return await asyncio.gather(*tasks)
 
 
-# Global asynchronous client instances
+# Global asynchronous client instances for LLM and Embedding API
 async_llm = AsyncOpenAI(
     api_key=OPENAI_API_KEY,
     model=OPENAI_MODEL,
@@ -703,7 +626,15 @@ async_embedding_client = AsyncEmbeddingAPIClient()
 # GRAPH DATABASE HELPER FUNCTIONS & CLASSES (Asynchronous LLM Calls)
 # =============================================================================
 class GraphManager:
+    """
+    Class for constructing and managing the graph data in Neo4j.
+    """
     async def build_graph(self, chunks: List[str], metadata_list: List[Dict[str, Any]]) -> None:
+        """
+        Build the graph in Neo4j by creating Chunk and Entity nodes and their relationships.
+        :param chunks: List of text chunks from documents.
+        :param metadata_list: List of metadata dictionaries corresponding to each chunk.
+        """
         with driver.session() as session:
             for i, (chunk, meta) in enumerate(zip(chunks, metadata_list)):
                 if not chunk.strip() or chunk.strip().isdigit():
@@ -783,6 +714,11 @@ class GraphManager:
         logger.info("Graph construction complete.")
 
     async def reproject_graph(self, graph_name: str = GRAPH_NAME, doc_id: Optional[str] = None) -> None:
+        """
+        Reproject the graph using Neo4j's Graph Data Science (GDS) library.
+        :param graph_name: Name of the projected graph.
+        :param doc_id: Optional document ID to filter nodes.
+        """
         with driver.session() as session:
             exists_record = session.run("CALL gds.graph.exists($graph_name) YIELD exists",
                                         graph_name=graph_name).single()
@@ -800,15 +736,21 @@ class GraphManager:
                             config=config)
             logger.info("Graph projection complete.")
 
-
+# Instance of GraphManager for use in the API.
 graph_manager = GraphManager()
 
-
 class GraphManagerExtended:
+    """
+    Extended graph manager for additional operations such as storing community summaries.
+    """
     def __init__(self, driver):
         self.driver = driver
 
     async def store_community_summaries(self, doc_id: str) -> None:
+        """
+        Detect communities in the graph and store their summaries.
+        :param doc_id: The document ID to process.
+        """
         with self.driver.session() as session:
             communities = detect_communities(doc_id)
             logger.debug(f"Detected communities for doc_id {doc_id}: {communities}")
@@ -862,6 +804,11 @@ class GraphManagerExtended:
                                 embedding=summary_embedding, timestamp=datetime.now().isoformat())
 
     async def get_stored_community_summaries(self, doc_id: Optional[str] = None) -> dict:
+        """
+        Retrieve stored community summaries from the graph.
+        :param doc_id: Optional document ID to filter summaries.
+        :return: Dictionary of community summaries.
+        """
         with self.driver.session() as session:
             if doc_id:
                 query = """
@@ -881,8 +828,12 @@ class GraphManagerExtended:
                 summaries[comm] = {"summary": record["summary"], "embedding": record["embedding"]}
             return summaries
 
-
 def detect_communities(doc_id: Optional[str] = None) -> dict:
+    """
+    Detect communities within the graph using Neo4j's GDS library.
+    :param doc_id: Optional document ID to filter nodes.
+    :return: A dictionary mapping community IDs to lists of entity names.
+    """
     communities = {}
     with driver.session() as session:
         exists_record = session.run("CALL gds.graph.exists($graph_name) YIELD exists", graph_name=GRAPH_NAME).single()
@@ -909,33 +860,57 @@ def detect_communities(doc_id: Optional[str] = None) -> dict:
             session.run("MATCH (n:DocEntity {doc_id: $doc_id}) REMOVE n:DocEntity", doc_id=doc_id)
     return communities
 
-
 class GraphManagerWrapper:
+    """
+    Wrapper class to abstract graph management operations.
+    """
     def __init__(self):
         self.manager = graph_manager
 
     async def build_graph(self, chunks: List[str], metadata_list: List[Dict[str, Any]]) -> None:
+        """
+        Build the graph using provided text chunks and metadata.
+        """
         await self.manager.build_graph(chunks, metadata_list)
 
     async def reproject_graph(self, graph_name: str = GRAPH_NAME, doc_id: Optional[str] = None) -> None:
+        """
+        Reproject the graph.
+        """
         await self.manager.reproject_graph(graph_name, doc_id)
 
     async def store_community_summaries(self, doc_id: str) -> None:
+        """
+        Store community summaries for the given document ID.
+        """
         extended = GraphManagerExtended(driver)
         await extended.store_community_summaries(doc_id)
 
     async def get_stored_community_summaries(self, doc_id: Optional[str] = None) -> dict:
+        """
+        Retrieve stored community summaries.
+        """
         extended = GraphManagerExtended(driver)
         return await extended.get_stored_community_summaries(doc_id)
 
-
+# Instantiate the GraphManagerWrapper for API usage.
 graph_manager_wrapper = GraphManagerWrapper()
-
 
 async def global_search_map_reduce(question: str, conversation_history: Optional[str] = None,
                                    doc_id: Optional[str] = None,
                                    chunk_size: int = GLOBAL_SEARCH_CHUNK_SIZE, top_n: int = GLOBAL_SEARCH_TOP_N,
                                    batch_size: int = GLOBAL_SEARCH_BATCH_SIZE) -> str:
+    """
+    Perform global search by dynamically selecting community summaries, extracting key points,
+    and reducing the information to generate a final answer.
+    :param question: The user query.
+    :param conversation_history: Optional conversation context.
+    :param doc_id: Optional document ID.
+    :param chunk_size: Maximum chunk size for text segmentation.
+    :param top_n: Number of top key points to consider.
+    :param batch_size: Batch size for processing chunks.
+    :return: A detailed final answer as a string.
+    """
     summaries = await graph_manager_wrapper.get_stored_community_summaries(doc_id=doc_id)
     if not summaries:
         raise HTTPException(status_code=500, detail="No community summaries available. Please re-index the dataset.")
@@ -1027,15 +1002,27 @@ async def global_search_map_reduce(question: str, conversation_history: Optional
         final_answer = f"Error during reduce step: {e}"
     return final_answer
 
-
 def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
+    """
+    Compute the cosine similarity between two vectors.
+    :param vec1: First vector.
+    :param vec2: Second vector.
+    :return: Cosine similarity as a float.
+    """
     from numpy import dot
     from numpy.linalg import norm
     return dot(vec1, vec2) / (norm(vec1) * norm(vec2) + 1e-8)
 
-
 def select_relevant_communities(query: str, community_reports: List[Union[str, dict]], top_k: int = GLOBAL_SEARCH_TOP_N,
                                 threshold: float = RELEVANCE_THRESHOLD) -> List[Tuple[str, float]]:
+    """
+    Select and rank community reports that are relevant to the query using cosine similarity.
+    :param query: The user query.
+    :param community_reports: List of community reports (either as strings or dicts with embeddings).
+    :param top_k: Number of top reports to select.
+    :param threshold: Relevance threshold for filtering.
+    :return: List of tuples with report snippet and similarity score.
+    """
     query_embedding = run_async(async_embedding_client.get_embedding(query))
     scored_reports = []
     for report in community_reports:
@@ -1058,47 +1045,18 @@ def select_relevant_communities(query: str, community_reports: List[Union[str, d
         logger.info("Score: %.4f, Snippet: %s", score, rep[:100])
     return scored_reports[:top_k]
 
-
-# =============================================================================
-# TEXT2CYPHER RETRIEVER (Asynchronous Version)
-# =============================================================================
-class Text2CypherRetriever:
-    def __init__(self, driver, llm_instance: AsyncOpenAI, schema: str = "(:Entity)-[:MENTIONED_IN]->(:Chunk)"):
-        self.driver = driver
-        self.llm = llm_instance
-        self.schema = schema
-
-    async def get_cypher(self, question: str) -> List[dict]:
-        instruction = (
-            "Generate a Cypher query that not only retrieves entities (e.g., names, organization, location) and their relationships but also fetches the 'text' field from all related Chunk nodes. This text data should be used as context when generating the comprehensive answer."
-        )
-        prompt = instruction.format(schema=self.schema, question=question)
-        messages = [
-            {"role": "system",
-             "content": "You are a professional assistant. Your response MUST be valid JSON with no extra commentary."},
-            {"role": "user", "content": prompt}
-        ]
-        raw_response = await self.llm.invoke_json(messages, fallback=True)
-        if isinstance(raw_response, (dict, list)):
-            raw_response = json.dumps(raw_response)
-        cypher_query = extract_cypher_query(raw_response)
-        cypher_query = fix_cypher_query(cypher_query)
-        validated_query = await validate_and_refine_query(cypher_query, question, self.llm)
-        return [{
-            "question": question,
-            "cypher_query": validated_query,
-            "explanation": "Generated using text2cypher with refined prompt to retrieve chunk texts and related data."
-        }]
-
-
 # =============================================================================
 # FASTAPI ENDPOINTS
 # =============================================================================
 app = FastAPI(title="Graph RAG API", description="End-to-end Graph Database RAG on Neo4j", version="1.0.0")
 
-
 @app.post("/upload_documents")
 async def upload_documents(files: List[UploadFile] = File(...)):
+    """
+    Upload documents, process them into text chunks, build the graph, and store community summaries.
+    :param files: List of files uploaded.
+    :return: JSON message confirming successful processing.
+    """
     document_texts = []
     metadata = []
     for file in files:
@@ -1144,9 +1102,13 @@ async def upload_documents(files: List[UploadFile] = File(...)):
             logger.error(f"Error storing community summaries for doc_id {doc_id}: {e}")
     return {"message": "Documents processed, graph updated, and community summaries stored successfully."}
 
-
 @app.post("/cypher_search")
 async def cypher_search(request: QuestionRequest):
+    """
+    Execute a cypher search based on the user question by matching entities and retrieving related text chunks.
+    :param request: The QuestionRequest object containing query details.
+    :return: JSON containing the final answer, aggregated text, and executed queries.
+    """
     # Step 1: Extract candidate entities from the user query.
     candidate_entities = await extract_entity_keywords(request.question)
     final_entities = []
@@ -1171,19 +1133,20 @@ async def cypher_search(request: QuestionRequest):
             LIMIT 1
             """
             try:
+                # Execute the similarity query in a separate thread.
                 result = await asyncio.to_thread(run_cypher_query, cypher_query, {"candidate_embedding": candidate_embedding})
             except Exception as e:
                 logger.error(f"Error executing similarity query for candidate '{candidate}': {e}")
                 continue
-    
+
             if result and len(result) > 0:
                 top_match = result[0].get("name")
                 if top_match:
                     final_entities.append(top_match)
-    
-    # Remove duplicates.
+
+    # Remove duplicate entity matches.
     final_entities = list(set(final_entities))
-    
+
     results = []
     # Step 2: If no matching entities were found, use the fallback query.
     if not final_entities:
@@ -1203,7 +1166,7 @@ async def cypher_search(request: QuestionRequest):
             logger.error(f"Error executing fallback query: {e}")
             raise HTTPException(status_code=500, detail=f"Error executing fallback query: {e}")
     else:
-        # Step 3: For each extracted entity, generate and execute the three Cypher queries.
+        # Step 3: For each extracted entity, generate and execute three Cypher queries.
         for entity in final_entities:
             query_a = f"""
             MATCH (start:Entity {{name: "{entity}"}})
@@ -1225,13 +1188,14 @@ async def cypher_search(request: QuestionRequest):
             RETURN start.name AS StartingEntity, related.name AS RelatedEntity, chunk.text AS ChunkText
             LIMIT {CYPHER_QUERY_LIMIT};
             """
+            # Execute each query and append results.
             for q in [query_a, query_b, query_c]:
                 try:
                     qr = await asyncio.to_thread(run_cypher_query, q)
                     results.append(qr)
                 except Exception as e:
                     logger.error(f"Error executing query for entity '{entity}': {e}")
-    
+
     # Step 4: Map Reduce – aggregate all returned text chunks without duplicates.
     processed_chunks = set()
     aggregated_text = ""
@@ -1256,7 +1220,7 @@ async def cypher_search(request: QuestionRequest):
                             processed_chunks.add(chunk)
                             aggregated_text += " " + chunk
     aggregated_text = aggregated_text.strip()
-    
+
     # Step 5: Use the aggregated text (plus the original query) to generate a final answer.
     final_prompt = (
         f"User Query: {request.question}\n\n"
@@ -1271,16 +1235,24 @@ async def cypher_search(request: QuestionRequest):
     except Exception as e:
         logger.error(f"Error generating final answer: {e}")
         raise HTTPException(status_code=500, detail=f"Error generating final answer: {e}")
-    
+
     return {
         "final_answer": final_answer,
         "aggregated_text": aggregated_text,
         "executed_queries": results
     }
 
-
+# -----------------------------------------------------------------------------
+# Endpoint: Global Search
+# -----------------------------------------------------------------------------
 @app.post("/global_search")
 async def global_search(request: GlobalSearchRequest):
+    """
+    Global search endpoint that rewrites the query if needed, performs map-reduce search,
+    and returns a final answer based solely on graph data.
+    :param request: GlobalSearchRequest object.
+    :return: JSON with the final answer.
+    """
     # Rewrite the query if previous conversation exists.
     request.question = await rewrite_query_if_needed(request.question, request.previous_conversations)
 
@@ -1295,9 +1267,16 @@ async def global_search(request: GlobalSearchRequest):
     logger.debug(f"Raw search answer: {answer}")
     return {"answer": format_natural_response(answer)}
 
-
+# -----------------------------------------------------------------------------
+# Endpoint: Local Search
+# -----------------------------------------------------------------------------
 @app.post("/local_search")
 async def local_search(request: LocalSearchRequest):
+    """
+    Local search endpoint that uses conversation history and document context to generate an answer.
+    :param request: LocalSearchRequest object.
+    :return: JSON with the local search answer.
+    """
     # Rewrite the query if previous conversation exists.
     request.question = await rewrite_query_if_needed(request.question, request.previous_conversations)
 
@@ -1372,9 +1351,16 @@ async def local_search(request: LocalSearchRequest):
     ])
     return {"local_search_answer": answer}
 
-
+# -----------------------------------------------------------------------------
+# Endpoint: Drift Search
+# -----------------------------------------------------------------------------
 @app.post("/drift_search")
 async def drift_search(request: DriftSearchRequest):
+    """
+    Drift search endpoint that synthesizes a hierarchical answer with follow-up queries.
+    :param request: DriftSearchRequest object.
+    :return: JSON with the drift search answer and hierarchy.
+    """
     # Rewrite the query if previous conversation exists.
     request.question = await rewrite_query_if_needed(request.question, request.previous_conversations)
 
@@ -1454,9 +1440,15 @@ async def drift_search(request: DriftSearchRequest):
     ])
     return {"drift_search_answer": final_answer.strip(), "drift_hierarchy": drift_hierarchy}
 
-
+# -----------------------------------------------------------------------------
+# Endpoint: List Documents
+# -----------------------------------------------------------------------------
 @app.get("/documents")
 async def list_documents():
+    """
+    List all distinct documents based on chunks in the graph.
+    :return: JSON with a list of documents.
+    """
     try:
         query = """
             MATCH (c:Chunk)
@@ -1468,9 +1460,16 @@ async def list_documents():
         logger.error(f"Error listing documents: {e}")
         raise HTTPException(status_code=500, detail="Error listing documents")
 
-
+# -----------------------------------------------------------------------------
+# Endpoint: Delete Document
+# -----------------------------------------------------------------------------
 @app.delete("/delete_document")
 async def delete_document(request: DeleteDocumentRequest):
+    """
+    Delete a document from the graph based on doc_id or document_name.
+    :param request: DeleteDocumentRequest object.
+    :return: JSON message confirming deletion.
+    """
     if not request.doc_id and not request.document_name:
         raise HTTPException(status_code=400, detail="Provide either doc_id or document_name to delete a document.")
     try:
@@ -1487,9 +1486,16 @@ async def delete_document(request: DeleteDocumentRequest):
         logger.error(f"Error deleting document: {e}")
         raise HTTPException(status_code=500, detail=f"Error deleting document: {e}")
 
-
+# -----------------------------------------------------------------------------
+# Endpoint: Get Communities
+# -----------------------------------------------------------------------------
 @app.get("/communities")
 async def get_communities(doc_id: Optional[str] = None):
+    """
+    Retrieve detected communities from the graph.
+    :param doc_id: Optional document ID filter.
+    :return: JSON with communities.
+    """
     try:
         communities = detect_communities(doc_id)
         return {"communities": communities}
@@ -1497,9 +1503,16 @@ async def get_communities(doc_id: Optional[str] = None):
         logger.error(f"Error detecting communities: {e}")
         raise HTTPException(status_code=500, detail=f"Error detecting communities: {e}")
 
-
+# -----------------------------------------------------------------------------
+# Endpoint: Get Community Summaries
+# -----------------------------------------------------------------------------
 @app.get("/community_summaries")
 async def community_summaries(doc_id: Optional[str] = None):
+    """
+    Retrieve stored community summaries.
+    :param doc_id: Optional document ID filter.
+    :return: JSON with community summaries.
+    """
     try:
         summaries = await graph_manager_wrapper.get_stored_community_summaries(doc_id)
         return {"community_summaries": summaries}
@@ -1507,13 +1520,20 @@ async def community_summaries(doc_id: Optional[str] = None):
         logger.error(f"Error generating community summaries: {e}")
         raise HTTPException(status_code=500, detail=f"Error generating community summaries: {e}")
 
-
+# -----------------------------------------------------------------------------
+# Root Endpoint
+# -----------------------------------------------------------------------------
 @app.get("/")
 async def root():
+    """
+    Root endpoint for basic health check.
+    :return: JSON message indicating that the API is running.
+    """
     return {"message": "GraphRAG API is running."}
 
-
+# -----------------------------------------------------------------------------
+# Main entry point: Start the application using Uvicorn.
+# -----------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run(app, host=APP_HOST, port=APP_PORT)
