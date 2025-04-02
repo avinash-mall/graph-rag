@@ -1151,10 +1151,7 @@ async def cypher_search(request: QuestionRequest):
     candidate_entities = await extract_entity_keywords(request.question)
     final_entities = []
 
-    # Retrieve all stored entities from Neo4j.
-    stored_entities = await asyncio.to_thread(run_cypher_query, "MATCH (e:Entity) RETURN e.name AS name, e.embedding AS embedding")
-
-    # For each candidate, compute cosine similarity and select the top matching stored entity.
+    # For each candidate, compute similarity directly in Neo4j.
     if candidate_entities:
         for candidate in candidate_entities:
             try:
@@ -1162,23 +1159,31 @@ async def cypher_search(request: QuestionRequest):
             except Exception as e:
                 logger.error(f"Error getting embedding for candidate '{candidate}': {e}")
                 continue
-
-            top_match = None
-            top_score = -1
-            for record in stored_entities:
-                name = record.get("name", "")
-                embedding = record.get("embedding")
-                if embedding:
-                    score = cosine_similarity(candidate_embedding, embedding)
-                    if score > top_score:
-                        top_score = score
-                        top_match = name
-            if top_match:
-                final_entities.append(top_match)
-
+    
+            cypher_query = """
+            WITH $candidate_embedding AS candidateEmbedding
+            MATCH (e:Entity)
+            WHERE size(e.embedding) = size(candidateEmbedding)
+            WITH e, gds.similarity.cosine(e.embedding, candidateEmbedding) AS similarity
+            WHERE similarity > 0.8
+            RETURN e.name AS name, similarity
+            ORDER BY similarity DESC
+            LIMIT 1
+            """
+            try:
+                result = await asyncio.to_thread(run_cypher_query, cypher_query, {"candidate_embedding": candidate_embedding})
+            except Exception as e:
+                logger.error(f"Error executing similarity query for candidate '{candidate}': {e}")
+                continue
+    
+            if result and len(result) > 0:
+                top_match = result[0].get("name")
+                if top_match:
+                    final_entities.append(top_match)
+    
     # Remove duplicates.
     final_entities = list(set(final_entities))
-
+    
     results = []
     # Step 2: If no matching entities were found, use the fallback query.
     if not final_entities:
@@ -1226,7 +1231,7 @@ async def cypher_search(request: QuestionRequest):
                     results.append(qr)
                 except Exception as e:
                     logger.error(f"Error executing query for entity '{entity}': {e}")
-
+    
     # Step 4: Map Reduce – aggregate all returned text chunks without duplicates.
     processed_chunks = set()
     aggregated_text = ""
@@ -1251,7 +1256,7 @@ async def cypher_search(request: QuestionRequest):
                             processed_chunks.add(chunk)
                             aggregated_text += " " + chunk
     aggregated_text = aggregated_text.strip()
-
+    
     # Step 5: Use the aggregated text (plus the original query) to generate a final answer.
     final_prompt = (
         f"User Query: {request.question}\n\n"
@@ -1266,12 +1271,13 @@ async def cypher_search(request: QuestionRequest):
     except Exception as e:
         logger.error(f"Error generating final answer: {e}")
         raise HTTPException(status_code=500, detail=f"Error generating final answer: {e}")
-
+    
     return {
         "final_answer": final_answer,
         "aggregated_text": aggregated_text,
         "executed_queries": results
     }
+
 
 @app.post("/global_search")
 async def global_search(request: GlobalSearchRequest):
