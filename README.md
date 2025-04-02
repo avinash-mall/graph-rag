@@ -80,7 +80,7 @@ Setup and Requirements
 
 1.  Clone the repository containing the script.
     
-2.  ```bash pip install -r requirements.txt```
+2.  ``` pip install -r requirements.txt```
     
 3.  Configure your environment variables by editing the .env file.
     
