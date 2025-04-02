@@ -80,7 +80,7 @@ Setup and Requirements
 
 1.  Clone the repository containing the script.
     
-2.  bashCopypip install -r requirements.txt
+2.  \`\`\`bash pip install -r requirements.txt\`\`\`
     
 3.  Configure your environment variables by editing the .env file.
     
@@ -405,7 +405,7 @@ Running the Application
 
 To run the application, execute the following command from the project directory:
 
-Plain textANTLR4BashCC#CSSCoffeeScriptCMakeDartDjangoDockerEJSErlangGitGoGraphQLGroovyHTMLJavaJavaScriptJSONJSXKotlinLaTeXLessLuaMakefileMarkdownMATLABMarkupObjective-CPerlPHPPowerShell.propertiesProtocol BuffersPythonRRubySass (Sass)Sass (Scss)SchemeSQLShellSwiftSVGTSXTypeScriptWebAssemblyYAMLXML`   bashCopyuvicorn graph-rag:app --host 0.0.0.0 --port 8000   `
+Plain textANTLR4BashCC#CSSCoffeeScriptCMakeDartDjangoDockerEJSErlangGitGoGraphQLGroovyHTMLJavaJavaScriptJSONJSXKotlinLaTeXLessLuaMakefileMarkdownMATLABMarkupObjective-CPerlPHPPowerShell.propertiesProtocol BuffersPythonRRubySass (Sass)Sass (Scss)SchemeSQLShellSwiftSVGTSXTypeScriptWebAssemblyYAMLXML`   uvicorn graph-rag:app --host 0.0.0.0 --port 8000   `
 
 Ensure that the environment variables are set (either via the .env file or your system environment) before starting the server.
 
