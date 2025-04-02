@@ -4,7 +4,7 @@ Graph RAG API Documentation
 Overview
 --------
 
-Graph RAG (Graph Retrieval-Augmented Generation) is a FastAPI application that integrates a Neo4j graph database with OpenAI’s language models and an embedding API. The primary purpose of the application is to process and index document contents (such as PDF, DOCX, and TXT files), build a knowledge graph, and provide various search functionalities (global, local, cypher, and drift search) over the indexed data. The application also uses advanced techniques like text chunking, community detection, and dynamic Cypher query generation to answer user queries based solely on the content in the graph.
+Graph RAG (Graph Retrieval-Augmented Generation) is a FastAPI application that integrates a Neo4j graph database with OpenAI’s language models and an embedding API. Its primary purpose is to process and index document contents (e.g., PDF, DOCX, and TXT files), build a knowledge graph, and provide various search functionalities over the indexed data. The application leverages advanced techniques such as text chunking, community detection, dynamic Cypher query generation, and hierarchical query synthesis to answer user queries based solely on the graph content.
 
 Table of Contents
 -----------------
@@ -21,10 +21,10 @@ Table of Contents
         
     *   [Main Components](#main-components)
         
-*   [API Endpoints](#api-endpoints)
+*   [Document Upload Pipeline Logic](#document-upload-pipeline-logic)
     
-    *   [Document Upload](#document-upload)
-        
+*   [Search Logic](#search-logic)
+    
     *   [Cypher Search](#cypher-search)
         
     *   [Global Search](#global-search)
@@ -32,6 +32,18 @@ Table of Contents
     *   [Local Search](#local-search)
         
     *   [Drift Search](#drift-search)
+        
+*   [API Endpoints](#api-endpoints)
+    
+    *   [Document Upload](#document-upload)
+        
+    *   [Cypher Search](#cypher-search-endpoint)
+        
+    *   [Global Search](#global-search-endpoint)
+        
+    *   [Local Search](#local-search-endpoint)
+        
+    *   [Drift Search](#drift-search-endpoint)
         
     *   [Document Management](#document-management)
         
@@ -157,6 +169,133 @@ The application reads settings from the .env file using python-dotenv. This ensu
 
 Refer to the source code in graph-rag.py for a detailed look at these components ​graph-rag.
 
+Document Upload Pipeline Logic
+------------------------------
+
+When documents are uploaded via the /upload\_documents endpoint, the following steps occur:
+
+1.  **File Processing and Text Extraction:**
+    
+    *   The endpoint supports multiple file types (PDF, DOCX, and TXT).
+        
+    *   For PDFs, text is extracted from each page using PyPDF2.
+        
+    *   DOCX files are processed using the docx library.
+        
+    *   TXT files are read directly after decoding.
+        
+2.  **Text Cleaning and Coreference Resolution:**
+    
+    *   Extracted text is cleaned using clean\_text to remove non-printable characters.
+        
+    *   The resolve\_coreferences\_in\_parts function refines the text by replacing ambiguous pronouns with their proper entities, ensuring clarity.
+        
+3.  **Document Metadata and Chunking:**
+    
+    *   A unique document ID is generated using UUID.
+        
+    *   The cleaned text is divided into manageable chunks using the chunk\_text function, which leverages sentence splitting (using Blingfire) and groups sentences up to a maximum character limit.
+        
+4.  **Graph Construction:**
+    
+    *   The document chunks and their metadata are passed to the graph manager.
+        
+    *   For each chunk, an embedding is computed via the embedding API.
+        
+    *   Each chunk is stored in Neo4j as a Chunk node with properties such as text, document name, timestamp, and its embedding.
+        
+    *   Relationships are established between Entity nodes (extracted via summarization prompts) and the corresponding Chunk nodes.
+        
+5.  **Community Summaries:**
+    
+    *   After building the graph, empty nodes are cleaned.
+        
+    *   Community detection is performed on the graph using Neo4j’s GDS library.
+        
+    *   For each community, the related text chunks are aggregated and summarized by calling an LLM, and these summaries are stored along with their embeddings.
+        
+
+This pipeline ensures that uploaded documents are transformed into a structured graph representation, making them searchable and analyzable via various endpoints.
+
+Search Logic
+------------
+
+The application provides several types of searches to retrieve answers based solely on the indexed document data. Each search method uses different strategies to extract and synthesize information from the graph.
+
+### Cypher Search
+
+**Endpoint:** /cypher\_search
+
+**Logic:**
+
+*   **Entity Extraction:**The LLM extracts candidate entities from the user’s question using the extract\_entity\_keywords function.
+    
+*   **Entity Similarity:**For each candidate entity, the embedding is computed and compared to the embeddings stored in Neo4j. If the cosine similarity exceeds a threshold (e.g., 0.8), the entity is considered a match.
+    
+*   **Query Generation:**Depending on the matches:
+    
+    *   **Primary Strategy:**If matching entities are found, the application generates three Cypher queries per entity. These queries match the entity node and retrieve related Chunk nodes via relationships like RELATES\_TO and MENTIONED\_IN.
+        
+    *   **Fallback Strategy:**If no candidates match, a fuzzy matching query using apoc.text.jaroWinklerDistance is executed to find entities similar to the query text.
+        
+*   **Aggregation:**The results from all executed queries are aggregated by extracting unique text chunks.
+    
+*   **Final Answer Generation:**The aggregated text is used to create a final prompt for the LLM to generate a detailed answer to the original question.
+    
+
+### Global Search
+
+**Endpoint:** /global\_search
+
+**Logic:**
+
+*   **Community Summaries Retrieval:**The endpoint retrieves stored community summaries, which represent aggregated content from the graph.
+    
+*   **Similarity Scoring:**The LLM computes embeddings for the user query and compares them to each community summary’s embedding using cosine similarity. Community reports above a certain relevance threshold are selected.
+    
+*   **Key Point Extraction:**Selected community reports are further chunked, and for each chunk, an LLM extracts key points (with ratings).
+    
+*   **Aggregation and Reduction:**Key points from all relevant chunks are aggregated and sorted by their rating. A final prompt is constructed, including these key points and the original query, which is sent to the LLM to synthesize a comprehensive answer.
+    
+
+### Local Search
+
+**Endpoint:** /local\_search
+
+**Logic:**
+
+*   **Context Building:**The endpoint combines multiple sources of context:
+    
+    *   **Conversation History:** If provided, the previous exchanges are included.
+        
+    *   **Community Summaries:** If a document ID is provided, relevant community summaries (ranked via embedding similarity) are retrieved.
+        
+    *   **Document Text Units:** A sample of text chunks from the specific document is also fetched.
+        
+*   **Final Prompt:**These context sources are concatenated to build a comprehensive prompt. The LLM is then asked to generate an answer strictly based on the provided context, ensuring that the answer is localized to the document or subset of documents specified.
+    
+
+### Drift Search
+
+**Endpoint:** /drift\_search
+
+**Logic:**
+
+*   **Community Report Selection:**Similar to global search, community summaries are retrieved and selected based on their similarity to the query.
+    
+*   **Primer Phase:**A primer prompt is sent to the LLM using the selected community reports. This generates an intermediate answer along with follow-up questions aimed at refining the query.
+    
+*   **Follow-Up Query Refinement:**For each follow-up query:
+    
+    *   Local context is gathered by querying for related text chunks.
+        
+    *   An LLM call refines the follow-up query and generates additional follow-up details.
+        
+*   **Hierarchical Aggregation:**The original query, intermediate answers, and follow-up responses are compiled into a hierarchical structure (drift hierarchy).
+    
+*   **Final Reduction:**A final reduction prompt that incorporates the entire hierarchy is sent to the LLM. The LLM then produces a final, detailed answer that synthesizes the layered information.
+    
+
 API Endpoints
 -------------
 
@@ -166,14 +305,14 @@ API Endpoints
     
 *   **Method:** POST
     
-*   **Description:** Accepts multiple files (PDF, DOCX, TXT), extracts and cleans text, chunks the content, and builds the graph. It also triggers community summary creation.
+*   **Description:** Accepts multiple files (PDF, DOCX, TXT), extracts and cleans text, chunks the content, builds the graph, and stores community summaries.
     
 *   **Request:** Multipart form-data with files.
     
-*   **Response:** A success message confirming processing and graph update.
+*   **Response:** A success message confirming processing, graph update, and community summary storage.
     
 
-### Cypher Search
+### Cypher Search Endpoint
 
 *   **Endpoint:** /cypher\_search
     
@@ -186,7 +325,7 @@ API Endpoints
 *   **Response:** Final answer, aggregated text from the graph, and details of the executed queries.
     
 
-### Global Search
+### Global Search Endpoint
 
 *   **Endpoint:** /global\_search
     
@@ -199,7 +338,7 @@ API Endpoints
 *   **Response:** A detailed answer generated solely from the provided graph data.
     
 
-### Local Search
+### Local Search Endpoint
 
 *   **Endpoint:** /local\_search
     
@@ -209,10 +348,10 @@ API Endpoints
     
 *   **Request:** JSON payload as defined by LocalSearchRequest.
     
-*   **Response:** Answer generated based on the local context of the document(s).
+*   **Response:** An answer generated based on the local context of the document(s).
     
 
-### Drift Search
+### Drift Search Endpoint
 
 *   **Endpoint:** /drift\_search
     
@@ -266,20 +405,20 @@ Running the Application
 
 To run the application, execute the following command from the project directory:
 
-Plain textANTLR4BashCC#CSSCoffeeScriptCMakeDartDjangoDockerEJSErlangGitGoGraphQLGroovyHTMLJavaJavaScriptJSONJSXKotlinLaTeXLessLuaMakefileMarkdownMATLABMarkupObjective-CPerlPHPPowerShell.propertiesProtocol BuffersPythonRRubySass (Sass)Sass (Scss)SchemeSQLShellSwiftSVGTSXTypeScriptWebAssemblyYAMLXML`   uvicorn graph-rag:app --host 0.0.0.0 --port 8000   `
+Plain textANTLR4BashCC#CSSCoffeeScriptCMakeDartDjangoDockerEJSErlangGitGoGraphQLGroovyHTMLJavaJavaScriptJSONJSXKotlinLaTeXLessLuaMakefileMarkdownMATLABMarkupObjective-CPerlPHPPowerShell.propertiesProtocol BuffersPythonRRubySass (Sass)Sass (Scss)SchemeSQLShellSwiftSVGTSXTypeScriptWebAssemblyYAMLXML`   bashCopyuvicorn graph-rag:app --host 0.0.0.0 --port 8000   `
 
 Ensure that the environment variables are set (either via the .env file or your system environment) before starting the server.
 
 Additional Notes
 ----------------
 
-*   **Error Handling:** The application uses structured logging and proper HTTP exceptions to handle errors during file processing, graph operations, and API calls.
+*   **Error Handling:**The application uses structured logging and proper HTTP exceptions to handle errors during file processing, graph operations, and API calls.
     
-*   **LLM Integration:** OpenAI API calls and embedding computations are done asynchronously to optimize throughput.
+*   **LLM Integration:**OpenAI API calls and embedding computations are done asynchronously to optimize throughput.
     
-*   **Graph Processing:** The application constructs and reprojects graphs dynamically based on document ingestion, using Neo4j’s GDS library for community detection and graph projection.
+*   **Graph Processing:**The application constructs and reprojects graphs dynamically based on document ingestion, using Neo4j’s GDS library for community detection and graph projection.
     
-*   **Scalability:** With careful chunking and asynchronous processing, the application is designed to handle larger documents and multiple concurrent requests.
+*   **Scalability:**With careful chunking and asynchronous processing, the application is designed to handle larger documents and multiple concurrent requests.
     
 
-This documentation provides an in-depth overview of the core functionalities and API endpoints of the Graph RAG project. For further details, review the source code in graph-rag.py ​graph-rag and the environment configuration in .env ​.env.
+This comprehensive documentation now includes detailed explanations of both the document upload pipeline and the logic behind each type of search offered by the Graph RAG application. For further details, review the source code in graph-rag.py ​graph-rag and the environment configuration in .env ​.env.
