@@ -12,7 +12,8 @@ import sys
 import uuid
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Union, Tuple
-
+from lmformatenforcer import JsonSchemaParser
+import json
 import PyPDF2
 import blingfire
 import docx
@@ -152,11 +153,18 @@ class GlobalSearchRequest(BaseModel):
     previous_conversations: Optional[str] = None
     doc_id: Optional[str] = None
 
-
+class ReduceOutput(BaseModel):
+    summary: str
+    key_points: list  
+    detailed_explanation: str
+    
 # =============================================================================
 # UTILITY FUNCTIONS
 # =============================================================================
-
+def extract_rating(text: str) -> int:
+    match = re.search(r'\(Rating:\s*(\d+)\)', text)
+    return int(match.group(1)) if match else 0
+            
 def clean_empty_chunks():
     """
     Delete Chunk nodes in Neo4j with empty or null 'text' property.
@@ -177,22 +185,6 @@ def clean_empty_nodes():
         query = "MATCH (n:Entity) WHERE n.name IS NULL OR trim(n.name) = '' DETACH DELETE n"
         session.run(query)
         logger.info("Cleaned empty Entity nodes.")
-
-
-def extract_cypher_code(raw_query: str) -> str:
-    """
-    Extract Cypher code from a raw string that may contain code block formatting.
-    :param raw_query: The raw string potentially containing a cypher code block.
-    :return: Extracted cypher code as a string.
-    """
-    pattern = re.compile(r"```(?:cypher)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
-    matches = pattern.findall(raw_query)
-    if matches:
-        return matches[0].strip()
-    # Fallback: if the raw query appears to be a query (contains MATCH and RETURN), return it as is.
-    if "MATCH" in raw_query and "RETURN" in raw_query:
-        return raw_query.strip()
-    return raw_query.strip()
 
 async def rewrite_query_if_needed(question: str, conversation_history: Optional[str]) -> str:
     """
@@ -235,97 +227,6 @@ async def extract_entity_keywords(question: str) -> list:
         logger.error(f"Error extracting keywords: {e}")
         # Fallback heuristic: return first two words if extraction fails.
         return question.split()[:2]
-
-async def validate_and_refine_query(initial_query: str, question: str, llm_instance: AsyncOpenAI) -> str:
-    """
-    Validate an initial Cypher query and refine it using an LLM if it returns no results.
-    :param initial_query: The initial generated Cypher query.
-    :param question: The original user question.
-    :param llm_instance: An instance of AsyncOpenAI to call for refining the query.
-    :return: A validated and refined Cypher query.
-    """
-    results = await asyncio.to_thread(run_cypher_query, initial_query)
-    if results:
-        return initial_query
-    fallback_prompt = (
-        f"The generated Cypher query returned no results. "
-        f"Based on the provided schema and question, generate an alternative query that retrieves data. "
-        f"Schema: (:Actor)-[:ActedIn]->(:Movie). Question: {question}. "
-        "Return valid JSON with key 'cypher_query'."
-    )
-    messages = [
-        {"role": "system",
-         "content": "You are a professional assistant. Return ONLY valid JSON with no extra commentary."},
-        {"role": "user", "content": fallback_prompt}
-    ]
-    raw_response = await llm_instance.invoke_json(messages, fallback=True)
-    if isinstance(raw_response, (dict, list)):
-        raw_response = json.dumps(raw_response)
-    refined_query = extract_cypher_query(raw_response)
-    fallback_results = await asyncio.to_thread(run_cypher_query, refined_query)
-    if fallback_results:
-        return refined_query
-    else:
-        raise Exception("Fallback query execution returned no results.")
-
-def extract_cypher_query(response_text: str) -> str:
-    """
-    Extract the Cypher query from a JSON response or raw text.
-    :param response_text: The text containing the Cypher query.
-    :return: The extracted Cypher query.
-    """
-    try:
-        data = parse_strict_json(response_text)
-        if isinstance(data, dict):
-            if "cypher_query" in data:
-                return data["cypher_query"].strip()
-            elif "query" in data:
-                return data["query"].strip()
-    except Exception as e:
-        logger.error(f"Error parsing JSON: {e}")
-    return _postprocess_output_cypher(response_text)
-
-def fix_cypher_query(query: str) -> str:
-    """
-    Fix common issues in a generated Cypher query.
-    :param query: The generated Cypher query.
-    :return: The corrected Cypher query.
-    """
-    # If the query is wrapped in a JSON object with key "query", extract it.
-    try:
-        data = json.loads(query)
-        if isinstance(data, dict) and "query" in data:
-            query = data["query"]
-    except Exception:
-        pass
-
-    # Replace invalid label syntax with a valid pattern.
-    if "b:Entity|Chunk" in query:
-        query = query.replace("b:Entity|Chunk", "b")
-        # If no WHERE clause is present in the MATCH clause, add one.
-        match_clause = query.split("WITH")[0]
-        if "WHERE" not in match_clause:
-            query = query.replace("MATCH (a:Entity)-[r]->(b)", "MATCH (a:Entity)-[r]->(b)\nWHERE b:Entity OR b:Chunk")
-    # Replace type(b) with type(r) since b is a node.
-    if "type(b)" in query:
-        query = query.replace("type(b)", "type(r)")
-    return query
-
-def _postprocess_output_cypher(output_cypher: str) -> str:
-    """
-    Post-process the output Cypher query by removing code block formatting.
-    :param output_cypher: The raw Cypher query output.
-    :return: Cleaned Cypher query.
-    """
-    if "```" in output_cypher:
-        parts = output_cypher.split("```")
-        code = parts[1]
-        if code.lower().startswith("cypher"):
-            code = code[len("cypher"):].strip()
-        return code.strip()
-    partition_by = "**Explanation:**"
-    output_cypher, _, _ = output_cypher.partition(partition_by)
-    return output_cypher.strip("`\n").lstrip("cypher\n").strip("`\n ")
 
 def parse_strict_json(response_text: str) -> Union[dict, list]:
     """
@@ -477,11 +378,7 @@ def get_refined_system_message() -> str:
     Get a refined system message instructing the LLM to return valid JSON.
     :return: The system message string.
     """
-    return (
-        "You are a professional assistant. Your response MUST be a valid JSON object with no additional text, "
-        "markdown formatting, or commentary. Ensure the JSON is complete and properly formatted with matching opening "
-        "and closing braces. If there is an error, return a JSON object with a key 'error' and a descriptive message."
-    )
+    return "You are a professional assistant. Please provide a detailed answer."
 
 # =============================================================================
 # ASYNCHRONOUS OPENAI & EMBEDDING API CLIENT CLASSES
@@ -490,7 +387,7 @@ class AsyncOpenAI:
     """
     Asynchronous client for interacting with the OpenAI API.
     """
-    def __init__(self, api_key: str, model: str, base_url: str, temperature: float, stop: List[str], timeout: int):
+    def __init__(self, api_key: str, model: str, base_url: str, temperature: float, stop: list, timeout: int):
         self.api_key = api_key
         self.model = model
         self.base_url = base_url
@@ -498,13 +395,13 @@ class AsyncOpenAI:
         self.stop = stop
         self.timeout = timeout
 
-    async def invoke(self, messages: List[Dict[str, str]]) -> str:
-        """
-        Invoke the LLM with a list of messages.
-        :param messages: List of messages (dictionaries) with roles and content.
-        :return: The LLM's response content as a string.
-        """
-        payload = {"model": self.model, "messages": messages, "temperature": self.temperature, "stop": self.stop}
+    async def invoke(self, messages: list) -> str:
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": self.temperature,
+            "stop": self.stop
+        }
         logger.debug(f"LLM Payload Sent: {json.dumps(payload, indent=2)}")
         headers = {"Authorization": f"Bearer {self.api_key}"}
         async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
@@ -514,33 +411,10 @@ class AsyncOpenAI:
             content = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
             return content
 
-    async def invoke_json(self, messages: List[Dict[str, str]], fallback: bool = True) -> Union[dict, list]:
-        """
-        Invoke the LLM and parse its response as JSON.
-        :param messages: List of messages for the LLM.
-        :param fallback: Whether to attempt a fallback if JSON parsing fails.
-        :return: The parsed JSON response.
-        """
+    async def invoke_json(self, messages: list, fallback: bool = True) -> str:
         primary_messages = [{"role": "system", "content": get_refined_system_message()}] + messages
         response_text = await self.invoke(primary_messages)
-        logger.debug("Raw LLM response: " + repr(response_text))
-        try:
-            parsed = parse_strict_json(response_text)
-            return parsed
-        except Exception as e:
-            logger.warning("Initial JSON parsing failed: " + str(e))
-            if fallback:
-                fallback_messages = [{"role": "system", "content": get_refined_system_message()}] + messages
-                fallback_response_text = await self.invoke(fallback_messages)
-                logger.debug("Fallback LLM response:\n" + fallback_response_text)
-                try:
-                    parsed = parse_strict_json(fallback_response_text)
-                    return parsed
-                except Exception as e2:
-                    logger.error("Fallback JSON parsing failed: " + str(e2))
-                    return {"error": "Failed to parse JSON response after fallback."}
-            else:
-                return {"error": "Failed to parse JSON response."}
+        return response_text
 
 
 class AsyncEmbeddingAPIClient:
@@ -610,14 +484,6 @@ async_llm = AsyncOpenAI(
     timeout=OPENAI_API_TIMEOUT
 )
 
-async_llm_query = AsyncOpenAI(
-    api_key=OPENAI_API_KEY,
-    model="hf.co/avinashm/text2cypher",  # Fine-tuned model for query generation.
-    base_url=OPENAI_BASE_URL,
-    temperature=0.0,
-    stop=OPENAI_STOP,
-    timeout=OPENAI_API_TIMEOUT
-)
 
 async_embedding_client = AsyncEmbeddingAPIClient()
 
@@ -895,9 +761,110 @@ class GraphManagerWrapper:
 
 # Instantiate the GraphManagerWrapper for API usage.
 graph_manager_wrapper = GraphManagerWrapper()
+async def global_search_map_reduce_plain(
+    question: str,
+    conversation_history: Optional[str] = None,
+    doc_id: Optional[str] = None,
+    chunk_size: int = GLOBAL_SEARCH_CHUNK_SIZE,
+    top_n: int = GLOBAL_SEARCH_TOP_N,
+    batch_size: int = GLOBAL_SEARCH_BATCH_SIZE
+) -> str:
+    # Step 1: Compute the embedding for the user query.
+    query_embedding = await async_embedding_client.get_embedding(question)
 
-async def global_search_map_reduce(question: str, conversation_history: Optional[str] = None,
-                                   doc_id: Optional[str] = None,
+    # Step 2: Retrieve similar Chunk nodes using cosine similarity.
+    cypher = """
+    WITH $query_embedding AS queryEmbedding
+    MATCH (c:Chunk)
+    WHERE size(c.embedding) = size(queryEmbedding)
+    WITH c, gds.similarity.cosine(c.embedding, queryEmbedding) AS sim
+    WHERE sim > $similarity_threshold
+    RETURN c.doc_id AS doc_id, c.text AS chunk_text, sim
+    ORDER BY sim DESC
+    LIMIT $limit
+    """
+    params = {
+       "query_embedding": query_embedding,
+       "similarity_threshold": 0.4,  # adjust as needed
+       "limit": 30
+    }
+    similar_chunks = await asyncio.to_thread(run_cypher_query, cypher, params)
+
+    # Step 3: From the similar chunks, collect related document IDs and fetch community summaries.
+    related_doc_ids = list({record["doc_id"] for record in similar_chunks})
+    community_summaries = {}
+    for doc in related_doc_ids:
+         query_cs = """
+         MATCH (cs:CommunitySummary {doc_id: $doc_id})
+         RETURN cs.community AS community, cs.summary AS summary, cs.embedding AS embedding
+         """
+         cs_result = await asyncio.to_thread(run_cypher_query, query_cs, {"doc_id": doc})
+         for record in cs_result:
+             community_summaries[record["community"]] = {
+                 "summary": record["summary"],
+                 "embedding": record["embedding"]
+             }
+    if not community_summaries:
+         raise HTTPException(status_code=500, detail="No related community summaries found based on chunk similarity.")
+
+    # Step 4: Process community summaries to extract key points using plain text.
+    # Instead of expecting JSON, we instruct the LLM to list key points as lines in plain text.
+    community_reports = list(community_summaries.values())
+    random.shuffle(community_reports)
+    # (Optionally, if you wish to filter or score these summaries, you can integrate that logic here.)
+    intermediate_points = []
+    for report in community_reports:
+         # Split each community summary into smaller text chunks.
+         chunks = chunk_text(report["summary"], max_chunk_size=chunk_size)
+         for i in range(0, len(chunks), batch_size):
+             batch = chunks[i:i + batch_size]
+             batch_prompt = (
+                 "You are an expert in extracting key points. For the following text chunks from a community summary, "
+                 "list the key points that are most relevant to answering the user query. For each key point, provide "
+                 "a brief description and assign a relevance rating between 1 and 100. "
+                 "Format each key point on a separate line in this format:\n"
+                 "Key point: <description> (Rating: <number>)\n\n"
+             )
+             for idx, chunk in enumerate(batch):
+                 batch_prompt += f"Chunk {idx+1}:\n\"\"\"\n{chunk}\n\"\"\"\n\n"
+             batch_prompt += f"User Query: \"{question}\"\n"
+             try:
+                 response = await async_llm.invoke([
+                     {"role": "system", "content": "You are a professional extraction assistant."},
+                     {"role": "user", "content": batch_prompt}
+                 ])
+                 # Append the response (plain text key points).
+                 intermediate_points.append(response.strip())
+             except Exception as e:
+                 logger.error(f"Batch processing error: {e}")
+    
+    # Combine all extracted key points into one aggregated text block.
+    aggregated_key_points = "\n".join(intermediate_points)
+    
+    # Optionally, you can add a debug log for the aggregated key points.
+    logger.info("Aggregated Key Points:\n%s", aggregated_key_points)
+    
+    conv_text = f"Conversation History: {conversation_history}\n" if conversation_history else ""
+    
+    # Step 5: Build a reduction prompt that uses the aggregated key points
+    # to generate a final detailed answer in plain text.
+    reduce_prompt = f"""
+{conv_text}You are a professional assistant tasked with synthesizing a detailed answer from the following extracted key points:
+{aggregated_key_points}
+
+User Query: "{question}"
+
+Using only the above key points, generate a comprehensive and detailed answer in plain text that directly addresses the query. Please include a clear summary and explanation that ties together all key points.
+"""
+    final_answer = await async_llm.invoke([
+         {"role": "system", "content": "You are a professional assistant providing detailed answers."},
+         {"role": "user", "content": reduce_prompt}
+    ])
+    
+    return final_answer
+    
+async def global_search_map_reduce(question: str, conversation_history: str = None,
+                                   doc_id: str = None,
                                    chunk_size: int = GLOBAL_SEARCH_CHUNK_SIZE, top_n: int = GLOBAL_SEARCH_TOP_N,
                                    batch_size: int = GLOBAL_SEARCH_BATCH_SIZE) -> str:
     """
@@ -911,19 +878,56 @@ async def global_search_map_reduce(question: str, conversation_history: Optional
     :param batch_size: Batch size for processing chunks.
     :return: A detailed final answer as a string.
     """
-    summaries = await graph_manager_wrapper.get_stored_community_summaries(doc_id=doc_id)
-    if not summaries:
-        raise HTTPException(status_code=500, detail="No community summaries available. Please re-index the dataset.")
-    community_reports = list(summaries.values())
+    # Step 1: Compute query embedding
+    query_embedding = await async_embedding_client.get_embedding(question)
+
+    # Step 2: Retrieve similar Chunk nodes using cosine similarity.
+    cypher = """
+    WITH $query_embedding AS queryEmbedding
+    MATCH (c:Chunk)
+    WHERE size(c.embedding) = size(queryEmbedding)
+    WITH c, gds.similarity.cosine(c.embedding, queryEmbedding) AS sim
+    WHERE sim > $similarity_threshold
+    RETURN c.doc_id AS doc_id, c.text AS chunk_text, sim
+    ORDER BY sim DESC
+    LIMIT $limit
+    """
+    params = {
+       "query_embedding": query_embedding,
+       "similarity_threshold": 0.4,
+       "limit": 30
+    }
+    similar_chunks = await asyncio.to_thread(run_cypher_query, cypher, params)
+    
+    # Step 3: Retrieve related community summaries based on doc_ids
+    related_doc_ids = list({record["doc_id"] for record in similar_chunks})
+    community_summaries = {}
+    for doc in related_doc_ids:
+         query_cs = """
+         MATCH (cs:CommunitySummary {doc_id: $doc_id})
+         RETURN cs.community AS community, cs.summary AS summary, cs.embedding AS embedding
+         """
+         cs_result = await asyncio.to_thread(run_cypher_query, query_cs, {"doc_id": doc})
+         for record in cs_result:
+             community_summaries[record["community"]] = {
+                 "summary": record["summary"],
+                 "embedding": record["embedding"]
+             }
+    
+    if not community_summaries:
+         raise HTTPException(status_code=500, detail="No related community summaries found based on chunk similarity.")
+    
+    
+    # Step 4: Continue with the remaining logic (chunking, extracting key points, and reducing).
+    community_reports = list(community_summaries.values())
     random.shuffle(community_reports)
     selected_reports_with_scores = await asyncio.to_thread(select_relevant_communities, question, community_reports)
     if not selected_reports_with_scores:
         selected_reports_with_scores = [(report, 0) for report in community_reports[:top_n]]
-    logger.info("Selected community reports for dynamic selection:")
-    for report, score in selected_reports_with_scores:
-        logger.info("Score: %.4f, Snippet: %s", score, report[:100])
+    
     intermediate_points = []
     for report, _ in selected_reports_with_scores:
+        # Break the community summary into manageable chunks.
         chunks = chunk_text(report, max_chunk_size=chunk_size)
         for i in range(0, len(chunks), batch_size):
             batch = chunks[i:i + batch_size]
@@ -932,41 +936,36 @@ async def global_search_map_reduce(question: str, conversation_history: Optional
                 "extract key points that are relevant to answering the user query provided at the end. "
                 "Return the output strictly as a valid JSON array in this format: "
                 '[{"point": "key detail", "rating": 1-100}].\n\n'
-                "**IMPORTANT:** Use **double quotes** for keys and string values. Do NOT add any explanation, commentary, or extra text outside the JSON structure.")
+                "**IMPORTANT:** Use **double quotes** for keys and string values. Do NOT add any explanation, commentary, or extra text outside the JSON structure."
+            )
             for idx, chunk in enumerate(batch):
                 batch_prompt += f"\n\nChunk {idx}:\n\"\"\"\n{chunk}\n\"\"\""
             batch_prompt += f"\n\nUser Query:\n\"\"\"\n{question}\n\"\"\""
             try:
                 response = await async_llm.invoke_json(
                     [{"role": "system", "content": "You are a professional extraction assistant."},
-                     {"role": "user", "content": batch_prompt}])
+                     {"role": "user", "content": batch_prompt}]
+                )
                 points = response
                 intermediate_points.extend(points)
             except Exception as e:
                 logger.error(f"Batch processing error: {e}")
-    logger.info("Intermediate key points extracted (unsorted):")
-    for pt in intermediate_points:
-        if isinstance(pt, dict):
-            logger.info("Key point: %s, Rating: %s", pt.get("point"), pt.get("rating"))
-        else:
-            logger.info("Key point: %s", pt)
-    # Sorting intermediate points with safe type checking
+    
+    # Sort the extracted key points by their rating.
     intermediate_points_sorted = sorted(
         intermediate_points,
-        key=lambda x: x.get("rating", 0) if isinstance(x, dict) else 0,
+        key=lambda x: extract_rating(x),
         reverse=True
     )
 
     selected_points = intermediate_points_sorted[:top_n]
-
-    # Build aggregated context: if a point is not a dictionary, treat it as a string with a default rating of 0.
     aggregated_context = "\n".join(
-        [f"{pt['point']} (Rating: {pt['rating']})" if isinstance(pt, dict) else f"{pt} (Rating: 0)" for pt in
-         selected_points]
+        [f"{pt['point']} (Rating: {pt['rating']})" if isinstance(pt, dict) else f"{pt} (Rating: 0)" for pt in selected_points]
     )
-
+    
     conv_text = f"Conversation History: {conversation_history}\n" if conversation_history else ""
-
+    
+    # Build the final reduce prompt.
     reduce_prompt = f"""
     {conv_text}You are a professional assistant specialized in synthesizing detailed information from provided data.
     Your task is to analyze the following list of intermediate key points and the original user query, and then generate a comprehensive answer that fully explains the topic using only the provided information.
@@ -990,11 +989,12 @@ async def global_search_map_reduce(question: str, conversation_history: Optional
         }}
     Ensure that your answer is extensive, uses complete sentences, and provides a deep, detailed explanation based solely on the supplied context.
     """
-
+    
     try:
-        final_answer = await async_llm.invoke_json([{"role": "system",
-                                                     "content": "You are a professional assistant providing detailed answers based solely on provided information. Infer insights when possible. Your response MUST be a valid JSON object."},
-                                                    {"role": "user", "content": reduce_prompt}])
+        final_answer = await async_llm.invoke_json([
+            {"role": "system", "content": "You are a professional assistant providing detailed answers based solely on provided information. Infer insights when possible. Your response MUST be a valid JSON object."},
+            {"role": "user", "content": reduce_prompt}
+        ])
         if isinstance(final_answer, dict) and "summary" in final_answer:
             return format_natural_response(json.dumps(final_answer))
         return "Here's the provided content:\n\n" + json.dumps(final_answer, indent=2)
@@ -1110,7 +1110,16 @@ async def cypher_search(request: QuestionRequest):
     :return: JSON containing the final answer, aggregated text, and executed queries.
     """
     # Step 1: Extract candidate entities from the user query.
-    candidate_entities = await extract_entity_keywords(request.question)
+    prompt = f"Extract entity names from the following question. Provide the names separated by commas:\n{request.question}"
+    try:
+        response = await async_llm.invoke([
+            {"role": "system", "content": "You are an expert in entity extraction."},
+            {"role": "user", "content": prompt}
+        ])
+        candidate_entities = [e.strip() for e in response.split(",") if e.strip()]
+    except Exception as e:
+        logger.error(f"Error extracting keywords: {e}")
+        candidate_entities = request.question.split()[:2]
     final_entities = []
 
     # For each candidate, compute similarity directly in Neo4j.
@@ -1247,25 +1256,18 @@ async def cypher_search(request: QuestionRequest):
 # -----------------------------------------------------------------------------
 @app.post("/global_search")
 async def global_search(request: GlobalSearchRequest):
-    """
-    Global search endpoint that rewrites the query if needed, performs map-reduce search,
-    and returns a final answer based solely on graph data.
-    :param request: GlobalSearchRequest object.
-    :return: JSON with the final answer.
-    """
-    # Rewrite the query if previous conversation exists.
+    # Rewrite query if previous conversation exists.
     request.question = await rewrite_query_if_needed(request.question, request.previous_conversations)
-
-    answer = await global_search_map_reduce(
-        question=request.question,
-        conversation_history=request.previous_conversations,
-        doc_id=request.doc_id,
-        chunk_size=GLOBAL_SEARCH_CHUNK_SIZE,
-        top_n=GLOBAL_SEARCH_TOP_N,
-        batch_size=GLOBAL_SEARCH_BATCH_SIZE
+    final_answer_text = await global_search_map_reduce_plain(
+         question=request.question,
+         conversation_history=request.previous_conversations,
+         doc_id=request.doc_id,
+         chunk_size=GLOBAL_SEARCH_CHUNK_SIZE,
+         top_n=GLOBAL_SEARCH_TOP_N,
+         batch_size=GLOBAL_SEARCH_BATCH_SIZE
     )
-    logger.debug(f"Raw search answer: {answer}")
-    return {"answer": format_natural_response(answer)}
+    # Return the plain text answer wrapped in JSON.
+    return {"answer": final_answer_text}
 
 # -----------------------------------------------------------------------------
 # Endpoint: Local Search
@@ -1356,89 +1358,208 @@ async def local_search(request: LocalSearchRequest):
 # -----------------------------------------------------------------------------
 @app.post("/drift_search")
 async def drift_search(request: DriftSearchRequest):
-    """
-    Drift search endpoint that synthesizes a hierarchical answer with follow-up queries.
-    :param request: DriftSearchRequest object.
-    :return: JSON with the drift search answer and hierarchy.
-    """
-    # Rewrite the query if previous conversation exists.
+    # Step 1: Rewrite the query if previous conversation exists.
     request.question = await rewrite_query_if_needed(request.question, request.previous_conversations)
-
-    summaries = await graph_manager_wrapper.get_stored_community_summaries(doc_id=request.doc_id)
-    if not summaries:
-        if request.doc_id:
-            return {
-                "drift_search_answer": f"No community summaries found for doc_id {request.doc_id}. Please re-index the dataset or try without specifying a doc_id."}
-        else:
-            return {"drift_search_answer": "No community summaries available. Please re-index the dataset."}
-    community_reports = [v["summary"] for v in summaries.values() if v.get("summary")]
-    selected_reports = await asyncio.to_thread(select_relevant_communities, request.question, community_reports)
-    global_context = "\n\n".join([rep for rep, score in selected_reports])
+    
+    # -----------------------------
+    # Global Search: Cosine Similarity Filtering
+    # -----------------------------
+    # Compute the query embedding.
+    query_embedding = await async_embedding_client.get_embedding(request.question)
+    
+    # Run a Cypher query to retrieve Chunk nodes similar to the query embedding.
+    cypher = """
+    WITH $query_embedding AS queryEmbedding
+    MATCH (c:Chunk)
+    WHERE size(c.embedding) = size(queryEmbedding)
+    WITH c, gds.similarity.cosine(c.embedding, queryEmbedding) AS sim
+    WHERE sim > $similarity_threshold
+    RETURN c.doc_id AS doc_id, c.text AS chunk_text, sim
+    ORDER BY sim DESC
+    LIMIT $limit
+    """
+    params = {
+       "query_embedding": query_embedding,
+       "similarity_threshold": 0.4,  # Adjust threshold as needed.
+       "limit": 30
+    }
+    similar_chunks = await asyncio.to_thread(run_cypher_query, cypher, params)
+    
+    # Extract unique doc_ids from the similar chunks.
+    related_doc_ids = list({record["doc_id"] for record in similar_chunks})
+    
+    # Retrieve community summaries for these document IDs.
+    community_summaries = {}
+    for doc in related_doc_ids:
+         query_cs = """
+         MATCH (cs:CommunitySummary {doc_id: $doc_id})
+         RETURN cs.community AS community, cs.summary AS summary, cs.embedding AS embedding
+         """
+         cs_result = await asyncio.to_thread(run_cypher_query, query_cs, {"doc_id": doc})
+         for record in cs_result:
+             community_summaries[record["community"]] = {
+                 "summary": record["summary"],
+                 "embedding": record["embedding"]
+             }
+    if not community_summaries:
+         raise HTTPException(status_code=500, detail="No related community summaries found based on chunk similarity.")
+    
+    # Build a global context by concatenating all retrieved community summaries.
+    community_reports = [v["summary"] for v in community_summaries.values() if v.get("summary")]
+    global_context = "\n\n".join(community_reports)
+    
     conversation_context = f"Conversation History:\n{request.previous_conversations}\n\n" if request.previous_conversations else ""
-    primer_prompt = (
-        "You are an expert in synthesizing information from diverse community reports. "
-        "Using the following community report excerpts:\n\n"
-        f"{global_context}\n\n"
-        f"{conversation_context}"
-        "Answer the following query by generating a hypothetical answer and listing follow-up questions that could "
-        "further refine the query."
-        "Return your output as a strict JSON object with the keys: 'intermediate_answer', 'follow_up_queries' (a JSON array), and 'score' (a confidence score), and do not include any markdown formatting, code blocks, or extra commentary.\n\n"
-        f"Query: {request.question}"
-    )
-    primer_result = await async_llm.invoke_json([
-        {"role": "system", "content": "You are a professional assistant."},
-        {"role": "user", "content": primer_prompt}
+    
+    # -----------------------------
+    # Primer Phase: Generate Intermediate Answer & Follow-Up Questions
+    # -----------------------------
+    primer_prompt = f"""
+You are an expert in synthesizing information from diverse community reports.
+Based on the following global context derived from document similarity filtering:
+{global_context}
+{conversation_context}
+Please provide a preliminary answer to the following query and list any follow-up questions that could help refine it.
+Format your response as plain text with the following sections:
+
+Intermediate Answer:
+<your intermediate answer here>
+
+Follow-Up Questions:
+1. <first follow-up question>
+2. <second follow-up question>
+... 
+
+Query: {request.question}
+"""
+    primer_result = await async_llm.invoke([
+         {"role": "system", "content": "You are a professional assistant."},
+         {"role": "user", "content": primer_prompt}
     ])
-    if not isinstance(primer_result, dict) or "intermediate_answer" not in primer_result:
-        return {"drift_search_answer": "Primer phase failed to generate a valid response."}
-    drift_hierarchy = {"query": request.question, "answer": primer_result["intermediate_answer"],
-                       "score": primer_result.get("score", 0), "follow_ups": []}
-    follow_up_queries = primer_result.get("follow_up_queries", [])
-    for follow_up in follow_up_queries:
-        follow_up_text = follow_up if isinstance(follow_up, str) else follow_up.get("query", str(follow_up))
-        local_context_text = ""
-        local_chunk_query = """
-            MATCH (c:Chunk)
-            WHERE toLower(c.text) CONTAINS toLower($keyword)
-        """
-        if request.doc_id:
-            local_chunk_query += " AND c.doc_id = $doc_id"
-        local_chunk_query += "\nRETURN c.text AS chunk_text\nLIMIT 5"
-        params = {"keyword": follow_up_text}
-        if request.doc_id:
-            params["doc_id"] = request.doc_id
-        chunk_results = await asyncio.to_thread(run_cypher_query, local_chunk_query, params)
-        if chunk_results:
-            chunks = [res.get("chunk_text", "") for res in chunk_results if res.get("chunk_text")]
-            local_context_text += "Related Document Chunks:\n" + "\n---\n".join(chunks) + "\n"
-        local_conversation = f"Conversation History:\n{request.previous_conversations}\n\n" if request.previous_conversations else ""
-        local_prompt = ("You are a professional assistant who refines queries using local document context. "
-                        "Based solely on the following local context information:\n\n"
-                        f"{local_context_text}\n\n"
-                        f"{local_conversation}"
-                        "Answer the following follow-up query and, if applicable, propose additional follow-up queries. "
-                        "Return your answer as a strict JSON object with keys: 'answer', 'follow_up_queries' (a JSON array), and 'score'.\n\n"
-                        f"Follow-Up Query: {follow_up_text}")
-        local_result = await async_llm.invoke_json([
-            {"role": "system", "content": "You are a professional assistant."},
-            {"role": "user", "content": local_prompt}
-        ])
-        drift_hierarchy["follow_ups"].append(
-            {"query": follow_up_text, "answer": local_result.get("answer", ""), "score": local_result.get("score", 0),
-             "follow_ups": local_result.get("follow_up_queries", [])})
-    reduction_prompt = (
-        "You are a professional assistant tasked with synthesizing a final detailed answer from hierarchical query data. "
-        "Below is a JSON representation of the query and its follow-up answers:\n\n"
-        f"{drift_hierarchy}\n\n"
-        "Based solely on the above information, provide a final, comprehensive answer to the original query. "
-        "Return your answer as plain text without any additional commentary.\n\n"
-        f"Original Query: {request.question}"
-    )
+    
+    # Parse the primer result into an intermediate answer and follow-up questions.
+    intermediate_answer = ""
+    follow_up_questions = []
+    if "Intermediate Answer:" in primer_result and "Follow-Up Questions:" in primer_result:
+         parts = primer_result.split("Follow-Up Questions:")
+         intermediate_part = parts[0]
+         follow_up_part = parts[1]
+         if "Intermediate Answer:" in intermediate_part:
+             intermediate_answer = intermediate_part.split("Intermediate Answer:")[1].strip()
+         follow_up_lines = follow_up_part.strip().splitlines()
+         for line in follow_up_lines:
+             line = line.strip()
+             if line:
+                 if line[0].isdigit():
+                     dot_index = line.find('.')
+                     if dot_index != -1:
+                         line = line[dot_index+1:].strip()
+                 follow_up_questions.append(line)
+    else:
+         # Fallback: treat the entire output as the intermediate answer.
+         intermediate_answer = primer_result.strip()
+    
+    drift_hierarchy = {
+         "query": request.question,
+         "answer": intermediate_answer,
+         "follow_ups": []
+    }
+    
+    # -----------------------------
+    # Local Phase: Process Each Follow-Up Question Using Local Document Context
+    # -----------------------------
+    for follow_up in follow_up_questions:
+         local_chunk_query = """
+             MATCH (c:Chunk)
+             WHERE toLower(c.text) CONTAINS toLower($keyword)
+         """
+         if request.doc_id:
+             local_chunk_query += " AND c.doc_id = $doc_id"
+         local_chunk_query += "\nRETURN c.text AS chunk_text\nLIMIT 5"
+         params = {"keyword": follow_up}
+         if request.doc_id:
+             params["doc_id"] = request.doc_id
+         chunk_results = await asyncio.to_thread(run_cypher_query, local_chunk_query, params)
+         local_context_text = ""
+         if chunk_results:
+             chunks = [res.get("chunk_text", "") for res in chunk_results if res.get("chunk_text")]
+             local_context_text = "Related Document Chunks:\n" + "\n---\n".join(chunks) + "\n"
+         
+         local_conversation = f"Conversation History:\n{request.previous_conversations}\n\n" if request.previous_conversations else ""
+         local_prompt = f"""
+You are a professional assistant who refines queries using local document context.
+Based on the following local context:
+{local_context_text}
+{local_conversation}
+Please provide an answer to the following follow-up query and list any additional follow-up questions.
+Format your response as plain text with these sections:
+
+Answer:
+<your answer here>
+
+Follow-Up Questions:
+1. <first follow-up question>
+2. <second follow-up question>
+...
+
+Follow-Up Query: {follow_up}
+"""
+         local_result = await async_llm.invoke([
+             {"role": "system", "content": "You are a professional assistant."},
+             {"role": "user", "content": local_prompt}
+         ])
+         
+         local_answer = ""
+         local_follow_ups = []
+         if "Answer:" in local_result and "Follow-Up Questions:" in local_result:
+             parts = local_result.split("Follow-Up Questions:")
+             answer_part = parts[0]
+             follow_up_part = parts[1]
+             if "Answer:" in answer_part:
+                 local_answer = answer_part.split("Answer:")[1].strip()
+             follow_up_lines = follow_up_part.strip().splitlines()
+             for line in follow_up_lines:
+                 line = line.strip()
+                 if line:
+                     if line[0].isdigit():
+                         dot_index = line.find('.')
+                         if dot_index != -1:
+                             line = line[dot_index+1:].strip()
+                     local_follow_ups.append(line)
+         else:
+             local_answer = local_result.strip()
+         
+         drift_hierarchy["follow_ups"].append({
+             "query": follow_up,
+             "answer": local_answer,
+             "follow_ups": local_follow_ups
+         })
+    
+    # -----------------------------
+    # Reduction Phase: Synthesize Final Answer Using the Full Hierarchy
+    # -----------------------------
+    reduction_prompt = f"""
+You are a professional assistant tasked with synthesizing a final detailed answer.
+Below is the hierarchical data gathered:
+
+Query: {drift_hierarchy["query"]}
+
+Intermediate Answer: {drift_hierarchy["answer"]}
+
+Follow-Up Interactions:
+"""
+    for idx, fu in enumerate(drift_hierarchy["follow_ups"], start=1):
+         reduction_prompt += f"\nFollow-Up {idx}:\nQuery: {fu['query']}\nAnswer: {fu['answer']}\n"
+         if fu["follow_ups"]:
+             reduction_prompt += "Additional Follow-Ups: " + ", ".join(fu["follow_ups"]) + "\n"
+    reduction_prompt += f"\nBased solely on the above, provide a final, comprehensive answer in plain text to the original query:\n{request.question}"
+    
     final_answer = await async_llm.invoke([
-        {"role": "system", "content": "You are a professional assistant."},
-        {"role": "user", "content": reduction_prompt}
+         {"role": "system", "content": "You are a professional assistant."},
+         {"role": "user", "content": reduction_prompt}
     ])
+    
     return {"drift_search_answer": final_answer.strip(), "drift_hierarchy": drift_hierarchy}
+
 
 # -----------------------------------------------------------------------------
 # Endpoint: List Documents
