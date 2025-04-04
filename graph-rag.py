@@ -872,7 +872,8 @@ app = FastAPI(title="Graph RAG API", description="End-to-end Graph Database RAG 
 @app.post("/upload_documents")
 async def upload_documents(files: List[UploadFile] = File(...)):
     """
-    Upload documents, process them into text chunks, build the graph, and store community summaries.
+    Upload documents, process them into text chunks, build the graph, store community summaries,
+    and update the graph projection.
     :param files: List of files uploaded.
     :return: JSON message confirming successful processing.
     """
@@ -919,7 +920,15 @@ async def upload_documents(files: List[UploadFile] = File(...)):
             await graph_manager_wrapper.store_community_summaries(doc_id)
         except Exception as e:
             logger.error(f"Error storing community summaries for doc_id {doc_id}: {e}")
-    return {"message": "Documents processed, graph updated, and community summaries stored successfully."}
+
+    # Use reproject_graph to update the graph projection after uploading documents.
+    try:
+        await graph_manager_wrapper.reproject_graph()  # This call reprojects the entire graph.
+        logger.info("Graph reprojected successfully after document upload.")
+    except Exception as e:
+        logger.error(f"Error reprojecting graph: {e}")
+
+    return {"message": "Documents processed, graph updated, community summaries stored, and graph reprojected successfully."}
 
 @app.post("/cypher_search")
 async def cypher_search(request: QuestionRequest):
@@ -929,16 +938,7 @@ async def cypher_search(request: QuestionRequest):
     :return: JSON containing the final answer, aggregated text, and executed queries.
     """
     # Step 1: Extract candidate entities from the user query.
-    prompt = f"Extract entity names from the following question. Provide the names separated by commas:\n{request.question}"
-    try:
-        response = await async_llm.invoke([
-            {"role": "system", "content": "You are an expert in entity extraction."},
-            {"role": "user", "content": prompt}
-        ])
-        candidate_entities = [e.strip() for e in response.split(",") if e.strip()]
-    except Exception as e:
-        logger.error(f"Error extracting keywords: {e}")
-        candidate_entities = request.question.split()[:2]
+    candidate_entities = await extract_entity_keywords(request.question)
     final_entities = []
 
     # For each candidate, compute similarity directly in Neo4j.
