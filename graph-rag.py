@@ -12,12 +12,9 @@ import sys
 import uuid
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Union, Tuple
-from lmformatenforcer import JsonSchemaParser
-import json
 import PyPDF2
 import blingfire
 import docx
-import json5  # More forgiving JSON parser. Install with: pip install json5
 import httpx
 import urllib3
 from dotenv import load_dotenv
@@ -228,22 +225,6 @@ async def extract_entity_keywords(question: str) -> list:
         # Fallback heuristic: return first two words if extraction fails.
         return question.split()[:2]
 
-def parse_strict_json(response_text: str) -> Union[dict, list]:
-    """
-    Parse a string into JSON using standard json and fallback to json5 if needed.
-    :param response_text: The string to parse.
-    :return: The parsed JSON object.
-    """
-    try:
-        return json.loads(response_text)
-    except json.JSONDecodeError as e:
-        logger.warning("json.loads failed, attempting json5 parser: " + str(e))
-        try:
-            return json5.loads(response_text)
-        except Exception as e2:
-            logger.error("json5 parsing also failed: " + str(e2))
-            raise e2
-
 def clean_text(text: str) -> str:
     """
     Clean text by removing non-printable characters and extra whitespace.
@@ -309,29 +290,6 @@ def run_cypher_query(query: str, parameters: Dict[str, Any] = {}) -> List[Dict[s
     except Exception as e:
         logger.error(f"Error executing query: {query}. Error: {e}")
         raise HTTPException(status_code=500, detail=f"Neo4j query execution error: {e}")
-
-def format_natural_response(response: str) -> str:
-    """
-    Format the natural language response from the LLM, parsing JSON if necessary.
-    :param response: The raw response string.
-    :return: Formatted response string.
-    """
-    logger.info(f"Raw LLM Response: {repr(response)}")
-    response = response.strip()
-    if (response.startswith("{") and response.endswith("}")) or (response.startswith("[") and response.endswith("]")):
-        try:
-            parsed_data = parse_strict_json(response)
-            if isinstance(parsed_data, dict) and "summary" in parsed_data:
-                summary = parsed_data.get("summary", "No summary available.")
-                key_points = parsed_data.get("key_points", [])
-                answer = f"{summary}\n\nKey points of note include:\n"
-                for idx, point in enumerate(key_points, 1):
-                    answer += f"{idx}. {point['point']} (Importance: {point['rating']})\n"
-                return answer.strip()
-        except Exception as e:
-            logger.error("Error parsing JSON: " + str(e))
-            return response
-    return response
 
 async def resolve_coreferences_in_parts(text: str) -> str:
     """
@@ -863,145 +821,6 @@ Using only the above key points, generate a comprehensive and detailed answer in
     
     return final_answer
     
-async def global_search_map_reduce(question: str, conversation_history: str = None,
-                                   doc_id: str = None,
-                                   chunk_size: int = GLOBAL_SEARCH_CHUNK_SIZE, top_n: int = GLOBAL_SEARCH_TOP_N,
-                                   batch_size: int = GLOBAL_SEARCH_BATCH_SIZE) -> str:
-    """
-    Perform global search by dynamically selecting community summaries, extracting key points,
-    and reducing the information to generate a final answer.
-    :param question: The user query.
-    :param conversation_history: Optional conversation context.
-    :param doc_id: Optional document ID.
-    :param chunk_size: Maximum chunk size for text segmentation.
-    :param top_n: Number of top key points to consider.
-    :param batch_size: Batch size for processing chunks.
-    :return: A detailed final answer as a string.
-    """
-    # Step 1: Compute query embedding
-    query_embedding = await async_embedding_client.get_embedding(question)
-
-    # Step 2: Retrieve similar Chunk nodes using cosine similarity.
-    cypher = """
-    WITH $query_embedding AS queryEmbedding
-    MATCH (c:Chunk)
-    WHERE size(c.embedding) = size(queryEmbedding)
-    WITH c, gds.similarity.cosine(c.embedding, queryEmbedding) AS sim
-    WHERE sim > $similarity_threshold
-    RETURN c.doc_id AS doc_id, c.text AS chunk_text, sim
-    ORDER BY sim DESC
-    LIMIT $limit
-    """
-    params = {
-       "query_embedding": query_embedding,
-       "similarity_threshold": 0.4,
-       "limit": 30
-    }
-    similar_chunks = await asyncio.to_thread(run_cypher_query, cypher, params)
-    
-    # Step 3: Retrieve related community summaries based on doc_ids
-    related_doc_ids = list({record["doc_id"] for record in similar_chunks})
-    community_summaries = {}
-    for doc in related_doc_ids:
-         query_cs = """
-         MATCH (cs:CommunitySummary {doc_id: $doc_id})
-         RETURN cs.community AS community, cs.summary AS summary, cs.embedding AS embedding
-         """
-         cs_result = await asyncio.to_thread(run_cypher_query, query_cs, {"doc_id": doc})
-         for record in cs_result:
-             community_summaries[record["community"]] = {
-                 "summary": record["summary"],
-                 "embedding": record["embedding"]
-             }
-    
-    if not community_summaries:
-         raise HTTPException(status_code=500, detail="No related community summaries found based on chunk similarity.")
-    
-    
-    # Step 4: Continue with the remaining logic (chunking, extracting key points, and reducing).
-    community_reports = list(community_summaries.values())
-    random.shuffle(community_reports)
-    selected_reports_with_scores = await asyncio.to_thread(select_relevant_communities, question, community_reports)
-    if not selected_reports_with_scores:
-        selected_reports_with_scores = [(report, 0) for report in community_reports[:top_n]]
-    
-    intermediate_points = []
-    for report, _ in selected_reports_with_scores:
-        # Break the community summary into manageable chunks.
-        chunks = chunk_text(report, max_chunk_size=chunk_size)
-        for i in range(0, len(chunks), batch_size):
-            batch = chunks[i:i + batch_size]
-            batch_prompt = (
-                "You are an expert in extracting key information. For each of the following community report chunks, "
-                "extract key points that are relevant to answering the user query provided at the end. "
-                "Return the output strictly as a valid JSON array in this format: "
-                '[{"point": "key detail", "rating": 1-100}].\n\n'
-                "**IMPORTANT:** Use **double quotes** for keys and string values. Do NOT add any explanation, commentary, or extra text outside the JSON structure."
-            )
-            for idx, chunk in enumerate(batch):
-                batch_prompt += f"\n\nChunk {idx}:\n\"\"\"\n{chunk}\n\"\"\""
-            batch_prompt += f"\n\nUser Query:\n\"\"\"\n{question}\n\"\"\""
-            try:
-                response = await async_llm.invoke_json(
-                    [{"role": "system", "content": "You are a professional extraction assistant."},
-                     {"role": "user", "content": batch_prompt}]
-                )
-                points = response
-                intermediate_points.extend(points)
-            except Exception as e:
-                logger.error(f"Batch processing error: {e}")
-    
-    # Sort the extracted key points by their rating.
-    intermediate_points_sorted = sorted(
-        intermediate_points,
-        key=lambda x: extract_rating(x),
-        reverse=True
-    )
-
-    selected_points = intermediate_points_sorted[:top_n]
-    aggregated_context = "\n".join(
-        [f"{pt['point']} (Rating: {pt['rating']})" if isinstance(pt, dict) else f"{pt} (Rating: 0)" for pt in selected_points]
-    )
-    
-    conv_text = f"Conversation History: {conversation_history}\n" if conversation_history else ""
-    
-    # Build the final reduce prompt.
-    reduce_prompt = f"""
-    {conv_text}You are a professional assistant specialized in synthesizing detailed information from provided data.
-    Your task is to analyze the following list of intermediate key points and the original user query, and then generate a comprehensive answer that fully explains the topic using only the provided information.
-    Using ONLY the following intermediate key points:
-    {json.dumps(intermediate_points_sorted[:top_n], indent=2)}
-    and the original user query: "{question}",
-    generate a detailed answer that directly addresses the query.
-    Please follow these instructions:
-    1. Produce a detailed summary that directly and thoroughly answers the user’s query.
-    2. Include a list of the key points along with their ratings exactly as provided.
-    3. Provide an extended detailed explanation that weaves together all key points, elaborating on how each contributes to the overall answer.
-    4. Do not use any external knowledge; rely solely on the provided key points.
-    5. Return your response strictly in the following JSON format:
-        {{
-        "summary": "Your detailed answer summary here",
-        "key_points": [
-            {{"point": "key detail", "rating": "1-100"}},
-            {{"point": "another detail", "rating": "1-100"}}
-        ],
-        "detailed_explanation": "A comprehensive explanation that connects all key points and fully addresses the query."
-        }}
-    Ensure that your answer is extensive, uses complete sentences, and provides a deep, detailed explanation based solely on the supplied context.
-    """
-    
-    try:
-        final_answer = await async_llm.invoke_json([
-            {"role": "system", "content": "You are a professional assistant providing detailed answers based solely on provided information. Infer insights when possible. Your response MUST be a valid JSON object."},
-            {"role": "user", "content": reduce_prompt}
-        ])
-        if isinstance(final_answer, dict) and "summary" in final_answer:
-            return format_natural_response(json.dumps(final_answer))
-        return "Here's the provided content:\n\n" + json.dumps(final_answer, indent=2)
-    except Exception as e:
-        final_answer = f"Error during reduce step: {e}"
-    return final_answer
-
 def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
     """
     Compute the cosine similarity between two vectors.
