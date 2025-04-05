@@ -22,6 +22,7 @@ from fastapi import FastAPI, HTTPException, UploadFile, File
 from neo4j import GraphDatabase
 from pydantic import BaseModel
 
+
 # -----------------------------------------------------------------------------
 # Helper function to run asynchronous coroutines in a thread-safe manner.
 # This function allows execution of async coroutines from synchronous contexts.
@@ -39,6 +40,7 @@ def run_async(coro):
     if loop and loop.is_running():
         result_container = {}
         new_loop = None  # Initialize new_loop outside the inner function.
+
         def run():
             nonlocal new_loop  # Declare nonlocal to modify the outer new_loop.
             new_loop = asyncio.new_event_loop()
@@ -50,6 +52,7 @@ def run_async(coro):
             finally:
                 if new_loop:
                     new_loop.close()
+
         thread = threading.Thread(target=run)
         thread.start()
         thread.join()
@@ -59,6 +62,7 @@ def run_async(coro):
         return result
     else:
         return asyncio.run(coro)
+
 
 # -----------------------------------------------------------------------------
 # Disable warnings and load environment variables
@@ -150,18 +154,21 @@ class GlobalSearchRequest(BaseModel):
     previous_conversations: Optional[str] = None
     doc_id: Optional[str] = None
 
+
 class ReduceOutput(BaseModel):
     summary: str
-    key_points: list  
+    key_points: list
     detailed_explanation: str
-    
+
+
 # =============================================================================
 # UTILITY FUNCTIONS
 # =============================================================================
 def extract_rating(text: str) -> int:
     match = re.search(r'\(Rating:\s*(\d+)\)', text)
     return int(match.group(1)) if match else 0
-            
+
+
 def clean_empty_chunks():
     """
     Delete Chunk nodes in Neo4j with empty or null 'text' property.
@@ -183,6 +190,7 @@ def clean_empty_nodes():
         session.run(query)
         logger.info("Cleaned empty Entity nodes.")
 
+
 async def rewrite_query_if_needed(question: str, conversation_history: Optional[str]) -> str:
     """
     Rewrite a user query into a standalone query if conversation history is provided.
@@ -201,6 +209,7 @@ async def rewrite_query_if_needed(question: str, conversation_history: Optional[
         ])
         return rewritten_query.strip()
     return question
+
 
 async def extract_entity_keywords(question: str) -> list:
     """
@@ -225,6 +234,7 @@ async def extract_entity_keywords(question: str) -> list:
         # Fallback heuristic: return first two words if extraction fails.
         return question.split()[:2]
 
+
 def clean_text(text: str) -> str:
     """
     Clean text by removing non-printable characters and extra whitespace.
@@ -237,6 +247,7 @@ def clean_text(text: str) -> str:
     cleaned_text = ''.join(filter(lambda x: x in string.printable, text.strip()))
     logger.debug(f"Cleaned text: {cleaned_text[:100]}...")
     return cleaned_text
+
 
 def chunk_text(text: str, max_chunk_size: int = 512) -> List[str]:
     """
@@ -264,6 +275,7 @@ def chunk_text(text: str, max_chunk_size: int = 512) -> List[str]:
         chunks.append(current_chunk.strip())
     return chunks
 
+
 def run_cypher_query(query: str, parameters: Dict[str, Any] = {}) -> List[Dict[str, Any]]:
     """
     Execute a Cypher query against the Neo4j database.
@@ -290,6 +302,7 @@ def run_cypher_query(query: str, parameters: Dict[str, Any] = {}) -> List[Dict[s
     except Exception as e:
         logger.error(f"Error executing query: {query}. Error: {e}")
         raise HTTPException(status_code=500, detail=f"Neo4j query execution error: {e}")
+
 
 async def resolve_coreferences_in_parts(text: str) -> str:
     """
@@ -331,12 +344,14 @@ async def resolve_coreferences_in_parts(text: str) -> str:
                            combined_text, flags=re.IGNORECASE)
     return filtered_text.strip()
 
+
 def get_refined_system_message() -> str:
     """
     Get a refined system message instructing the LLM to return valid JSON.
     :return: The system message string.
     """
     return "You are a professional assistant. Please provide a detailed answer."
+
 
 # =============================================================================
 # ASYNCHRONOUS OPENAI & EMBEDDING API CLIENT CLASSES
@@ -345,6 +360,7 @@ class AsyncOpenAI:
     """
     Asynchronous client for interacting with the OpenAI API.
     """
+
     def __init__(self, api_key: str, model: str, base_url: str, temperature: float, stop: list, timeout: int):
         self.api_key = api_key
         self.model = model
@@ -379,6 +395,7 @@ class AsyncEmbeddingAPIClient:
     """
     Asynchronous client for fetching embeddings via the embedding API.
     """
+
     def __init__(self):
         self.embedding_api_url = os.getenv("EMBEDDING_API_URL", "http://localhost/api/embed")
         self.timeout = OPENAI_API_TIMEOUT
@@ -442,7 +459,6 @@ async_llm = AsyncOpenAI(
     timeout=OPENAI_API_TIMEOUT
 )
 
-
 async_embedding_client = AsyncEmbeddingAPIClient()
 
 
@@ -453,6 +469,7 @@ class GraphManager:
     """
     Class for constructing and managing the graph data in Neo4j.
     """
+
     async def build_graph(self, chunks: List[str], metadata_list: List[Dict[str, Any]]) -> None:
         """
         Build the graph in Neo4j by creating Chunk and Entity nodes and their relationships.
@@ -560,13 +577,16 @@ class GraphManager:
                             config=config)
             logger.info("Graph projection complete.")
 
+
 # Instance of GraphManager for use in the API.
 graph_manager = GraphManager()
+
 
 class GraphManagerExtended:
     """
     Extended graph manager for additional operations such as storing community summaries.
     """
+
     def __init__(self, driver):
         self.driver = driver
 
@@ -652,6 +672,7 @@ class GraphManagerExtended:
                 summaries[comm] = {"summary": record["summary"], "embedding": record["embedding"]}
             return summaries
 
+
 def detect_communities(doc_id: Optional[str] = None) -> dict:
     """
     Detect communities within the graph using Neo4j's GDS library.
@@ -684,10 +705,12 @@ def detect_communities(doc_id: Optional[str] = None) -> dict:
             session.run("MATCH (n:DocEntity {doc_id: $doc_id}) REMOVE n:DocEntity", doc_id=doc_id)
     return communities
 
+
 class GraphManagerWrapper:
     """
     Wrapper class to abstract graph management operations.
     """
+
     def __init__(self):
         self.manager = graph_manager
 
@@ -717,15 +740,18 @@ class GraphManagerWrapper:
         extended = GraphManagerExtended(driver)
         return await extended.get_stored_community_summaries(doc_id)
 
+
 # Instantiate the GraphManagerWrapper for API usage.
 graph_manager_wrapper = GraphManagerWrapper()
+
+
 async def global_search_map_reduce_plain(
-    question: str,
-    conversation_history: Optional[str] = None,
-    doc_id: Optional[str] = None,
-    chunk_size: int = GLOBAL_SEARCH_CHUNK_SIZE,
-    top_n: int = GLOBAL_SEARCH_TOP_N,
-    batch_size: int = GLOBAL_SEARCH_BATCH_SIZE
+        question: str,
+        conversation_history: Optional[str] = None,
+        doc_id: Optional[str] = None,
+        chunk_size: int = GLOBAL_SEARCH_CHUNK_SIZE,
+        top_n: int = GLOBAL_SEARCH_TOP_N,
+        batch_size: int = GLOBAL_SEARCH_BATCH_SIZE
 ) -> str:
     # Step 1: Compute the embedding for the user query.
     query_embedding = await async_embedding_client.get_embedding(question)
@@ -742,9 +768,9 @@ async def global_search_map_reduce_plain(
     LIMIT $limit
     """
     params = {
-       "query_embedding": query_embedding,
-       "similarity_threshold": 0.4,  # adjust as needed
-       "limit": 30
+        "query_embedding": query_embedding,
+        "similarity_threshold": 0.4,  # adjust as needed
+        "limit": 30
     }
     similar_chunks = await asyncio.to_thread(run_cypher_query, cypher, params)
 
@@ -752,18 +778,18 @@ async def global_search_map_reduce_plain(
     related_doc_ids = list({record["doc_id"] for record in similar_chunks})
     community_summaries = {}
     for doc in related_doc_ids:
-         query_cs = """
+        query_cs = """
          MATCH (cs:CommunitySummary {doc_id: $doc_id})
          RETURN cs.community AS community, cs.summary AS summary, cs.embedding AS embedding
          """
-         cs_result = await asyncio.to_thread(run_cypher_query, query_cs, {"doc_id": doc})
-         for record in cs_result:
-             community_summaries[record["community"]] = {
-                 "summary": record["summary"],
-                 "embedding": record["embedding"]
-             }
+        cs_result = await asyncio.to_thread(run_cypher_query, query_cs, {"doc_id": doc})
+        for record in cs_result:
+            community_summaries[record["community"]] = {
+                "summary": record["summary"],
+                "embedding": record["embedding"]
+            }
     if not community_summaries:
-         raise HTTPException(status_code=500, detail="No related community summaries found based on chunk similarity.")
+        raise HTTPException(status_code=500, detail="No related community summaries found based on chunk similarity.")
 
     # Step 4: Process community summaries to extract key points using plain text.
     # Instead of expecting JSON, we instruct the LLM to list key points as lines in plain text.
@@ -772,38 +798,38 @@ async def global_search_map_reduce_plain(
     # (Optionally, if you wish to filter or score these summaries, you can integrate that logic here.)
     intermediate_points = []
     for report in community_reports:
-         # Split each community summary into smaller text chunks.
-         chunks = chunk_text(report["summary"], max_chunk_size=chunk_size)
-         for i in range(0, len(chunks), batch_size):
-             batch = chunks[i:i + batch_size]
-             batch_prompt = (
-                 "You are an expert in extracting key points. For the following text chunks from a community summary, "
-                 "list the key points that are most relevant to answering the user query. For each key point, provide "
-                 "a brief description and assign a relevance rating between 1 and 100. "
-                 "Format each key point on a separate line in this format:\n"
-                 "Key point: <description> (Rating: <number>)\n\n"
-             )
-             for idx, chunk in enumerate(batch):
-                 batch_prompt += f"Chunk {idx+1}:\n\"\"\"\n{chunk}\n\"\"\"\n\n"
-             batch_prompt += f"User Query: \"{question}\"\n"
-             try:
-                 response = await async_llm.invoke([
-                     {"role": "system", "content": "You are a professional extraction assistant."},
-                     {"role": "user", "content": batch_prompt}
-                 ])
-                 # Append the response (plain text key points).
-                 intermediate_points.append(response.strip())
-             except Exception as e:
-                 logger.error(f"Batch processing error: {e}")
-    
+        # Split each community summary into smaller text chunks.
+        chunks = chunk_text(report["summary"], max_chunk_size=chunk_size)
+        for i in range(0, len(chunks), batch_size):
+            batch = chunks[i:i + batch_size]
+            batch_prompt = (
+                "You are an expert in extracting key points. For the following text chunks from a community summary, "
+                "list the key points that are most relevant to answering the user query. For each key point, provide "
+                "a brief description and assign a relevance rating between 1 and 100. "
+                "Format each key point on a separate line in this format:\n"
+                "Key point: <description> (Rating: <number>)\n\n"
+            )
+            for idx, chunk in enumerate(batch):
+                batch_prompt += f"Chunk {idx + 1}:\n\"\"\"\n{chunk}\n\"\"\"\n\n"
+            batch_prompt += f"User Query: \"{question}\"\n"
+            try:
+                response = await async_llm.invoke([
+                    {"role": "system", "content": "You are a professional extraction assistant."},
+                    {"role": "user", "content": batch_prompt}
+                ])
+                # Append the response (plain text key points).
+                intermediate_points.append(response.strip())
+            except Exception as e:
+                logger.error(f"Batch processing error: {e}")
+
     # Combine all extracted key points into one aggregated text block.
     aggregated_key_points = "\n".join(intermediate_points)
-    
+
     # Optionally, you can add a debug log for the aggregated key points.
     logger.info("Aggregated Key Points:\n%s", aggregated_key_points)
-    
+
     conv_text = f"Conversation History: {conversation_history}\n" if conversation_history else ""
-    
+
     # Step 5: Build a reduction prompt that uses the aggregated key points
     # to generate a final detailed answer in plain text.
     reduce_prompt = f"""
@@ -815,12 +841,13 @@ User Query: "{question}"
 Using only the above key points, generate a comprehensive and detailed answer in plain text that directly addresses the query. Please include a clear summary and explanation that ties together all key points.
 """
     final_answer = await async_llm.invoke([
-         {"role": "system", "content": "You are a professional assistant providing detailed answers."},
-         {"role": "user", "content": reduce_prompt}
+        {"role": "system", "content": "You are a professional assistant providing detailed answers."},
+        {"role": "user", "content": reduce_prompt}
     ])
-    
+
     return final_answer
-    
+
+
 def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
     """
     Compute the cosine similarity between two vectors.
@@ -831,6 +858,7 @@ def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
     from numpy import dot
     from numpy.linalg import norm
     return dot(vec1, vec2) / (norm(vec1) * norm(vec2) + 1e-8)
+
 
 def select_relevant_communities(query: str, community_reports: List[Union[str, dict]], top_k: int = GLOBAL_SEARCH_TOP_N,
                                 threshold: float = RELEVANCE_THRESHOLD) -> List[Tuple[str, float]]:
@@ -864,16 +892,17 @@ def select_relevant_communities(query: str, community_reports: List[Union[str, d
         logger.info("Score: %.4f, Snippet: %s", score, rep[:100])
     return scored_reports[:top_k]
 
+
 # =============================================================================
 # FASTAPI ENDPOINTS
 # =============================================================================
 app = FastAPI(title="Graph RAG API", description="End-to-end Graph Database RAG on Neo4j", version="1.0.0")
 
+
 @app.post("/upload_documents")
 async def upload_documents(files: List[UploadFile] = File(...)):
     """
-    Upload documents, process them into text chunks, build the graph, store community summaries,
-    and update the graph projection.
+    Upload documents, process them into text chunks, build the graph, and store community summaries.
     :param files: List of files uploaded.
     :return: JSON message confirming successful processing.
     """
@@ -920,15 +949,8 @@ async def upload_documents(files: List[UploadFile] = File(...)):
             await graph_manager_wrapper.store_community_summaries(doc_id)
         except Exception as e:
             logger.error(f"Error storing community summaries for doc_id {doc_id}: {e}")
+    return {"message": "Documents processed, graph updated, and community summaries stored successfully."}
 
-    # Use reproject_graph to update the graph projection after uploading documents.
-    try:
-        await graph_manager_wrapper.reproject_graph()  # This call reprojects the entire graph.
-        logger.info("Graph reprojected successfully after document upload.")
-    except Exception as e:
-        logger.error(f"Error reprojecting graph: {e}")
-
-    return {"message": "Documents processed, graph updated, community summaries stored, and graph reprojected successfully."}
 
 @app.post("/cypher_search")
 async def cypher_search(request: QuestionRequest):
@@ -938,7 +960,16 @@ async def cypher_search(request: QuestionRequest):
     :return: JSON containing the final answer, aggregated text, and executed queries.
     """
     # Step 1: Extract candidate entities from the user query.
-    candidate_entities = await extract_entity_keywords(request.question)
+    prompt = f"Extract entity names from the following question. Provide the names separated by commas:\n{request.question}"
+    try:
+        response = await async_llm.invoke([
+            {"role": "system", "content": "You are an expert in entity extraction."},
+            {"role": "user", "content": prompt}
+        ])
+        candidate_entities = [e.strip() for e in response.split(",") if e.strip()]
+    except Exception as e:
+        logger.error(f"Error extracting keywords: {e}")
+        candidate_entities = request.question.split()[:2]
     final_entities = []
 
     # For each candidate, compute similarity directly in Neo4j.
@@ -949,7 +980,7 @@ async def cypher_search(request: QuestionRequest):
             except Exception as e:
                 logger.error(f"Error getting embedding for candidate '{candidate}': {e}")
                 continue
-    
+
             cypher_query = """
             WITH $candidate_embedding AS candidateEmbedding
             MATCH (e:Entity)
@@ -962,7 +993,8 @@ async def cypher_search(request: QuestionRequest):
             """
             try:
                 # Execute the similarity query in a separate thread.
-                result = await asyncio.to_thread(run_cypher_query, cypher_query, {"candidate_embedding": candidate_embedding})
+                result = await asyncio.to_thread(run_cypher_query, cypher_query,
+                                                 {"candidate_embedding": candidate_embedding})
             except Exception as e:
                 logger.error(f"Error executing similarity query for candidate '{candidate}': {e}")
                 continue
@@ -1070,6 +1102,7 @@ async def cypher_search(request: QuestionRequest):
         "executed_queries": results
     }
 
+
 # -----------------------------------------------------------------------------
 # Endpoint: Global Search
 # -----------------------------------------------------------------------------
@@ -1078,15 +1111,16 @@ async def global_search(request: GlobalSearchRequest):
     # Rewrite query if previous conversation exists.
     request.question = await rewrite_query_if_needed(request.question, request.previous_conversations)
     final_answer_text = await global_search_map_reduce_plain(
-         question=request.question,
-         conversation_history=request.previous_conversations,
-         doc_id=request.doc_id,
-         chunk_size=GLOBAL_SEARCH_CHUNK_SIZE,
-         top_n=GLOBAL_SEARCH_TOP_N,
-         batch_size=GLOBAL_SEARCH_BATCH_SIZE
+        question=request.question,
+        conversation_history=request.previous_conversations,
+        doc_id=request.doc_id,
+        chunk_size=GLOBAL_SEARCH_CHUNK_SIZE,
+        top_n=GLOBAL_SEARCH_TOP_N,
+        batch_size=GLOBAL_SEARCH_BATCH_SIZE
     )
     # Return the plain text answer wrapped in JSON.
     return {"answer": final_answer_text}
+
 
 # -----------------------------------------------------------------------------
 # Endpoint: Local Search
@@ -1172,6 +1206,7 @@ async def local_search(request: LocalSearchRequest):
     ])
     return {"local_search_answer": answer}
 
+
 # -----------------------------------------------------------------------------
 # Endpoint: Drift Search
 # -----------------------------------------------------------------------------
@@ -1179,13 +1214,13 @@ async def local_search(request: LocalSearchRequest):
 async def drift_search(request: DriftSearchRequest):
     # Step 1: Rewrite the query if previous conversation exists.
     request.question = await rewrite_query_if_needed(request.question, request.previous_conversations)
-    
+
     # -----------------------------
     # Global Search: Cosine Similarity Filtering
     # -----------------------------
     # Compute the query embedding.
     query_embedding = await async_embedding_client.get_embedding(request.question)
-    
+
     # Run a Cypher query to retrieve Chunk nodes similar to the query embedding.
     cypher = """
     WITH $query_embedding AS queryEmbedding
@@ -1198,37 +1233,37 @@ async def drift_search(request: DriftSearchRequest):
     LIMIT $limit
     """
     params = {
-       "query_embedding": query_embedding,
-       "similarity_threshold": 0.4,  # Adjust threshold as needed.
-       "limit": 30
+        "query_embedding": query_embedding,
+        "similarity_threshold": 0.4,  # Adjust threshold as needed.
+        "limit": 30
     }
     similar_chunks = await asyncio.to_thread(run_cypher_query, cypher, params)
-    
+
     # Extract unique doc_ids from the similar chunks.
     related_doc_ids = list({record["doc_id"] for record in similar_chunks})
-    
+
     # Retrieve community summaries for these document IDs.
     community_summaries = {}
     for doc in related_doc_ids:
-         query_cs = """
+        query_cs = """
          MATCH (cs:CommunitySummary {doc_id: $doc_id})
          RETURN cs.community AS community, cs.summary AS summary, cs.embedding AS embedding
          """
-         cs_result = await asyncio.to_thread(run_cypher_query, query_cs, {"doc_id": doc})
-         for record in cs_result:
-             community_summaries[record["community"]] = {
-                 "summary": record["summary"],
-                 "embedding": record["embedding"]
-             }
+        cs_result = await asyncio.to_thread(run_cypher_query, query_cs, {"doc_id": doc})
+        for record in cs_result:
+            community_summaries[record["community"]] = {
+                "summary": record["summary"],
+                "embedding": record["embedding"]
+            }
     if not community_summaries:
-         raise HTTPException(status_code=500, detail="No related community summaries found based on chunk similarity.")
-    
+        raise HTTPException(status_code=500, detail="No related community summaries found based on chunk similarity.")
+
     # Build a global context by concatenating all retrieved community summaries.
     community_reports = [v["summary"] for v in community_summaries.values() if v.get("summary")]
     global_context = "\n\n".join(community_reports)
-    
+
     conversation_context = f"Conversation History:\n{request.previous_conversations}\n\n" if request.previous_conversations else ""
-    
+
     # -----------------------------
     # Primer Phase: Generate Intermediate Answer & Follow-Up Questions
     # -----------------------------
@@ -1251,60 +1286,60 @@ Follow-Up Questions:
 Query: {request.question}
 """
     primer_result = await async_llm.invoke([
-         {"role": "system", "content": "You are a professional assistant."},
-         {"role": "user", "content": primer_prompt}
+        {"role": "system", "content": "You are a professional assistant."},
+        {"role": "user", "content": primer_prompt}
     ])
-    
+
     # Parse the primer result into an intermediate answer and follow-up questions.
     intermediate_answer = ""
     follow_up_questions = []
     if "Intermediate Answer:" in primer_result and "Follow-Up Questions:" in primer_result:
-         parts = primer_result.split("Follow-Up Questions:")
-         intermediate_part = parts[0]
-         follow_up_part = parts[1]
-         if "Intermediate Answer:" in intermediate_part:
-             intermediate_answer = intermediate_part.split("Intermediate Answer:")[1].strip()
-         follow_up_lines = follow_up_part.strip().splitlines()
-         for line in follow_up_lines:
-             line = line.strip()
-             if line:
-                 if line[0].isdigit():
-                     dot_index = line.find('.')
-                     if dot_index != -1:
-                         line = line[dot_index+1:].strip()
-                 follow_up_questions.append(line)
+        parts = primer_result.split("Follow-Up Questions:")
+        intermediate_part = parts[0]
+        follow_up_part = parts[1]
+        if "Intermediate Answer:" in intermediate_part:
+            intermediate_answer = intermediate_part.split("Intermediate Answer:")[1].strip()
+        follow_up_lines = follow_up_part.strip().splitlines()
+        for line in follow_up_lines:
+            line = line.strip()
+            if line:
+                if line[0].isdigit():
+                    dot_index = line.find('.')
+                    if dot_index != -1:
+                        line = line[dot_index + 1:].strip()
+                follow_up_questions.append(line)
     else:
-         # Fallback: treat the entire output as the intermediate answer.
-         intermediate_answer = primer_result.strip()
-    
+        # Fallback: treat the entire output as the intermediate answer.
+        intermediate_answer = primer_result.strip()
+
     drift_hierarchy = {
-         "query": request.question,
-         "answer": intermediate_answer,
-         "follow_ups": []
+        "query": request.question,
+        "answer": intermediate_answer,
+        "follow_ups": []
     }
-    
+
     # -----------------------------
     # Local Phase: Process Each Follow-Up Question Using Local Document Context
     # -----------------------------
     for follow_up in follow_up_questions:
-         local_chunk_query = """
+        local_chunk_query = """
              MATCH (c:Chunk)
              WHERE toLower(c.text) CONTAINS toLower($keyword)
          """
-         if request.doc_id:
-             local_chunk_query += " AND c.doc_id = $doc_id"
-         local_chunk_query += "\nRETURN c.text AS chunk_text\nLIMIT 5"
-         params = {"keyword": follow_up}
-         if request.doc_id:
-             params["doc_id"] = request.doc_id
-         chunk_results = await asyncio.to_thread(run_cypher_query, local_chunk_query, params)
-         local_context_text = ""
-         if chunk_results:
-             chunks = [res.get("chunk_text", "") for res in chunk_results if res.get("chunk_text")]
-             local_context_text = "Related Document Chunks:\n" + "\n---\n".join(chunks) + "\n"
-         
-         local_conversation = f"Conversation History:\n{request.previous_conversations}\n\n" if request.previous_conversations else ""
-         local_prompt = f"""
+        if request.doc_id:
+            local_chunk_query += " AND c.doc_id = $doc_id"
+        local_chunk_query += "\nRETURN c.text AS chunk_text\nLIMIT 5"
+        params = {"keyword": follow_up}
+        if request.doc_id:
+            params["doc_id"] = request.doc_id
+        chunk_results = await asyncio.to_thread(run_cypher_query, local_chunk_query, params)
+        local_context_text = ""
+        if chunk_results:
+            chunks = [res.get("chunk_text", "") for res in chunk_results if res.get("chunk_text")]
+            local_context_text = "Related Document Chunks:\n" + "\n---\n".join(chunks) + "\n"
+
+        local_conversation = f"Conversation History:\n{request.previous_conversations}\n\n" if request.previous_conversations else ""
+        local_prompt = f"""
 You are a professional assistant who refines queries using local document context.
 Based on the following local context:
 {local_context_text}
@@ -1322,37 +1357,37 @@ Follow-Up Questions:
 
 Follow-Up Query: {follow_up}
 """
-         local_result = await async_llm.invoke([
-             {"role": "system", "content": "You are a professional assistant."},
-             {"role": "user", "content": local_prompt}
-         ])
-         
-         local_answer = ""
-         local_follow_ups = []
-         if "Answer:" in local_result and "Follow-Up Questions:" in local_result:
-             parts = local_result.split("Follow-Up Questions:")
-             answer_part = parts[0]
-             follow_up_part = parts[1]
-             if "Answer:" in answer_part:
-                 local_answer = answer_part.split("Answer:")[1].strip()
-             follow_up_lines = follow_up_part.strip().splitlines()
-             for line in follow_up_lines:
-                 line = line.strip()
-                 if line:
-                     if line[0].isdigit():
-                         dot_index = line.find('.')
-                         if dot_index != -1:
-                             line = line[dot_index+1:].strip()
-                     local_follow_ups.append(line)
-         else:
-             local_answer = local_result.strip()
-         
-         drift_hierarchy["follow_ups"].append({
-             "query": follow_up,
-             "answer": local_answer,
-             "follow_ups": local_follow_ups
-         })
-    
+        local_result = await async_llm.invoke([
+            {"role": "system", "content": "You are a professional assistant."},
+            {"role": "user", "content": local_prompt}
+        ])
+
+        local_answer = ""
+        local_follow_ups = []
+        if "Answer:" in local_result and "Follow-Up Questions:" in local_result:
+            parts = local_result.split("Follow-Up Questions:")
+            answer_part = parts[0]
+            follow_up_part = parts[1]
+            if "Answer:" in answer_part:
+                local_answer = answer_part.split("Answer:")[1].strip()
+            follow_up_lines = follow_up_part.strip().splitlines()
+            for line in follow_up_lines:
+                line = line.strip()
+                if line:
+                    if line[0].isdigit():
+                        dot_index = line.find('.')
+                        if dot_index != -1:
+                            line = line[dot_index + 1:].strip()
+                    local_follow_ups.append(line)
+        else:
+            local_answer = local_result.strip()
+
+        drift_hierarchy["follow_ups"].append({
+            "query": follow_up,
+            "answer": local_answer,
+            "follow_ups": local_follow_ups
+        })
+
     # -----------------------------
     # Reduction Phase: Synthesize Final Answer Using the Full Hierarchy
     # -----------------------------
@@ -1367,16 +1402,16 @@ Intermediate Answer: {drift_hierarchy["answer"]}
 Follow-Up Interactions:
 """
     for idx, fu in enumerate(drift_hierarchy["follow_ups"], start=1):
-         reduction_prompt += f"\nFollow-Up {idx}:\nQuery: {fu['query']}\nAnswer: {fu['answer']}\n"
-         if fu["follow_ups"]:
-             reduction_prompt += "Additional Follow-Ups: " + ", ".join(fu["follow_ups"]) + "\n"
+        reduction_prompt += f"\nFollow-Up {idx}:\nQuery: {fu['query']}\nAnswer: {fu['answer']}\n"
+        if fu["follow_ups"]:
+            reduction_prompt += "Additional Follow-Ups: " + ", ".join(fu["follow_ups"]) + "\n"
     reduction_prompt += f"\nBased solely on the above, provide a final, comprehensive answer in plain text to the original query:\n{request.question}"
-    
+
     final_answer = await async_llm.invoke([
-         {"role": "system", "content": "You are a professional assistant."},
-         {"role": "user", "content": reduction_prompt}
+        {"role": "system", "content": "You are a professional assistant."},
+        {"role": "user", "content": reduction_prompt}
     ])
-    
+
     return {"drift_search_answer": final_answer.strip(), "drift_hierarchy": drift_hierarchy}
 
 
@@ -1399,6 +1434,7 @@ async def list_documents():
     except Exception as e:
         logger.error(f"Error listing documents: {e}")
         raise HTTPException(status_code=500, detail="Error listing documents")
+
 
 # -----------------------------------------------------------------------------
 # Endpoint: Delete Document
@@ -1426,6 +1462,7 @@ async def delete_document(request: DeleteDocumentRequest):
         logger.error(f"Error deleting document: {e}")
         raise HTTPException(status_code=500, detail=f"Error deleting document: {e}")
 
+
 # -----------------------------------------------------------------------------
 # Endpoint: Get Communities
 # -----------------------------------------------------------------------------
@@ -1442,6 +1479,7 @@ async def get_communities(doc_id: Optional[str] = None):
     except Exception as e:
         logger.error(f"Error detecting communities: {e}")
         raise HTTPException(status_code=500, detail=f"Error detecting communities: {e}")
+
 
 # -----------------------------------------------------------------------------
 # Endpoint: Get Community Summaries
@@ -1460,6 +1498,7 @@ async def community_summaries(doc_id: Optional[str] = None):
         logger.error(f"Error generating community summaries: {e}")
         raise HTTPException(status_code=500, detail=f"Error generating community summaries: {e}")
 
+
 # -----------------------------------------------------------------------------
 # Root Endpoint
 # -----------------------------------------------------------------------------
@@ -1471,9 +1510,11 @@ async def root():
     """
     return {"message": "GraphRAG API is running."}
 
+
 # -----------------------------------------------------------------------------
 # Main entry point: Start the application using Uvicorn.
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host=APP_HOST, port=APP_PORT)
