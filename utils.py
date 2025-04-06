@@ -20,8 +20,19 @@ logger = logging.getLogger(__name__)
 
 # Ensure environment variables are loaded
 load_dotenv()
-
+# Load from environment
 CHUNK_SIZE_GDS = int(os.getenv("CHUNK_SIZE_GDS", "512"))
+COSINE_EPSILON = float(os.getenv("COSINE_EPSILON", "1e-8"))
+NER_MAX_RETRIES = int(os.getenv("NER_MAX_RETRIES", "3"))
+SUMMARY_TRUNCATE_CHARS = int(os.getenv("SUMMARY_TRUNCATE_CHARS", "200"))
+RELEVANCE_SCORE_MAX = int(os.getenv("RELEVANCE_SCORE_MAX", "100"))
+RELEVANCE_SCORE_MIN = int(os.getenv("RELEVANCE_SCORE_MIN", "1"))
+# Prompt templates from .env
+NER_EXTRACTION_PROMPT = os.getenv("NER_EXTRACTION_PROMPT")
+NER_SYSTEM_PROMPT = os.getenv("NER_SYSTEM_PROMPT")
+SYSTEM_MESSAGE_GENERIC = os.getenv("SYSTEM_MESSAGE_GENERIC")
+RERANKING_PROMPT = os.getenv("RERANKING_PROMPT")
+RERANKING_SYSTEM_PROMPT = os.getenv("RERANKING_SYSTEM_PROMPT")
 
 class AsyncOpenAI:
     def __init__(self, api_key: str, model: str, base_url: str, temperature: float, stop: list, timeout: int):
@@ -148,8 +159,7 @@ def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
     """
     from numpy import dot
     from numpy.linalg import norm
-    return dot(vec1, vec2) / (norm(vec1) * norm(vec2) + 1e-8)
-
+    return dot(vec1, vec2) / (norm(vec1) * norm(vec2) + COSINE_EPSILON)
 
 def run_cypher_query(driver, query: str, parameters: Dict[str, Any] = {}) -> List[Dict[str, Any]]:
     """
@@ -174,31 +184,21 @@ def get_refined_system_message() -> str:
     """
     Return a refined system message instructing the LLM to return valid JSON.
     """
-    return "You are a professional assistant. Please provide a detailed answer."
+    return SYSTEM_MESSAGE_GENERIC
 
 
 async def extract_entities_with_llm(text: str) -> List[Dict[str, str]]:
     async_llm = get_async_llm()
-    prompt = (
-            "Extract all named entities from the following text. For each entity, provide its name and type (e.g., "
-            "cardinal value, date value, event name, building name, geo-political entity, language name, law name, "
-            "money name, person name, organization name, location name, affiliation, ordinal value, percent value, "
-            "product name, quantity value, time value, name of work of art). If uncertain, label it as 'UNKNOWN'. "
-            "Return ONLY a valid Python list of dictionaries (without any additional text or markdown) in the exact "
-            "format as example below:"
-            "[{'name': 'Entity1', 'type': 'Type1'}, {'name': 'Entity2', 'type': 'Type3'}, ...].\n\n" + text
-    )
-    max_retries = 3
+    prompt = NER_EXTRACTION_PROMPT + text
+    max_retries = NER_MAX_RETRIES
     for attempt in range(max_retries):
         try:
             response = await async_llm.invoke_json([
-                {"role": "system", "content": "You are a professional NER extraction assistant who responds only in "
-                                              "valid python list of dictionaries."},
+                {"role": "system", "content": NER_SYSTEM_PROMPT},
                 {"role": "user", "content": prompt}
             ])
             logger.debug(f"LLM response for NER extraction (attempt {attempt + 1}): {response}")
 
-            # Try to isolate the Python list from the response.
             start = response.find('[')
             end = response.rfind(']')
             if start == -1 or end == -1:
@@ -207,9 +207,7 @@ async def extract_entities_with_llm(text: str) -> List[Dict[str, str]]:
             try:
                 entities = ast.literal_eval(list_str)
             except Exception as eval_error:
-                # Fallback: try to extract using regex
                 logger.error(f"ast.literal_eval failed: {eval_error}. Attempting regex extraction.")
-                # This regex looks for patterns like: ['name': '...', 'type': '...']
                 pattern = r"\[\s*'name':\s*'(.*?)',\s*'type':\s*'(.*?)'\s*\]"
                 matches = re.findall(pattern, list_str)
                 if matches:
@@ -228,28 +226,18 @@ async def extract_entities_with_llm(text: str) -> List[Dict[str, str]]:
             logger.error(f"NER extraction attempt {attempt + 1} failed: {e}")
             if attempt == max_retries - 1:
                 return []
-            await asyncio.sleep(1)  # wait a moment before retrying
+            await asyncio.sleep(1)
 
 async def rerank_community_reports(question: str, community_reports: list[dict]) -> list[dict]:
-    """
-    Uses an LLM to dynamically rerank community reports based on relevance to the user query.
-    Each community report is a dict with a "summary" field.
-    """
-    # Create an instance of async_llm using the helper function
     async_llm = get_async_llm()
 
-    prompt = (
-        "You are an expert in evaluating textual information. Below are several community summaries. "
-        "For the given user query, please rank these summaries in order of relevance from most to least relevant. "
-        "For each summary, provide a JSON object containing:\n"
-        "  - 'report_index': the index number (starting from 1) of the summary as listed below\n"
-        "  - 'score': an integer between 1 and 100 indicating its relevance (100 being most relevant)\n"
-        "Return the results as a JSON array sorted in descending order by score.\n"
-        f"User Query: \"{question}\"\n"
-        "Community Summaries:\n"
+    prompt = RERANKING_PROMPT.format(
+        question=question,
+        RELEVANCE_SCORE_MIN=RELEVANCE_SCORE_MIN,
+        RELEVANCE_SCORE_MAX=RELEVANCE_SCORE_MAX
     )
     for idx, report in enumerate(community_reports, start=1):
-        summary_text = report.get("summary", "")[:200]  # limit to first 200 characters for brevity
+        summary_text = report.get("summary", "")[:SUMMARY_TRUNCATE_CHARS]
         prompt += f"Report {idx}: \"{summary_text}\"\n"
     prompt += (
         "\nYour JSON output should be in the format: "
@@ -258,7 +246,7 @@ async def rerank_community_reports(question: str, community_reports: list[dict])
 
     try:
         llm_response = await async_llm.invoke([
-            {"role": "system", "content": "You are an expert at ranking textual information."},
+            {"role": "system", "content": RERANKING_SYSTEM_PROMPT},
             {"role": "user", "content": prompt}
         ])
         ranking = json.loads(llm_response)
@@ -270,4 +258,4 @@ async def rerank_community_reports(question: str, community_reports: list[dict])
         return sorted_reports
     except Exception as e:
         logger.error(f"Error during LLM-based reranking of community reports: {e}")
-        return community_reports  # Fallback to original order if something goes wrong.
+        return community_reports
