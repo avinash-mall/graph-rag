@@ -42,8 +42,32 @@ GLOBAL_SEARCH_TOP_N = int(os.getenv("GLOBAL_SEARCH_TOP_N") or "30")
 GLOBAL_SEARCH_BATCH_SIZE = int(os.getenv("GLOBAL_SEARCH_BATCH_SIZE") or "10")
 RELEVANCE_THRESHOLD = float(os.getenv("RELEVANCE_THRESHOLD") or "0.40")
 CYPHER_QUERY_LIMIT = int(os.getenv("CYPHER_QUERY_LIMIT", "5"))
-
+LOCAL_SEARCH_RELEVANCE_THRESHOLD = float(os.getenv("LOCAL_SEARCH_RELEVANCE_THRESHOLD", "0.3"))
+LOCAL_SEARCH_TOP_K = int(os.getenv("LOCAL_SEARCH_TOP_K", "3"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+# Prompt templates from .env
+REWRITE_SYSTEM_PROMPT = os.getenv("REWRITE_SYSTEM_PROMPT")
+REWRITE_USER_PROMPT = os.getenv("REWRITE_USER_PROMPT")
+
+GSEARCH_EXTRACT_SYSTEM_PROMPT = os.getenv("GSEARCH_EXTRACT_SYSTEM_PROMPT")
+GSEARCH_EXTRACT_USER_PROMPT = os.getenv("GSEARCH_EXTRACT_USER_PROMPT")
+
+GSEARCH_RERANK_SYSTEM_PROMPT = os.getenv("GSEARCH_RERANK_SYSTEM_PROMPT")
+GSEARCH_RERANK_USER_PROMPT = os.getenv("GSEARCH_RERANK_USER_PROMPT")
+
+GSEARCH_FINAL_SYSTEM_PROMPT = os.getenv("GSEARCH_FINAL_SYSTEM_PROMPT")
+
+LSEARCH_SYSTEM_PROMPT = os.getenv("LSEARCH_SYSTEM_PROMPT")
+LSEARCH_USER_PROMPT = os.getenv("LSEARCH_USER_PROMPT")
+
+DRIFT_PRIMER_SYSTEM_PROMPT = os.getenv("DRIFT_PRIMER_SYSTEM_PROMPT")
+DRIFT_PRIMER_USER_PROMPT = os.getenv("DRIFT_PRIMER_USER_PROMPT")
+
+DRIFT_LOCAL_SYSTEM_PROMPT = os.getenv("DRIFT_LOCAL_SYSTEM_PROMPT")
+DRIFT_LOCAL_USER_PROMPT = os.getenv("DRIFT_LOCAL_USER_PROMPT")
+
+DRIFT_FINAL_SYSTEM_PROMPT = os.getenv("DRIFT_FINAL_SYSTEM_PROMPT")
+DRIFT_FINAL_USER_PROMPT = os.getenv("DRIFT_FINAL_USER_PROMPT")
 
 logging.basicConfig(
     level=LOG_LEVEL,
@@ -167,17 +191,11 @@ async_embedding_client = AsyncEmbeddingAPIClient()
 # Helper Functions for Search
 # ----------------------------
 async def rewrite_query_if_needed(question: str, conversation_history: Optional[str]) -> str:
-    """
-    Rewrite a user query into a standalone query if conversation history is provided.
-    """
     if conversation_history:
-        rewrite_prompt = (
-            f"Based on the previous conversation: '{conversation_history}', "
-            f"rewrite the query: '{question}' into a standalone query."
-        )
+        user_prompt = REWRITE_USER_PROMPT.format(conversation=conversation_history, question=question)
         rewritten_query = await async_llm.invoke([
-            {"role": "system", "content": "You are a professional query rewriting assistant."},
-            {"role": "user", "content": rewrite_prompt}
+            {"role": "system", "content": REWRITE_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt}
         ])
         return rewritten_query.strip()
     return question
@@ -238,19 +256,13 @@ async def global_search_map_reduce_plain(
         chunks = chunk_text(report["summary"], max_chunk_size=chunk_size)
         for i in range(0, len(chunks), batch_size):
             batch = chunks[i:i + batch_size]
-            batch_prompt = (
-                "You are an expert in extracting key points. For the following text chunks from a community summary, "
-                "list the key points that are most relevant to answering the user query. For each key point, provide "
-                "a brief description and assign a relevance rating between 1 and 100. "
-                "Format each key point on a separate line in this format:\n"
-                "Key point: <description> (Rating: <number>)\n\n"
-            )
+            batch_prompt = GSEARCH_EXTRACT_USER_PROMPT + "\n\n"
             for idx, chunk in enumerate(batch):
                 batch_prompt += f"Chunk {idx + 1}:\n\"\"\"\n{chunk}\n\"\"\"\n\n"
             batch_prompt += f"User Query: \"{question}\"\n"
             try:
                 response = await async_llm.invoke([
-                    {"role": "system", "content": "You are a professional extraction assistant."},
+                    {"role": "system", "content": GSEARCH_EXTRACT_SYSTEM_PROMPT},
                     {"role": "user", "content": batch_prompt}
                 ])
                 intermediate_points.append(response.strip())
@@ -259,18 +271,10 @@ async def global_search_map_reduce_plain(
     aggregated_key_points = "\n".join(intermediate_points)
 
     # Step 4.5: Use LLM prompting to rerank the aggregated key points.
-    rerank_prompt = (
-        "You are an expert at evaluating the relevance of key points extracted from community summaries. "
-        "Below are key points extracted from the documents, each on a separate line. Please rerank them in descending "
-        "order of relevance to the following user query, and output the reranked key points as a plain text list, "
-        "each on a separate line.\n"
-        f"User Query: \"{question}\"\n"
-        "Key Points:\n" + aggregated_key_points + "\n"
-        "Output the reranked key points in order (most relevant first), preserving their original text.\n"
-    )
+    rerank_prompt = GSEARCH_RERANK_USER_PROMPT.format(question=question, points=aggregated_key_points)
     try:
         reranked_key_points = await async_llm.invoke([
-            {"role": "system", "content": "You are an expert at ranking key points."},
+            {"role": "system", "content": GSEARCH_RERANK_SYSTEM_PROMPT},
             {"role": "user", "content": rerank_prompt}
         ])
     except Exception as e:
@@ -280,16 +284,13 @@ async def global_search_map_reduce_plain(
     conv_text = f"Conversation History: {conversation_history}\n" if conversation_history else ""
 
     # Step 5: Build a reduction prompt using the reranked key points to generate the final answer.
-    reduce_prompt = f"""
-{conv_text}You are a professional assistant tasked with synthesizing a detailed answer from the following reranked key points:
-{reranked_key_points}
+    reduce_prompt = GSEARCH_FINAL_SYSTEM_PROMPT + "\n\n"
+    reduce_prompt += f"{'Conversation History: ' + conversation_history if conversation_history else ''}\n"
+    reduce_prompt += f"You are a professional assistant tasked with synthesizing a detailed answer from the following reranked key points:\n{reranked_key_points}\n\n"
+    reduce_prompt += f"User Query: \"{question}\"\n\nUsing only the above key points, generate a comprehensive and detailed answer in plain text that directly addresses the query."
 
-User Query: "{question}"
-
-Using only the above key points, generate a comprehensive and detailed answer in plain text that directly addresses the query. Please include a clear summary and explanation that ties together all key points.
-"""
     final_answer = await async_llm.invoke([
-        {"role": "system", "content": "You are a professional assistant providing detailed answers."},
+        {"role": "system", "content": GSEARCH_FINAL_SYSTEM_PROMPT},
         {"role": "user", "content": reduce_prompt}
     ])
 
@@ -544,11 +545,10 @@ async def local_search(request: LocalSearchRequest):
                 summary_embedding = info["embedding"]
                 score = cosine_similarity(query_embedding, summary_embedding)
                 scored_summaries.append((comm, info["summary"], score))
-        threshold = 0.3
+        threshold = LOCAL_SEARCH_RELEVANCE_THRESHOLD
         filtered_summaries = [(comm, summary, score) for comm, summary, score in scored_summaries if score >= threshold]
         filtered_summaries.sort(key=lambda x: x[2], reverse=True)
-        top_k = 3
-        top_summaries = filtered_summaries[:top_k]
+        top_summaries = filtered_summaries[:LOCAL_SEARCH_TOP_K]
         community_context = "Community Summaries (ranked by similarity):\n" + "\n".join(
             [f"{comm}: {summary} (Score: {score:.2f})" for comm, summary, score in top_summaries]
         ) + "\n"
@@ -576,16 +576,10 @@ async def local_search(request: LocalSearchRequest):
     else:
         text_unit_context = "No document text units found.\n"
     combined_context = conversation_context + community_context + text_unit_context
-    prompt_template = (
-        "You are a professional assistant who answers queries strictly based on the provided context.\n\n"
-        "Context:\n{context}\n\n"
-        "Question: {question}\n\n"
-        "Answer:"
-    )
-    prompt = prompt_template.format(context=combined_context, question=request.question)
+    prompt = LSEARCH_USER_PROMPT.format(context=combined_context, question=request.question)
     logger.debug(f"Local search prompt:\n{prompt}")
     answer = await async_llm.invoke([
-        {"role": "system", "content": "You are a professional assistant who answers strictly based on the provided context."},
+        {"role": "system", "content": LSEARCH_SYSTEM_PROMPT},
         {"role": "user", "content": prompt}
     ])
     return {"local_search_answer": answer}
@@ -632,26 +626,13 @@ async def drift_search(request: DriftSearchRequest):
     community_reports = [v["summary"] for v in community_summaries.values() if v.get("summary")]
     random.shuffle(community_reports)
     # Primer Phase
-    primer_prompt = f"""
-You are an expert in synthesizing information from diverse community reports.
-Based on the following global context derived from document similarity filtering:
-{ "\n".join(community_reports) }
-{"Conversation History:\n" + request.previous_conversations if request.previous_conversations else ""}
-Please provide a preliminary answer to the following query and list any follow-up questions that could help refine it.
-Format your response as plain text with the following sections:
-
-Intermediate Answer:
-<your intermediate answer here>
-
-Follow-Up Questions:
-1. <first follow-up question>
-2. <second follow-up question>
-... 
-
-Query: {request.question}
-"""
+    primer_prompt = DRIFT_PRIMER_USER_PROMPT.format(
+        context="\n".join(community_reports),
+        conversation=f"Conversation History:\n{request.previous_conversations}" if request.previous_conversations else "",
+        question=request.question
+    )
     primer_result = await async_llm.invoke([
-        {"role": "system", "content": "You are a professional assistant."},
+        {"role": "system", "content": DRIFT_PRIMER_SYSTEM_PROMPT},
         {"role": "user", "content": primer_prompt}
     ])
     intermediate_answer = ""
@@ -696,26 +677,13 @@ Query: {request.question}
             chunks = [res.get("chunk_text", "") for res in chunk_results if res.get("chunk_text")]
             local_context_text = "Related Document Chunks:\n" + "\n---\n".join(chunks) + "\n"
         local_conversation = f"Conversation History:\n{request.previous_conversations}\n\n" if request.previous_conversations else ""
-        local_prompt = f"""
-You are a professional assistant who refines queries using local document context.
-Based on the following local context:
-{local_context_text}
-{local_conversation}
-Please provide an answer to the following follow-up query and list any additional follow-up questions.
-Format your response as plain text with these sections:
-
-Answer:
-<your answer here>
-
-Follow-Up Questions:
-1. <first follow-up question>
-2. <second follow-up question>
-...
-
-Follow-Up Query: {follow_up}
-"""
+        local_prompt = DRIFT_LOCAL_USER_PROMPT.format(
+            local_context=local_context_text,
+            conversation=local_conversation,
+            query=follow_up
+        )
         local_result = await async_llm.invoke([
-            {"role": "system", "content": "You are a professional assistant."},
+            {"role": "system", "content": DRIFT_LOCAL_SYSTEM_PROMPT},
             {"role": "user", "content": local_prompt}
         ])
         local_answer = ""
@@ -743,23 +711,19 @@ Follow-Up Query: {follow_up}
             "follow_ups": local_follow_ups
         })
     # Reduction Phase
-    reduction_prompt = f"""
-You are a professional assistant tasked with synthesizing a final detailed answer.
-Below is the hierarchical data gathered:
+    reduction_prompt = DRIFT_FINAL_USER_PROMPT.format(
+        query=drift_hierarchy["query"],
+        intermediate=drift_hierarchy["answer"],
+        follow_ups="\n".join([
+            f"Follow-Up {i + 1}:\nQuery: {fu['query']}\nAnswer: {fu['answer']}\n"
+            + (f"Additional Follow-Ups: {', '.join(fu['follow_ups'])}" if fu["follow_ups"] else "")
+            for i, fu in enumerate(drift_hierarchy["follow_ups"])
+        ]),
+        original_query=request.question
+    )
 
-Query: {drift_hierarchy["query"]}
-
-Intermediate Answer: {drift_hierarchy["answer"]}
-
-Follow-Up Interactions:
-"""
-    for idx, fu in enumerate(drift_hierarchy["follow_ups"], start=1):
-        reduction_prompt += f"\nFollow-Up {idx}:\nQuery: {fu['query']}\nAnswer: {fu['answer']}\n"
-        if fu["follow_ups"]:
-            reduction_prompt += "Additional Follow-Ups: " + ", ".join(fu["follow_ups"]) + "\n"
-    reduction_prompt += f"\nBased solely on the above, provide a final, comprehensive answer in plain text to the original query:\n{request.question}"
     final_answer = await async_llm.invoke([
-        {"role": "system", "content": "You are a professional assistant."},
+        {"role": "system", "content": DRIFT_FINAL_SYSTEM_PROMPT},
         {"role": "user", "content": reduction_prompt}
     ])
     return {"drift_search_answer": final_answer.strip(), "drift_hierarchy": drift_hierarchy}
