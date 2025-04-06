@@ -41,9 +41,12 @@ if OPENAI_STOP:
     import json
     OPENAI_STOP = json.loads(OPENAI_STOP)
 API_TIMEOUT = int(os.getenv("API_TIMEOUT") or "600")
-
+EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "mxbai-embed-large")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-
+COREF_SYSTEM_PROMPT = os.getenv("COREF_SYSTEM_PROMPT")
+COREF_USER_PROMPT = os.getenv("COREF_USER_PROMPT")
+SUMMARY_SYSTEM_PROMPT = os.getenv("SUMMARY_SYSTEM_PROMPT")
+SUMMARY_USER_PROMPT = os.getenv("SUMMARY_USER_PROMPT")
 logging.basicConfig(
     level=LOG_LEVEL,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -134,14 +137,12 @@ async def resolve_coreferences_in_parts(text: str) -> str:
     """
     words = text.split()
     parts = [" ".join(words[i:i + COREF_WORD_LIMIT]) for i in range(0, len(words), COREF_WORD_LIMIT)]
+
     async def process_part(part: str, idx: int) -> str:
-        prompt = (
-            "Resolve all ambiguous pronouns and vague references in the following text by replacing them with their appropriate entities. "
-            "Ensure no unresolved pronouns like 'he', 'she', 'himself', etc. remain. "
-            "If the referenced entity is unclear, make an intelligent guess based on context.\n\n" + part)
+        prompt = COREF_USER_PROMPT + part
         try:
             resolved_text = await async_llm.invoke([
-                {"role": "system", "content": "You are a professional text refiner skilled in coreference resolution."},
+                {"role": "system", "content": COREF_SYSTEM_PROMPT},
                 {"role": "user", "content": prompt}
             ])
             logger.info(f"Coreference resolution successful for part {idx + 1}/{len(parts)}.")
@@ -149,6 +150,7 @@ async def resolve_coreferences_in_parts(text: str) -> str:
         except Exception as e:
             logger.warning(f"Coreference resolution failed for part {idx + 1}/{len(parts)}: {e}")
             return part
+
     resolved_parts = await asyncio.gather(*[process_part(part, idx) for idx, part in enumerate(parts)])
     combined_text = " ".join(resolved_parts)
     filtered_text = re.sub(
@@ -158,6 +160,7 @@ async def resolve_coreferences_in_parts(text: str) -> str:
         flags=re.IGNORECASE
     )
     return filtered_text.strip()
+
 
 def get_refined_system_message() -> str:
     """
@@ -230,7 +233,7 @@ class AsyncEmbeddingAPIClient:
             self.logger.info(f"Embedding for text (hash: {text_hash}) retrieved from cache.")
             return self.cache[text_hash]
         self.logger.info("Requesting embedding for text (first 50 chars): %s", text[:50])
-        payload = {"model": "mxbai-embed-large", "input": text}
+        payload = {"model": EMBEDDING_MODEL_NAME, "input": text}
         async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
             response = await client.post(
                 url=self.embedding_api_url,
@@ -333,15 +336,13 @@ class GraphManager:
         logger.info("Graph construction complete.")
 
     async def store_community_summaries(self, doc_id: str) -> None:
-        # Use the new community detection function.
         communities = await detect_communities(doc_id)
         logger.debug(f"detect_communities returned: {communities}")
         if not communities:
-            # Fallback to a default community if nothing is detected.
             communities = {"default": ["No communities detected."]}
+
         with driver.session() as session:
             for comm, entities in communities.items():
-                # Retrieve aggregated text from chunks that mention any entity in this community.
                 chunk_query = """
                     MATCH (e:Entity {doc_id: $doc_id})-[:MENTIONED_IN]->(c:Chunk)
                     WHERE toLower(e.name) IN $entity_names AND c.text IS NOT NULL AND c.text <> ""
@@ -359,24 +360,18 @@ class GraphManager:
                     logger.warning(f"No content found for community {comm}. Skipping community summary creation.")
                     continue
 
-                # Generate a community summary using the LLM.
-                prompt = (
-                        "Summarize the following text into a meaningful summary with key insights. "
-                        "If the text is too short or unclear, describe the entities and their possible connections. "
-                        "Avoid vague fillers.\n\n" + aggregated_text
-                )
+                prompt = SUMMARY_USER_PROMPT + aggregated_text
                 summary = await async_llm.invoke([
-                    {
-                        "role": "system",
-                        "content": "You are a professional summarization assistant. Do not use your prior knowledge and only use knowledge from the provided text."
-                    },
+                    {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
                     {"role": "user", "content": prompt}
                 ])
+
                 try:
                     summary_embedding = await async_embedding_client.get_embedding(summary)
                 except Exception as e:
                     logger.error(f"Failed to generate embedding for summary of community {comm}: {e}")
                     summary_embedding = []
+
                 store_query = """
                     MERGE (cs:CommunitySummary {doc_id: $doc_id, community: $community})
                     SET cs.summary = $summary, cs.embedding = $embedding, cs.timestamp = $timestamp
@@ -390,6 +385,7 @@ class GraphManager:
                     timestamp=datetime.now().isoformat()
                 )
         logger.info("Stored community summaries.")
+
 
 class GraphManagerWrapper:
     def __init__(self):
