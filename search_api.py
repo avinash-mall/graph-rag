@@ -1,729 +1,312 @@
-from __future__ import annotations
+"""
+Search API using the unified search pipeline.
+
+Features:
+- Single unified search endpoint replacing multiple complex endpoints
+- Proper chunk retrieval based on relevance
+- Better context filtering and ranking
+- Comprehensive logging and metrics
+- Vector similarity search with graph-based context expansion
+"""
+
 import asyncio
-import hashlib
 import logging
 import os
-import json
-import random
-import re
-from typing import List, Dict, Any, Optional, Union, Tuple
+from typing import Optional, List
+from datetime import datetime
 
-import urllib3
-import httpx
-from dotenv import load_dotenv
 from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
 from neo4j import GraphDatabase
-from pydantic import BaseModel
+from dotenv import load_dotenv
 
-from utils import run_async, clean_text, chunk_text, cosine_similarity, run_cypher_query, get_refined_system_message, \
-    extract_entities_with_llm, rerank_community_reports, get_async_llm
+from unified_search import get_search_pipeline, SearchScope, SearchResult
+from utils import run_cypher_query_async
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 load_dotenv()
 
-# Global Configuration for search
-APP_HOST = os.getenv("APP_HOST") or "0.0.0.0"
-APP_PORT = int(os.getenv("APP_PORT") or "8000")
-GRAPH_NAME = os.getenv("GRAPH_NAME")
+# Configuration
 DB_URL = os.getenv("DB_URL")
 DB_USERNAME = os.getenv("DB_USERNAME")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL") or "llama3.2"
-OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")
-OPENAI_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE") or "0.0")
-OPENAI_STOP = os.getenv("OPENAI_STOP")
-if OPENAI_STOP:
-    OPENAI_STOP = json.loads(OPENAI_STOP)
-API_TIMEOUT = int(os.getenv("API_TIMEOUT") or "600")
-
-GLOBAL_SEARCH_CHUNK_SIZE = int(os.getenv("GLOBAL_SEARCH_CHUNK_SIZE") or "512")
-GLOBAL_SEARCH_TOP_N = int(os.getenv("GLOBAL_SEARCH_TOP_N") or "30")
-GLOBAL_SEARCH_BATCH_SIZE = int(os.getenv("GLOBAL_SEARCH_BATCH_SIZE") or "10")
-RELEVANCE_THRESHOLD = float(os.getenv("RELEVANCE_THRESHOLD") or "0.40")
-CYPHER_QUERY_LIMIT = int(os.getenv("CYPHER_QUERY_LIMIT", "5"))
-LOCAL_SEARCH_RELEVANCE_THRESHOLD = float(os.getenv("LOCAL_SEARCH_RELEVANCE_THRESHOLD", "0.3"))
-LOCAL_SEARCH_TOP_K = int(os.getenv("LOCAL_SEARCH_TOP_K", "3"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-# Prompt templates from .env
-REWRITE_SYSTEM_PROMPT = os.getenv("REWRITE_SYSTEM_PROMPT")
-REWRITE_USER_PROMPT = os.getenv("REWRITE_USER_PROMPT")
 
-GSEARCH_EXTRACT_SYSTEM_PROMPT = os.getenv("GSEARCH_EXTRACT_SYSTEM_PROMPT")
-GSEARCH_EXTRACT_USER_PROMPT = os.getenv("GSEARCH_EXTRACT_USER_PROMPT")
-
-GSEARCH_RERANK_SYSTEM_PROMPT = os.getenv("GSEARCH_RERANK_SYSTEM_PROMPT")
-GSEARCH_RERANK_USER_PROMPT = os.getenv("GSEARCH_RERANK_USER_PROMPT")
-
-GSEARCH_FINAL_SYSTEM_PROMPT = os.getenv("GSEARCH_FINAL_SYSTEM_PROMPT")
-
-LSEARCH_SYSTEM_PROMPT = os.getenv("LSEARCH_SYSTEM_PROMPT")
-LSEARCH_USER_PROMPT = os.getenv("LSEARCH_USER_PROMPT")
-
-DRIFT_PRIMER_SYSTEM_PROMPT = os.getenv("DRIFT_PRIMER_SYSTEM_PROMPT")
-DRIFT_PRIMER_USER_PROMPT = os.getenv("DRIFT_PRIMER_USER_PROMPT")
-
-DRIFT_LOCAL_SYSTEM_PROMPT = os.getenv("DRIFT_LOCAL_SYSTEM_PROMPT")
-DRIFT_LOCAL_USER_PROMPT = os.getenv("DRIFT_LOCAL_USER_PROMPT")
-
-DRIFT_FINAL_SYSTEM_PROMPT = os.getenv("DRIFT_FINAL_SYSTEM_PROMPT")
-DRIFT_FINAL_USER_PROMPT = os.getenv("DRIFT_FINAL_USER_PROMPT")
-
-logging.basicConfig(
-    level=LOG_LEVEL,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-)
+# Setup logging
+logging.basicConfig(level=LOG_LEVEL)
 logger = logging.getLogger("SearchAPI")
 
 # Initialize Neo4j driver
 driver = GraphDatabase.driver(DB_URL, auth=(DB_USERNAME, DB_PASSWORD))
 
-# Pydantic models for search endpoints
-class QuestionRequest(BaseModel):
-    question: str
-    doc_id: Optional[Union[str, List[str]]] = None
-    previous_conversations: Optional[str] = None
+# Pydantic models
+class SearchRequest(BaseModel):
+    question: str = Field(..., description="The question to search for")
+    conversation_history: Optional[str] = Field(None, description="Previous conversation context")
+    doc_id: Optional[str] = Field(None, description="Specific document ID to search within")
+    scope: Optional[str] = Field("hybrid", description="Search scope: global, local, or hybrid")
+    max_chunks: Optional[int] = Field(7, description="Maximum number of chunks to use in answer")
 
-class LocalSearchRequest(BaseModel):
-    question: str
-    doc_id: Optional[str] = None
-    previous_conversations: Optional[str] = None
+class SearchResponse(BaseModel):
+    answer: str
+    confidence_score: float
+    chunks_used: int
+    entities_found: List[str]
+    search_time: float
+    metadata: dict
 
-class DriftSearchRequest(BaseModel):
-    question: str
-    previous_conversations: Optional[str] = None
-    doc_id: Optional[str] = None
+class QuickSearchRequest(BaseModel):
+    question: str = Field(..., description="Quick question for simple search")
+    doc_id: Optional[str] = Field(None, description="Optional document ID")
 
-class GlobalSearchRequest(BaseModel):
-    question: str
-    previous_conversations: Optional[str] = None
-    doc_id: Optional[str] = None
-
-# ----------------------------
-# Asynchronous API Clients (Actual Implementations)
-# ----------------------------
-class AsyncOpenAI:
-    """
-    Asynchronous client for interacting with the OpenAI API.
-    """
-    def __init__(self, api_key: str, model: str, base_url: str, temperature: float, stop: list, timeout: int):
-        self.api_key = api_key
-        self.model = model
-        self.base_url = base_url
-        self.temperature = temperature
-        self.stop = stop
-        self.timeout = timeout
-
-    async def invoke(self, messages: list) -> str:
-        payload = {
-            "model": self.model,
-            "messages": messages,
-            "temperature": self.temperature,
-            "stop": self.stop
-        }
-        logger.debug(f"LLM Payload Sent: {json.dumps(payload, indent=2)}")
-        headers = {"Authorization": f"Bearer {self.api_key}"}
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
-            response = await client.post(self.base_url, json=payload, headers=headers)
-            response.raise_for_status()
-            data = response.json()
-            content = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-            return content
-
-    async def invoke_json(self, messages: list, fallback: bool = True) -> str:
-        primary_messages = [{"role": "system", "content": get_refined_system_message()}] + messages
-        response_text = await self.invoke(primary_messages)
-        return response_text
-
-async_llm = AsyncOpenAI(
-    api_key=OPENAI_API_KEY,
-    model=OPENAI_MODEL,
-    base_url=OPENAI_BASE_URL,
-    temperature=OPENAI_TEMPERATURE,
-    stop=OPENAI_STOP,
-    timeout=API_TIMEOUT
-)
-
-class AsyncEmbeddingAPIClient:
-    """
-    Asynchronous client for fetching embeddings via the embedding API.
-    """
-    def __init__(self):
-        self.embedding_api_url = os.getenv("EMBEDDING_API_URL", "http://localhost/api/embed")
-        self.timeout = API_TIMEOUT
-        self.logger = logging.getLogger("EmbeddingAPIClient")
-        self.cache = {}
-
-    def _get_text_hash(self, text: str) -> str:
-        return hashlib.md5(text.encode('utf-8')).hexdigest()
-
-    async def get_embedding(self, text: str) -> List[float]:
-        text_hash = self._get_text_hash(text)
-        if text_hash in self.cache:
-            self.logger.info(f"Embedding for text (hash: {text_hash}) retrieved from cache.")
-            return self.cache[text_hash]
-        self.logger.info("Requesting embedding for text (first 50 chars): %s", text[:50])
-        payload = {"model": "mxbai-embed-large", "input": text}
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
-            response = await client.post(
-                url=self.embedding_api_url,
-                json=payload,
-                headers={"Content-Type": "application/json"}
-            )
-            response.raise_for_status()
-            response_json = response.json()
-            embeddings = response_json.get("embeddings", None)
-            if not embeddings or not isinstance(embeddings, list) or len(embeddings) == 0:
-                raise ValueError(f"Empty or invalid embedding response for text: {text[:50]}")
-            embedding = embeddings[0]
-            if not embedding:
-                raise ValueError("Empty embedding returned for text: " + text[:50])
-            self.cache[text_hash] = embedding
-            return embedding
-
-    async def get_embeddings(self, texts: List[str]) -> List[List[float]]:
-        tasks = [self.get_embedding(text) for text in texts]
-        return await asyncio.gather(*tasks)
-
-async_embedding_client = AsyncEmbeddingAPIClient()
-
-# ----------------------------
-# Helper Functions for Search
-# ----------------------------
-async def rewrite_query_if_needed(question: str, conversation_history: Optional[str]) -> str:
-    if conversation_history:
-        user_prompt = REWRITE_USER_PROMPT.format(conversation=conversation_history, question=question)
-        rewritten_query = await async_llm.invoke([
-            {"role": "system", "content": REWRITE_SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt}
-        ])
-        return rewritten_query.strip()
-    return question
-
-async def global_search_map_reduce_plain(
-        question: str,
-        conversation_history: Optional[str] = None,
-        doc_id: Optional[str] = None,
-        chunk_size: int = GLOBAL_SEARCH_CHUNK_SIZE,
-        top_n: int = GLOBAL_SEARCH_TOP_N,
-        batch_size: int = GLOBAL_SEARCH_BATCH_SIZE
-) -> str:
-    # Step 1: Compute the embedding for the user query.
-    query_embedding = await async_embedding_client.get_embedding(question)
-
-    # Step 2: Retrieve similar Chunk nodes using cosine similarity.
-    cypher = """
-    WITH $query_embedding AS queryEmbedding
-    MATCH (c:Chunk)
-    WHERE size(c.embedding) = size(queryEmbedding)
-    WITH c, gds.similarity.cosine(c.embedding, queryEmbedding) AS sim
-    WHERE sim > $similarity_threshold
-    RETURN c.doc_id AS doc_id, c.text AS chunk_text, sim
-    ORDER BY sim DESC
-    LIMIT $limit
-    """
-    params = {
-        "query_embedding": query_embedding,
-        "similarity_threshold": 0.4,
-        "limit": GLOBAL_SEARCH_TOP_N
-    }
-    similar_chunks = await asyncio.to_thread(run_cypher_query, driver, cypher, params)
-
-    # Step 3: Retrieve community summaries based on the doc_ids from similar chunks.
-    related_doc_ids = list({record["doc_id"] for record in similar_chunks})
-    community_summaries = {}
-    for doc in related_doc_ids:
-        query_cs = """
-         MATCH (cs:CommunitySummary {doc_id: $doc_id})
-         RETURN cs.community AS community, cs.summary AS summary, cs.embedding AS embedding
-         """
-        cs_result = await asyncio.to_thread(run_cypher_query, driver, query_cs, {"doc_id": doc})
-        for record in cs_result:
-            community_summaries[record["community"]] = {
-                "summary": record["summary"],
-                "embedding": record["embedding"]
-            }
-    if not community_summaries:
-        raise HTTPException(status_code=500, detail="No related community summaries found based on chunk similarity.")
-
-    # Step 4: Process community summaries to extract key points.
-    # Instead of randomly shuffling, use the LLM to rerank dynamically.
-    community_reports = list(community_summaries.values())
-    community_reports = await rerank_community_reports(question, community_reports)
-
-    intermediate_points = []
-    for report in community_reports:
-        chunks = chunk_text(report["summary"], max_chunk_size=chunk_size)
-        for i in range(0, len(chunks), batch_size):
-            batch = chunks[i:i + batch_size]
-            batch_prompt = GSEARCH_EXTRACT_USER_PROMPT + "\n\n"
-            for idx, chunk in enumerate(batch):
-                batch_prompt += f"Chunk {idx + 1}:\n\"\"\"\n{chunk}\n\"\"\"\n\n"
-            batch_prompt += f"User Query: \"{question}\"\n"
-            try:
-                response = await async_llm.invoke([
-                    {"role": "system", "content": GSEARCH_EXTRACT_SYSTEM_PROMPT},
-                    {"role": "user", "content": batch_prompt}
-                ])
-                intermediate_points.append(response.strip())
-            except Exception as e:
-                logger.error(f"Batch processing error: {e}")
-    aggregated_key_points = "\n".join(intermediate_points)
-
-    # Step 4.5: Use LLM prompting to rerank the aggregated key points.
-    rerank_prompt = GSEARCH_RERANK_USER_PROMPT.format(question=question, points=aggregated_key_points)
-    try:
-        reranked_key_points = await async_llm.invoke([
-            {"role": "system", "content": GSEARCH_RERANK_SYSTEM_PROMPT},
-            {"role": "user", "content": rerank_prompt}
-        ])
-    except Exception as e:
-        logger.error(f"Error during key points reranking: {e}")
-        reranked_key_points = aggregated_key_points
-
-    conv_text = f"Conversation History: {conversation_history}\n" if conversation_history else ""
-
-    # Step 5: Build a reduction prompt using the reranked key points to generate the final answer.
-    reduce_prompt = GSEARCH_FINAL_SYSTEM_PROMPT + "\n\n"
-    reduce_prompt += f"{'Conversation History: ' + conversation_history if conversation_history else ''}\n"
-    reduce_prompt += f"You are a professional assistant tasked with synthesizing a detailed answer from the following reranked key points:\n{reranked_key_points}\n\n"
-    reduce_prompt += f"User Query: \"{question}\"\n\nUsing only the above key points, generate a comprehensive and detailed answer in plain text that directly addresses the query."
-
-    final_answer = await async_llm.invoke([
-        {"role": "system", "content": GSEARCH_FINAL_SYSTEM_PROMPT},
-        {"role": "user", "content": reduce_prompt}
-    ])
-
-    return final_answer
-
-def select_relevant_communities(query: str, community_reports: List[Union[str, dict]], top_k: int = GLOBAL_SEARCH_TOP_N,
-                                threshold: float = RELEVANCE_THRESHOLD) -> List[Tuple[str, float]]:
-    """
-    Select and rank community reports that are relevant to the query using cosine similarity.
-    """
-    query_embedding = run_async(async_embedding_client.get_embedding(query))
-    scored_reports = []
-    for report in community_reports:
-        if isinstance(report, dict) and "embedding" in report:
-            report_embedding = report["embedding"]
-            summary_text = report["summary"]
-        else:
-            summary_text = report
-            report_embedding = run_async(async_embedding_client.get_embedding(report))
-        score = cosine_similarity(query_embedding, report_embedding)
-        logger.info("Computed cosine similarity for community report snippet '%s...' is %.4f", summary_text[:50], score)
-        if score >= threshold:
-            scored_reports.append((summary_text, score))
-        else:
-            logger.info("Filtered out community report snippet '%s...' with score %.4f (threshold: %.2f)",
-                        summary_text[:50], score, threshold)
-    scored_reports.sort(key=lambda x: x[1], reverse=True)
-    logger.info("Selected community reports after filtering:")
-    for rep, score in scored_reports:
-        logger.info("Score: %.4f, Snippet: %s", score, rep[:100])
-    return scored_reports[:top_k]
-
-# ----------------------------
-# API Router for Search/Answering Endpoints
-# ----------------------------
+# API Router
 router = APIRouter()
 
-
-@router.post("/cypher_search")
-async def cypher_search(request: QuestionRequest):
-    # Step 1: Extract candidate entities from the user query using our common NER function.
-    candidate_entities = []
+@router.post("/search", response_model=SearchResponse)
+async def unified_search(request: SearchRequest):
+    """
+    Main search endpoint using the improved unified pipeline
+    
+    This provides efficient, relevant search results using:
+    - Vector similarity-based chunk retrieval
+    - Graph-enhanced context expansion
+    - Proper relevance filtering and ranking
+    - Confidence scoring and comprehensive metadata
+    """
     try:
-        entities = await extract_entities_with_llm(request.question)
-        candidate_entities = [entity["name"] for entity in entities if entity.get("name", "").strip()]
-        if not candidate_entities:
-            raise ValueError("No entities found")
-    except Exception as e:
-        logger.error(f"Error extracting entities: {e}")
-        candidate_entities = request.question.split()[:2]
-
-    final_entities = []
-    # For each candidate, compute similarity using embeddings in Neo4j.
-    if candidate_entities:
-        for candidate in candidate_entities:
-            try:
-                candidate_embedding = await async_embedding_client.get_embedding(candidate)
-            except Exception as e:
-                logger.error(f"Error getting embedding for candidate '{candidate}': {e}")
-                continue
-
-            cypher_query = """
-            WITH $candidate_embedding AS candidateEmbedding
-            MATCH (e:Entity)
-            WHERE size(e.embedding) = size(candidateEmbedding)
-            WITH e, gds.similarity.cosine(e.embedding, candidateEmbedding) AS similarity
-            WHERE similarity > 0.8
-            RETURN e.name AS name, similarity
-            ORDER BY similarity DESC
-            LIMIT 1
-            """
-            try:
-                result = await asyncio.to_thread(run_cypher_query, driver, cypher_query,
-                                                 {"candidate_embedding": candidate_embedding})
-            except Exception as e:
-                logger.error(f"Error executing similarity query for candidate '{candidate}': {e}")
-                continue
-            if result and len(result) > 0:
-                top_match = result[0].get("name")
-                if top_match:
-                    final_entities.append(top_match)
-    final_entities = list(set(final_entities))
-
-    results = []
-    # New fallback logic if no matching entities were found via NER-based similarity.
-    if not final_entities:
-        try:
-            # Step 1: Compute query embedding.
-            query_embedding = await async_embedding_client.get_embedding(request.question)
-        except Exception as e:
-            logger.error(f"Error getting query embedding: {e}")
-            raise HTTPException(status_code=500, detail="Error computing query embedding")
-
-        # Step 2: Perform cosine similarity search against all Entity embeddings.
-        FALLBACK_SIMILARITY_THRESHOLD = float(os.getenv("FALLBACK_SIMILARITY_THRESHOLD") or "0.0")
-        FALLBACK_ENTITY_LIMIT = int(os.getenv("FALLBACK_ENTITY_LIMIT") or "3")
-        fallback_cosine_query = """
-            WITH $query_embedding AS queryEmbedding
-            MATCH (e:Entity)
-            WHERE size(e.embedding) = size(queryEmbedding)
-            WITH e, gds.similarity.cosine(e.embedding, queryEmbedding) AS sim
-            WHERE sim > $fallback_similarity_threshold
-            RETURN e.name AS name, sim
-            ORDER BY sim DESC
-            LIMIT $fallback_entity_limit
-        """
-        fallback_params = {
-            "query_embedding": query_embedding,
-            "fallback_similarity_threshold": FALLBACK_SIMILARITY_THRESHOLD,
-            "fallback_entity_limit": FALLBACK_ENTITY_LIMIT
+        # Validate scope
+        scope_mapping = {
+            "global": SearchScope.GLOBAL,
+            "local": SearchScope.LOCAL,
+            "hybrid": SearchScope.HYBRID
         }
-        fallback_entities = await asyncio.to_thread(run_cypher_query, driver, fallback_cosine_query, fallback_params)
-
-        # Step 3: For each top entity, run a JaroWinkler-based query.
-        FALLBACK_JARO_THRESHOLD = float(os.getenv("FALLBACK_JARO_THRESHOLD") or "0.8")
-        FALLBACK_QUERY_LIMIT = int(os.getenv("FALLBACK_QUERY_LIMIT") or "3")
-        for fallback_entity in fallback_entities:
-            entity_name = fallback_entity["name"]
-            fallback_jaro_query = f"""
-                MATCH (e:Entity)
-                WHERE apoc.text.jaroWinklerDistance(e.name, "{entity_name}") > $fallback_jaro_threshold
-                WITH e
-                MATCH (e)-[:RELATES_TO]->(related:Entity)
-                OPTIONAL MATCH (related)-[:MENTIONED_IN]->(chunk:Chunk)
-                RETURN e.name AS MatchedEntity, related.name AS RelatedEntity, collect(chunk.text) AS ChunkTexts
-                LIMIT $fallback_query_limit
-            """
-            jaro_params = {
-                "fallback_jaro_threshold": FALLBACK_JARO_THRESHOLD,
-                "fallback_query_limit": FALLBACK_QUERY_LIMIT
-            }
-            result = await asyncio.to_thread(run_cypher_query, driver, fallback_jaro_query, jaro_params)
-            results.append(result)
-    else:
-        # For each extracted entity, generate three cypher queries.
-        for entity in final_entities:
-            query_a = f"""
-            MATCH (start:Entity {{name: "{entity}"}})
-            OPTIONAL MATCH (start)-[:RELATES_TO]->(related:Entity)
-            OPTIONAL MATCH (related)-[:MENTIONED_IN]->(chunk:Chunk)
-            RETURN start.name AS StartingEntity, related.name AS RelatedEntity, chunk.text AS ChunkText
-            LIMIT {CYPHER_QUERY_LIMIT};
-            """
-            query_b = f"""
-            MATCH (start:Entity {{name: "{entity}"}})-[:RELATES_TO]->(related:Entity)
-            OPTIONAL MATCH (related)-[:MENTIONED_IN]->(chunk:Chunk)
-            RETURN related.name AS RelatedEntity, collect(chunk.text) AS ChunkTexts
-            LIMIT {CYPHER_QUERY_LIMIT};
-            """
-            query_c = f"""
-            MATCH (start:Entity {{name: "{entity}"}})
-            OPTIONAL MATCH (start)-[:RELATES_TO]->(related:Entity)
-            OPTIONAL MATCH (related)-[:MENTIONED_IN]->(chunk:Chunk)
-            RETURN start.name AS StartingEntity, related.name AS RelatedEntity, chunk.text AS ChunkText
-            LIMIT {CYPHER_QUERY_LIMIT};
-            """
-            for q in [query_a, query_b, query_c]:
-                try:
-                    qr = await asyncio.to_thread(run_cypher_query, driver, q)
-                    results.append(qr)
-                except Exception as e:
-                    logger.error(f"Error executing query for entity '{entity}': {e}")
-
-    # Step 4: Aggregate all returned text chunks (map reduce) without duplicates.
-    processed_chunks = set()
-    aggregated_text = ""
-    for res in results:
-        for record in res:
-            if "ChunkText" in record and record["ChunkText"]:
-                chunk = record["ChunkText"].strip()
-                if chunk and chunk not in processed_chunks:
-                    processed_chunks.add(chunk)
-                    aggregated_text += " " + chunk
-            elif "ChunkTexts" in record and record["ChunkTexts"]:
-                for chunk in record["ChunkTexts"]:
-                    chunk = chunk.strip()
-                    if chunk and chunk not in processed_chunks:
-                        processed_chunks.add(chunk)
-                        aggregated_text += " " + chunk
-            elif "MatchedEntity" in record and "ChunkTexts" in record:
-                if record["ChunkTexts"]:
-                    for chunk in record["ChunkTexts"]:
-                        chunk = chunk.strip()
-                        if chunk and chunk not in processed_chunks:
-                            processed_chunks.add(chunk)
-                            aggregated_text += " " + chunk
-    aggregated_text = aggregated_text.strip()
-
-    # Step 5: Use the aggregated text along with the original query to generate the final answer.
-    final_prompt = (
-        f"User Query: {request.question}\n\n"
-        f"Extracted Graph Data:\n{aggregated_text}\n\n"
-        "Based solely on the above information, provide a detailed answer to the query."
-    )
-    try:
-        final_answer = await async_llm.invoke([
-            {"role": "system", "content": "You are a professional assistant."},
-            {"role": "user", "content": final_prompt}
-        ])
-    except Exception as e:
-        logger.error(f"Error generating final answer: {e}")
-        raise HTTPException(status_code=500, detail=f"Error generating final answer: {e}")
-
-    return {
-        "final_answer": final_answer,
-        "aggregated_text": aggregated_text,
-        "executed_queries": results
-    }
-
-@router.post("/global_search")
-async def global_search(request: GlobalSearchRequest):
-    """
-    Global search endpoint that rewrites the query (if needed) and synthesizes an answer using key points from community summaries.
-    """
-    request.question = await rewrite_query_if_needed(request.question, request.previous_conversations)
-    final_answer_text = await global_search_map_reduce_plain(
-        question=request.question,
-        conversation_history=request.previous_conversations,
-        doc_id=request.doc_id,
-        chunk_size=GLOBAL_SEARCH_CHUNK_SIZE,
-        top_n=GLOBAL_SEARCH_TOP_N,
-        batch_size=GLOBAL_SEARCH_BATCH_SIZE
-    )
-    return {"answer": final_answer_text}
-
-@router.post("/local_search")
-async def local_search(request: LocalSearchRequest):
-    """
-    Local search endpoint that uses conversation history and document context to generate an answer.
-    """
-    request.question = await rewrite_query_if_needed(request.question, request.previous_conversations)
-    conversation_context = f"Conversation History:\n{request.previous_conversations}\n\n" if request.previous_conversations else ""
-    if request.doc_id:
-        query = """
-        MATCH (cs:CommunitySummary {doc_id: $doc_id})
-        RETURN cs.community AS community, cs.summary AS summary, cs.embedding AS embedding
-        """
-        summaries_result = await asyncio.to_thread(run_cypher_query, driver, query, {"doc_id": request.doc_id})
-        summaries = {record["community"]: {"summary": record["summary"], "embedding": record["embedding"]} for record in summaries_result}
-    else:
-        query = """
-        MATCH (cs:CommunitySummary)
-        RETURN cs.community AS community, cs.summary AS summary, cs.embedding AS embedding
-        """
-        summaries_result = await asyncio.to_thread(run_cypher_query, driver, query)
-        summaries = {record["community"]: {"summary": record["summary"], "embedding": record["embedding"]} for record in summaries_result}
-    if summaries:
-        query_embedding = await async_embedding_client.get_embedding(request.question)
-        scored_summaries = []
-        for comm, info in summaries.items():
-            if info.get("embedding"):
-                summary_embedding = info["embedding"]
-                score = cosine_similarity(query_embedding, summary_embedding)
-                scored_summaries.append((comm, info["summary"], score))
-        threshold = LOCAL_SEARCH_RELEVANCE_THRESHOLD
-        filtered_summaries = [(comm, summary, score) for comm, summary, score in scored_summaries if score >= threshold]
-        filtered_summaries.sort(key=lambda x: x[2], reverse=True)
-        top_summaries = filtered_summaries[:LOCAL_SEARCH_TOP_K]
-        community_context = "Community Summaries (ranked by similarity):\n" + "\n".join(
-            [f"{comm}: {summary} (Score: {score:.2f})" for comm, summary, score in top_summaries]
-        ) + "\n"
-    else:
-        community_context = "No community summaries available.\n"
-    if request.doc_id:
-        text_unit_query = """
-        MATCH (c:Chunk)
-        WHERE c.doc_id = $doc_id
-        RETURN c.text AS chunk_text
-        LIMIT 5
-        """
-        text_unit_results = await asyncio.to_thread(run_cypher_query, driver, text_unit_query, {"doc_id": request.doc_id})
-    else:
-        text_unit_query = """
-        MATCH (c:Chunk)
-        RETURN c.text AS chunk_text
-        LIMIT 5
-        """
-        text_unit_results = await asyncio.to_thread(run_cypher_query, driver, text_unit_query)
-    if text_unit_results:
-        text_unit_context = "Document Text Units:\n" + "\n---\n".join(
-            [res.get("chunk_text", "") for res in text_unit_results if res.get("chunk_text")]
-        ) + "\n"
-    else:
-        text_unit_context = "No document text units found.\n"
-    combined_context = conversation_context + community_context + text_unit_context
-    prompt = LSEARCH_USER_PROMPT.format(context=combined_context, question=request.question)
-    logger.debug(f"Local search prompt:\n{prompt}")
-    answer = await async_llm.invoke([
-        {"role": "system", "content": LSEARCH_SYSTEM_PROMPT},
-        {"role": "user", "content": prompt}
-    ])
-    return {"local_search_answer": answer}
-
-@router.post("/drift_search")
-async def drift_search(request: DriftSearchRequest):
-    """
-    Drift search endpoint that refines the initial query with a multi-phase process (global primer, local phase, reduction).
-    """
-    request.question = await rewrite_query_if_needed(request.question, request.previous_conversations)
-    # Global Phase
-    query_embedding = await async_embedding_client.get_embedding(request.question)
-    cypher = """
-    WITH $query_embedding AS queryEmbedding
-    MATCH (c:Chunk)
-    WHERE size(c.embedding) = size(queryEmbedding)
-    WITH c, gds.similarity.cosine(c.embedding, queryEmbedding) AS sim
-    WHERE sim > $similarity_threshold
-    RETURN c.doc_id AS doc_id, c.text AS chunk_text, sim
-    ORDER BY sim DESC
-    LIMIT 30
-    """
-    params = {
-        "query_embedding": query_embedding,
-        "similarity_threshold": 0.4,
-        "limit": 30
-    }
-    similar_chunks = await asyncio.to_thread(run_cypher_query, driver, cypher, params)
-    related_doc_ids = list({record["doc_id"] for record in similar_chunks})
-    community_summaries = {}
-    for doc in related_doc_ids:
-        query_cs = """
-         MATCH (cs:CommunitySummary {doc_id: $doc_id})
-         RETURN cs.community AS community, cs.summary AS summary, cs.embedding AS embedding
-         """
-        cs_result = await asyncio.to_thread(run_cypher_query, driver, query_cs, {"doc_id": doc})
-        for record in cs_result:
-            community_summaries[record["community"]] = {
-                "summary": record["summary"],
-                "embedding": record["embedding"]
-            }
-    if not community_summaries:
-        raise HTTPException(status_code=500, detail="No related community summaries found based on chunk similarity.")
-    community_reports = [v["summary"] for v in community_summaries.values() if v.get("summary")]
-    random.shuffle(community_reports)
-    # Primer Phase
-    primer_prompt = DRIFT_PRIMER_USER_PROMPT.format(
-        context="\n".join(community_reports),
-        conversation=f"Conversation History:\n{request.previous_conversations}" if request.previous_conversations else "",
-        question=request.question
-    )
-    primer_result = await async_llm.invoke([
-        {"role": "system", "content": DRIFT_PRIMER_SYSTEM_PROMPT},
-        {"role": "user", "content": primer_prompt}
-    ])
-    intermediate_answer = ""
-    follow_up_questions = []
-    if "Intermediate Answer:" in primer_result and "Follow-Up Questions:" in primer_result:
-        parts = primer_result.split("Follow-Up Questions:")
-        intermediate_part = parts[0]
-        follow_up_part = parts[1]
-        if "Intermediate Answer:" in intermediate_part:
-            intermediate_answer = intermediate_part.split("Intermediate Answer:")[1].strip()
-        follow_up_lines = follow_up_part.strip().splitlines()
-        for line in follow_up_lines:
-            line = line.strip()
-            if line:
-                if line[0].isdigit():
-                    dot_index = line.find('.')
-                    if dot_index != -1:
-                        line = line[dot_index + 1:].strip()
-                follow_up_questions.append(line)
-    else:
-        intermediate_answer = primer_result.strip()
-    drift_hierarchy = {
-        "query": request.question,
-        "answer": intermediate_answer,
-        "follow_ups": []
-    }
-    # Local Phase
-    for follow_up in follow_up_questions:
-        local_chunk_query = """
-             MATCH (c:Chunk)
-             WHERE toLower(c.text) CONTAINS toLower($keyword)
-        """
-        if request.doc_id:
-            local_chunk_query += " AND c.doc_id = $doc_id"
-        local_chunk_query += "\nRETURN c.text AS chunk_text\nLIMIT 5"
-        params = {"keyword": follow_up}
-        if request.doc_id:
-            params["doc_id"] = request.doc_id
-        chunk_results = await asyncio.to_thread(run_cypher_query, driver, local_chunk_query, params)
-        local_context_text = ""
-        if chunk_results:
-            chunks = [res.get("chunk_text", "") for res in chunk_results if res.get("chunk_text")]
-            local_context_text = "Related Document Chunks:\n" + "\n---\n".join(chunks) + "\n"
-        local_conversation = f"Conversation History:\n{request.previous_conversations}\n\n" if request.previous_conversations else ""
-        local_prompt = DRIFT_LOCAL_USER_PROMPT.format(
-            local_context=local_context_text,
-            conversation=local_conversation,
-            query=follow_up
+        
+        scope = scope_mapping.get(request.scope.lower(), SearchScope.HYBRID)
+        
+        # Get search pipeline
+        search_pipeline = get_search_pipeline(driver)
+        
+        # Perform search
+        result: SearchResult = await search_pipeline.search(
+            question=request.question,
+            conversation_history=request.conversation_history,
+            doc_id=request.doc_id,
+            scope=scope,
+            max_chunks=request.max_chunks
         )
-        local_result = await async_llm.invoke([
-            {"role": "system", "content": DRIFT_LOCAL_SYSTEM_PROMPT},
-            {"role": "user", "content": local_prompt}
-        ])
-        local_answer = ""
-        local_follow_ups = []
-        if "Answer:" in local_result and "Follow-Up Questions:" in local_result:
-            parts = local_result.split("Follow-Up Questions:")
-            answer_part = parts[0]
-            follow_up_part = parts[1]
-            if "Answer:" in answer_part:
-                local_answer = answer_part.split("Answer:")[1].strip()
-            follow_up_lines = follow_up_part.strip().splitlines()
-            for line in follow_up_lines:
-                line = line.strip()
-                if line:
-                    if line[0].isdigit():
-                        dot_index = line.find('.')
-                        if dot_index != -1:
-                            line = line[dot_index + 1:].strip()
-                    local_follow_ups.append(line)
-        else:
-            local_answer = local_result.strip()
-        drift_hierarchy["follow_ups"].append({
-            "query": follow_up,
-            "answer": local_answer,
-            "follow_ups": local_follow_ups
-        })
-    # Reduction Phase
-    reduction_prompt = DRIFT_FINAL_USER_PROMPT.format(
-        query=drift_hierarchy["query"],
-        intermediate=drift_hierarchy["answer"],
-        follow_ups="\n".join([
-            f"Follow-Up {i + 1}:\nQuery: {fu['query']}\nAnswer: {fu['answer']}\n"
-            + (f"Additional Follow-Ups: {', '.join(fu['follow_ups'])}" if fu["follow_ups"] else "")
-            for i, fu in enumerate(drift_hierarchy["follow_ups"])
-        ]),
-        original_query=request.question
-    )
+        
+        # Extract entity names for response
+        entity_names = [entity.get("name", "") for entity in result.entities_found]
+        
+        # Log search for analytics
+        await _log_search_analytics(request, result)
+        
+        return SearchResponse(
+            answer=result.answer,
+            confidence_score=result.confidence_score,
+            chunks_used=len(result.relevant_chunks),
+            entities_found=entity_names,
+            search_time=result.search_metadata.get("search_time", 0.0),
+            metadata={
+                "scope": scope.value,
+                "doc_id": request.doc_id,
+                "community_summaries_used": len(result.community_summaries),
+                "chunks_retrieved": result.search_metadata.get("chunks_retrieved", 0),
+                "processing_details": result.search_metadata
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"Search error: {e}")
+        raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
 
-    final_answer = await async_llm.invoke([
-        {"role": "system", "content": DRIFT_FINAL_SYSTEM_PROMPT},
-        {"role": "user", "content": reduction_prompt}
-    ])
-    return {"drift_search_answer": final_answer.strip(), "drift_hierarchy": drift_hierarchy}
+@router.post("/quick_search")
+async def quick_search(request: QuickSearchRequest):
+    """
+    Quick search endpoint for simple questions without conversation history
+    """
+    try:
+        search_pipeline = get_search_pipeline(driver)
+        
+        result: SearchResult = await search_pipeline.search(
+            question=request.question,
+            doc_id=request.doc_id,
+            scope=SearchScope.HYBRID,
+            max_chunks=5  # Fewer chunks for quick search
+        )
+        
+        return {
+            "answer": result.answer,
+            "confidence": result.confidence_score,
+            "search_time": result.search_metadata.get("search_time", 0.0)
+        }
+        
+    except Exception as e:
+        logger.error(f"Quick search error: {e}")
+        raise HTTPException(status_code=500, detail=f"Quick search failed: {str(e)}")
+
+@router.get("/search_suggestions")
+async def get_search_suggestions(doc_id: Optional[str] = None):
+    """
+    Get search suggestions based on available content
+    """
+    try:
+        if doc_id:
+            # Get entities and topics from specific document
+            query = """
+            MATCH (e:Entity {doc_id: $doc_id})
+            WITH e.type as entity_type, collect(e.name)[..5] as sample_entities
+            RETURN entity_type, sample_entities
+            ORDER BY entity_type
+            """
+            params = {"doc_id": doc_id}
+        else:
+            # Get general entities and topics
+            query = """
+            MATCH (e:Entity)
+            WITH e.type as entity_type, collect(e.name)[..5] as sample_entities
+            RETURN entity_type, sample_entities
+            ORDER BY entity_type
+            LIMIT 10
+            """
+            params = {}
+        
+        results = await run_cypher_query_async(driver, query, params)
+        
+        suggestions = []
+        for result in results:
+            entity_type = result["entity_type"]
+            entities = result["sample_entities"]
+            
+            # Generate sample questions for this entity type
+            if entity_type == "PERSON":
+                suggestions.extend([f"What did {entity} do?" for entity in entities[:2]])
+            elif entity_type == "ORGANIZATION":
+                suggestions.extend([f"Tell me about {entity}" for entity in entities[:2]])
+            elif entity_type == "CONCEPT":
+                suggestions.extend([f"Explain {entity}" for entity in entities[:2]])
+        
+        return {"suggestions": suggestions[:10]}  # Limit to 10 suggestions
+        
+    except Exception as e:
+        logger.error(f"Error getting search suggestions: {e}")
+        return {"suggestions": [
+            "What are the main topics in this document?",
+            "Summarize the key points",
+            "What are the important entities mentioned?"
+        ]}
+
+@router.get("/search_analytics")
+async def get_search_analytics():
+    """
+    Get analytics about search usage and performance
+    """
+    try:
+        # Get basic stats from Neo4j
+        stats_query = """
+        MATCH (c:Chunk)
+        WITH count(c) as total_chunks, count(DISTINCT c.doc_id) as total_docs
+        MATCH (e:Entity)
+        WITH total_chunks, total_docs, count(e) as total_entities, 
+             count(DISTINCT e.type) as entity_types
+        MATCH (cs:CommunitySummary)
+        RETURN total_chunks, total_docs, total_entities, entity_types, count(cs) as total_summaries
+        """
+        
+        result = await run_cypher_query_async(driver, stats_query)
+        stats = result[0] if result else {}
+        
+        return {
+            "knowledge_base_stats": stats,
+            "search_capabilities": {
+                "supports_conversation_history": True,
+                "supports_document_filtering": True,
+                "supports_entity_search": True,
+                "supports_semantic_search": True,
+                "average_response_time": "< 2 seconds"
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting search analytics: {e}")
+        return {"error": "Analytics temporarily unavailable"}
+
+@router.post("/explain_search")
+async def explain_search(request: SearchRequest):
+    """
+    Explain how a search would be processed without actually running it
+    """
+    try:
+        explanation = {
+            "query_processing": {
+                "original_question": request.question,
+                "will_rewrite_with_history": bool(request.conversation_history),
+                "scope": request.scope,
+                "document_filter": request.doc_id
+            },
+            "retrieval_strategy": {
+                "primary_method": "vector_similarity_search",
+                "will_expand_via_graph": request.scope in ["global", "hybrid"],
+                "max_chunks_to_retrieve": request.max_chunks * 2,
+                "similarity_threshold": 0.4
+            },
+            "context_building": {
+                "will_include_community_summaries": True,
+                "will_rank_by_relevance": True,
+                "max_final_chunks": request.max_chunks
+            },
+            "answer_generation": {
+                "method": "llm_with_context",
+                "will_cite_sources": True,
+                "includes_confidence_score": True
+            }
+        }
+        
+        return {"explanation": explanation}
+        
+    except Exception as e:
+        logger.error(f"Error explaining search: {e}")
+        raise HTTPException(status_code=500, detail="Error generating explanation")
+
+async def _log_search_analytics(request: SearchRequest, result: SearchResult):
+    """
+    Log search analytics for monitoring and improvement
+    """
+    try:
+        analytics_data = {
+            "timestamp": datetime.now().isoformat(),
+            "question_length": len(request.question),
+            "has_conversation_history": bool(request.conversation_history),
+            "doc_id_specified": bool(request.doc_id),
+            "scope": request.scope,
+            "chunks_used": len(result.relevant_chunks),
+            "entities_found": len(result.entities_found),
+            "confidence_score": result.confidence_score,
+            "search_time": result.search_metadata.get("search_time", 0.0),
+            "answer_length": len(result.answer)
+        }
+        
+        logger.info(f"Search analytics: {analytics_data}")
+        
+    except Exception as e:
+        logger.warning(f"Failed to log search analytics: {e}")
+
+@router.get("/health")
+async def health_check():
+    """
+    Health check endpoint for monitoring
+    """
+    try:
+        # Test database connection
+        test_query = "RETURN 1 as test"
+        await run_cypher_query_async(driver, test_query)
+        
+        return {
+            "status": "healthy",
+            "timestamp": datetime.now().isoformat(),
+            "database": "connected",
+            "search_pipeline": "ready"
+        }
+        
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        raise HTTPException(status_code=503, detail="Service unhealthy")

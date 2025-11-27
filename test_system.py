@@ -1,11 +1,11 @@
 """
-Comprehensive test suite for the improved Graph RAG system
+Comprehensive test suite for the Graph RAG system
 
-This module tests all the key improvements:
-- Efficient NLP processing
+Tests all key components:
+- Efficient NLP processing with spaCy
 - Batch embedding optimization
 - Unified search pipeline
-- Async handling
+- Async handling and performance
 - Error handling and edge cases
 """
 
@@ -17,12 +17,12 @@ from typing import List, Dict, Any
 from unittest.mock import Mock, patch, AsyncMock
 
 # Import modules to test
-from improved_utils import (
+from utils import (
     EfficientNLPProcessor, BatchEmbeddingClient, AsyncLLMClient,
     ImprovedTextProcessor, cosine_similarity, extract_entities_efficient
 )
 from unified_search import UnifiedSearchPipeline, SearchScope
-from improved_document_api import ImprovedGraphManager
+from document_api import GraphManager
 
 class TestEfficientNLPProcessor:
     """Test the efficient NLP processor"""
@@ -307,7 +307,7 @@ class TestIntegration:
 
 def test_configuration_loading():
     """Test that configuration is loaded correctly"""
-    from improved_utils import CHUNK_SIZE_GDS, RELEVANCE_THRESHOLD
+    from utils import CHUNK_SIZE_GDS, RELEVANCE_THRESHOLD
     
     assert isinstance(CHUNK_SIZE_GDS, int)
     assert CHUNK_SIZE_GDS > 0
@@ -316,7 +316,7 @@ def test_configuration_loading():
 
 # Performance tests
 class TestPerformance:
-    """Performance tests for the improved system"""
+    """Performance tests for the system"""
     
     @pytest.mark.asyncio
     async def test_batch_vs_individual_embeddings(self):
