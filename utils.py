@@ -147,7 +147,11 @@ class EfficientNLPProcessor:
                 if key not in seen:
                     seen.add(key)
                     unique_entities.append(entity)
-            
+
+            # Add domain-specific entities that spaCy may miss or mislabel
+            domain_entities = self._detect_domain_entities(unique_entities, text)
+            unique_entities.extend(domain_entities)
+
             logger.debug(f"Extracted {len(unique_entities)} unique entities from text")
             return unique_entities
             
@@ -189,8 +193,43 @@ class EfficientNLPProcessor:
             re.match(r'^[^\w\s]+$', text) or
             text.lower() in {'the', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by'}):
             return False
-        
+
         return True
+
+    def _detect_domain_entities(self, existing_entities: List[Entity], text: str) -> List[Entity]:
+        """Capture cloud/AI terms that spaCy may miss or miscategorize."""
+
+        patterns = {
+            r"\bSaaS\b": "CONCEPT",
+            r"\bPaaS\b": "CONCEPT",
+            r"\bIaaS\b": "CONCEPT",
+            r"\bAI\b": "CONCEPT",
+            r"\bML\b": "CONCEPT",
+            r"\bGenAI\b": "CONCEPT",
+            r"\bLLMs?\b": "CONCEPT",
+        }
+
+        existing_keys = {(e.name.lower(), e.type) for e in existing_entities}
+        domain_entities: List[Entity] = []
+
+        for pattern, entity_type in patterns.items():
+            for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+                name = match.group(0)
+                key = (name.lower(), entity_type)
+
+                if key in existing_keys:
+                    continue
+
+                domain_entities.append(Entity(
+                    name=name,
+                    type=entity_type,
+                    confidence=0.9,
+                    start_pos=match.start(),
+                    end_pos=match.end()
+                ))
+                existing_keys.add(key)
+
+        return domain_entities
     
     def resolve_coreferences(self, text: str) -> str:
         """
