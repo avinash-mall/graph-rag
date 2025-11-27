@@ -12,6 +12,7 @@ multi-endpoint approach with a single, flexible search function. It addresses th
 import asyncio
 import logging
 import os
+import re
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 from enum import Enum
@@ -195,79 +196,192 @@ class UnifiedSearchPipeline:
             return question
     
     async def _retrieve_relevant_chunks(
-        self, 
-        question: str, 
-        doc_id: Optional[str], 
+        self,
+        question: str,
+        doc_id: Optional[str],
         top_k: int
     ) -> List[RetrievedChunk]:
         """
         Retrieve relevant chunks using vector similarity search
         """
         try:
-            # Get question embedding
             question_embedding = await embedding_client.get_embedding(question)
-            
-            # Build Cypher query for vector similarity search
-            if doc_id:
-                cypher = """
-                WITH $query_embedding AS queryEmbedding
-                MATCH (c:Chunk {doc_id: $doc_id})
-                WHERE size(c.embedding) = size(queryEmbedding) AND c.text IS NOT NULL
-                WITH c, gds.similarity.cosine(c.embedding, queryEmbedding) AS similarity
-                WHERE similarity >= $threshold
-                RETURN c.id AS chunk_id, c.doc_id AS doc_id, c.text AS text, 
-                       c.document_name AS document_name, similarity
-                ORDER BY similarity DESC
-                LIMIT $limit
-                """
-                params = {
-                    "query_embedding": question_embedding,
-                    "doc_id": doc_id,
-                    "threshold": SIMILARITY_THRESHOLD_CHUNKS,
-                    "limit": top_k
+
+            # Primary search: respect doc_id filter when provided
+            vector_results = await self._run_vector_similarity_search(
+                question_embedding, doc_id, top_k
+            )
+            chunks = await self._convert_results_to_chunks(
+                vector_results, retrieval_method="vector_similarity"
+            )
+
+            # Fallback: if doc_id was provided but no chunks were found, retry globally
+            if doc_id and not chunks:
+                self.logger.info(
+                    "No chunks found for specified doc_id; retrying without document filter"
+                )
+                vector_results = await self._run_vector_similarity_search(
+                    question_embedding, None, top_k
+                )
+                chunks = await self._convert_results_to_chunks(
+                    vector_results, retrieval_method="vector_similarity"
+                )
+
+            # Secondary fallback: keyword search when vector search yields nothing
+            if not chunks:
+                chunks = await self._keyword_fallback_search(question, doc_id, top_k)
+
+            return chunks
+
+        except Exception as e:
+            self.logger.error(f"Chunk retrieval error: {e}")
+            return []
+
+    async def _run_vector_similarity_search(
+        self,
+        question_embedding: List[float],
+        doc_id: Optional[str],
+        top_k: int
+    ) -> List[Dict[str, Any]]:
+        """Execute a vector similarity search and return raw results."""
+
+        if doc_id:
+            cypher = """
+            WITH $query_embedding AS queryEmbedding
+            MATCH (c:Chunk {doc_id: $doc_id})
+            WHERE size(c.embedding) = size(queryEmbedding) AND c.text IS NOT NULL
+            WITH c, gds.similarity.cosine(c.embedding, queryEmbedding) AS similarity
+            WHERE similarity >= $threshold
+            RETURN c.id AS chunk_id, c.doc_id AS doc_id, c.text AS text,
+                   c.document_name AS document_name, similarity
+            ORDER BY similarity DESC
+            LIMIT $limit
+            """
+            params = {
+                "query_embedding": question_embedding,
+                "doc_id": doc_id,
+                "threshold": SIMILARITY_THRESHOLD_CHUNKS,
+                "limit": top_k
+            }
+        else:
+            cypher = """
+            WITH $query_embedding AS queryEmbedding
+            MATCH (c:Chunk)
+            WHERE size(c.embedding) = size(queryEmbedding) AND c.text IS NOT NULL
+            WITH c, gds.similarity.cosine(c.embedding, queryEmbedding) AS similarity
+            WHERE similarity >= $threshold
+            RETURN c.id AS chunk_id, c.doc_id AS doc_id, c.text AS text,
+                   c.document_name AS document_name, similarity
+            ORDER BY similarity DESC
+            LIMIT $limit
+            """
+            params = {
+                "query_embedding": question_embedding,
+                "threshold": SIMILARITY_THRESHOLD_CHUNKS,
+                "limit": top_k
+            }
+
+        return await run_cypher_query_async(self.driver, cypher, params)
+
+    async def _convert_results_to_chunks(
+        self,
+        results: List[Dict[str, Any]],
+        retrieval_method: str,
+        default_similarity: float = SIMILARITY_THRESHOLD_CHUNKS
+    ) -> List[RetrievedChunk]:
+        """Convert raw cypher results to RetrievedChunk objects."""
+
+        chunks: List[RetrievedChunk] = []
+
+        for result in results:
+            entities = await self._get_chunk_entities(result["chunk_id"])
+            similarity_score = result.get("similarity", default_similarity)
+
+            chunks.append(RetrievedChunk(
+                chunk_id=result["chunk_id"],
+                doc_id=result["doc_id"],
+                text=result["text"],
+                similarity_score=similarity_score,
+                entities=entities,
+                metadata={
+                    "document_name": result.get("document_name", ""),
+                    "retrieval_method": retrieval_method
                 }
-            else:
-                cypher = """
-                WITH $query_embedding AS queryEmbedding
-                MATCH (c:Chunk)
-                WHERE size(c.embedding) = size(queryEmbedding) AND c.text IS NOT NULL
-                WITH c, gds.similarity.cosine(c.embedding, queryEmbedding) AS similarity
-                WHERE similarity >= $threshold
-                RETURN c.id AS chunk_id, c.doc_id AS doc_id, c.text AS text,
-                       c.document_name AS document_name, similarity
-                ORDER BY similarity DESC
-                LIMIT $limit
-                """
-                params = {
-                    "query_embedding": question_embedding,
-                    "threshold": SIMILARITY_THRESHOLD_CHUNKS,
-                    "limit": top_k
-                }
-            
+            ))
+
+        return chunks
+
+    async def _keyword_fallback_search(
+        self,
+        question: str,
+        doc_id: Optional[str],
+        top_k: int
+    ) -> List[RetrievedChunk]:
+        """Fallback keyword search to avoid empty answers when vector search fails."""
+
+        keywords = [
+            kw.lower()
+            for kw in re.findall(r"[A-Za-z][A-Za-z0-9\-]+", question)
+            if len(kw) > 2
+        ][:10]
+
+        if not keywords:
+            return []
+
+        doc_filter = "" if not doc_id else "AND c.doc_id = $doc_id"
+
+        cypher = f"""
+        UNWIND $keywords AS kw
+        MATCH (c:Chunk)
+        WHERE c.text IS NOT NULL {doc_filter}
+          AND toLower(c.text) CONTAINS kw
+        RETURN c.id AS chunk_id, c.doc_id AS doc_id, c.text AS text,
+               c.document_name AS document_name, count(kw) AS keyword_matches
+        ORDER BY keyword_matches DESC
+        LIMIT $limit
+        """
+
+        params = {
+            "keywords": keywords,
+            "limit": top_k,
+            "doc_id": doc_id
+        }
+
+        try:
             results = await run_cypher_query_async(self.driver, cypher, params)
-            
-            # Convert to RetrievedChunk objects
-            chunks = []
+
+            if not results and doc_id:
+                # Retry globally if doc filter provided nothing
+                params["doc_id"] = None
+                cypher = cypher.replace("AND c.doc_id = $doc_id", "")
+                results = await run_cypher_query_async(self.driver, cypher, params)
+
+            keyword_chunks: List[RetrievedChunk] = []
+
             for result in results:
-                # Get entities for this chunk
                 entities = await self._get_chunk_entities(result["chunk_id"])
-                
-                chunks.append(RetrievedChunk(
+                match_ratio = result.get("keyword_matches", 0) / max(1, len(keywords))
+                similarity_score = max(
+                    RELEVANCE_THRESHOLD,
+                    round(0.4 + 0.6 * match_ratio, 3)
+                )
+
+                keyword_chunks.append(RetrievedChunk(
                     chunk_id=result["chunk_id"],
                     doc_id=result["doc_id"],
                     text=result["text"],
-                    similarity_score=result["similarity"],
+                    similarity_score=similarity_score,
                     entities=entities,
                     metadata={
                         "document_name": result.get("document_name", ""),
-                        "retrieval_method": "vector_similarity"
+                        "retrieval_method": "keyword_fallback"
                     }
                 ))
-            
-            return chunks
-            
+
+            return keyword_chunks
+
         except Exception as e:
-            self.logger.error(f"Chunk retrieval error: {e}")
+            self.logger.warning(f"Keyword fallback search failed: {e}")
             return []
     
     async def _get_chunk_entities(self, chunk_id: str) -> List[str]:
