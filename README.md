@@ -48,7 +48,9 @@ Table of Contents
     *   [Document Management](#document-management)
         
 *   [Running the Application](#running-the-application)
-    
+
+*   [Testing](#testing)
+
 *   [Additional Notes](#additional-notes)
     
 
@@ -410,6 +412,19 @@ uvicorn graph-rag:app --host 0.0.0.0 --port 8000
 ```
 
 Ensure that the environment variables are set (either via the .env file or your system environment) before starting the server.
+
+Testing
+-------
+
+You can run the existing pytest suite locally to validate core behaviors such as NLP processing, embedding caching, and the uni
+fied search helpers:
+
+```bash
+pytest -q
+```
+
+Ensure that optional dependencies like spaCy language models are installed beforehand to avoid import issues when running the t
+ests.
 
 Additional Notes
 ----------------
