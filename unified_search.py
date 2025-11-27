@@ -20,7 +20,7 @@ import numpy as np
 from neo4j import GraphDatabase
 from dotenv import load_dotenv
 
-from improved_utils import (
+from utils import (
     nlp_processor, llm_client, embedding_client, text_processor,
     cosine_similarity, run_cypher_query_async
 )

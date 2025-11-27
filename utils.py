@@ -105,17 +105,10 @@ class EfficientNLPProcessor:
                     logger.error("No spaCy English model found. Please install with: python -m spacy download en_core_web_sm")
                     raise
             
-            # Load coreference resolution pipeline (optional)
-            try:
-                self.coref_pipeline = pipeline(
-                    "text2text-generation",
-                    model="microsoft/DialoGPT-medium",
-                    device=-1  # CPU
-                )
-                logger.info("Loaded coreference resolution pipeline")
-            except Exception as e:
-                logger.warning(f"Could not load coreference pipeline: {e}")
-                self.coref_pipeline = None
+            # Use simple coreference resolution to avoid large model downloads
+            # This is more efficient and sufficient for most use cases
+            self.coref_pipeline = None
+            logger.info("Using simple fallback coreference resolution")
                 
         except Exception as e:
             logger.error(f"Failed to load NLP models: {e}")
@@ -125,7 +118,7 @@ class EfficientNLPProcessor:
         """
         Extract entities using spaCy NER - much faster than LLM-based approach
         """
-        if not text or not text.strip():
+        if not text or not isinstance(text, str) or not text.strip():
             return []
         
         try:
@@ -209,8 +202,9 @@ class EfficientNLPProcessor:
         
         try:
             if self.coref_pipeline:
-                # Use transformer-based coreference resolution
-                result = self.coref_pipeline(text, max_length=512, truncation=True)
+                # Use T5-based coreference resolution with proper prompt
+                prompt = f"Resolve pronouns in this text: {text}"
+                result = self.coref_pipeline(prompt, max_length=512, truncation=True)
                 return result[0]['generated_text'] if result else text
             else:
                 # Simple pronoun replacement as fallback
@@ -268,29 +262,54 @@ class AsyncLLMClient:
         if time_since_last < self.min_request_interval:
             await asyncio.sleep(self.min_request_interval - time_since_last)
         
+        # Convert messages to Gemini format
+        contents = []
+        for msg in messages:
+            if msg.get("role") == "user":
+                contents.append({"parts": [{"text": msg.get("content", "")}]})
+            elif msg.get("role") == "system":
+                # Gemini doesn't have system role, prepend to first user message
+                if contents:
+                    contents[0]["parts"][0]["text"] = f"{msg.get('content', '')}\n\n{contents[0]['parts'][0]['text']}"
+                else:
+                    contents.append({"parts": [{"text": msg.get("content", "")}]})
+        
+        # Gemini API format
         payload = {
-            "model": self.model,
-            "messages": messages,
-            "temperature": self.temperature,
-            "stop": self.stop
+            "contents": contents,
+            "generationConfig": {
+                "temperature": self.temperature,
+                "maxOutputTokens": 2048
+            }
         }
         
-        headers = {"Authorization": f"Bearer {self.api_key}"}
+        headers = {
+            "x-goog-api-key": self.api_key,
+            "Content-Type": "application/json"
+        }
+        
+        # Construct the correct Gemini API URL
+        api_url = f"{self.base_url}/models/{self.model}:generateContent"
         
         for attempt in range(max_retries):
             try:
                 async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
-                    response = await client.post(self.base_url, json=payload, headers=headers)
+                    response = await client.post(api_url, json=payload, headers=headers)
                     response.raise_for_status()
                     
                     data = response.json()
-                    content = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-                    
-                    if not content:
-                        raise ValueError("Empty response from LLM")
-                    
-                    self.last_request_time = time.time()
-                    return content
+                    # Gemini API response format
+                    candidates = data.get("candidates", [])
+                    if candidates and candidates[0].get("content", {}).get("parts"):
+                        content = candidates[0]["content"]["parts"][0].get("text", "").strip()
+                        
+                        if not content:
+                            raise ValueError("Empty response from LLM")
+                        
+                        self.last_request_time = time.time()
+                        return content
+                    else:
+                        raise ValueError("Invalid response format from Gemini API")
                     
             except httpx.HTTPStatusError as e:
                 logger.error(f"HTTP error {e.response.status_code}: {e.response.text}")
@@ -318,6 +337,7 @@ class BatchEmbeddingClient:
     
     def __init__(self):
         self.embedding_api_url = os.getenv("EMBEDDING_API_URL", "http://localhost/api/embed")
+        self.embedding_api_key = os.getenv("EMBEDDING_API_KEY")
         self.model_name = os.getenv("EMBEDDING_MODEL_NAME", "mxbai-embed-large")
         self.timeout = int(os.getenv("API_TIMEOUT", "600"))
         self.batch_size = int(os.getenv("EMBEDDING_BATCH_SIZE", "10"))
@@ -328,6 +348,8 @@ class BatchEmbeddingClient:
         self.cache_ttl = CACHE_TTL
         
         logger.info(f"Initialized BatchEmbeddingClient with batch_size={self.batch_size}")
+        if not self.embedding_api_key:
+            logger.warning("EMBEDDING_API_KEY not found in environment variables")
     
     def _get_text_hash(self, text: str) -> str:
         """Generate hash for caching"""
@@ -417,24 +439,46 @@ class BatchEmbeddingClient:
         return [emb if emb is not None else [] for emb in results]
     
     async def _fetch_batch_embeddings(self, texts: List[str]) -> List[List[float]]:
-        """Fetch embeddings for a batch of texts"""
-        payload = {
-            "model": self.model_name,
-            "input": texts
+        """Fetch embeddings for a batch of texts using Gemini API"""
+        # Gemini API format for embeddings
+        requests = []
+        for text in texts:
+            requests.append({
+                "model": f"models/{self.model_name}",
+                "content": {
+                    "parts": [{"text": text}]
+                }
+            })
+        
+        payload = {"requests": requests}
+        
+        # Prepare headers for Gemini API
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": self.embedding_api_key
         }
+        
+        # Construct the correct Gemini API URL for batch embeddings
+        api_url = f"{self.embedding_api_url}/models/{self.model_name}:batchEmbedContents"
         
         async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
             response = await client.post(
-                self.embedding_api_url,
+                api_url,
                 json=payload,
-                headers={"Content-Type": "application/json"}
+                headers=headers
             )
             response.raise_for_status()
             
             data = response.json()
-            embeddings = data.get("embeddings", [])
+            embeddings_data = data.get("embeddings", [])
             
-            if not embeddings or len(embeddings) != len(texts):
+            # Extract the actual embedding values
+            embeddings = []
+            for emb_data in embeddings_data:
+                values = emb_data.get("values", [])
+                embeddings.append(values)
+            
+            if len(embeddings) != len(texts):
                 raise ValueError(f"Invalid embedding response: expected {len(texts)}, got {len(embeddings)}")
             
             return embeddings

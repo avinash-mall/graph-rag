@@ -12,5 +12,5 @@ services:
       NEO4J_dbms_security_procedures_whitelist: "gds.*"
     volumes:
       # On Windows, use forward slashes in paths
-      - "E:/neo4j_data:/data"
+      - "D:/neo4j_data:/data"
     restart: always

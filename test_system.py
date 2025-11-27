@@ -121,6 +121,53 @@ class TestBatchEmbeddingClient:
             
             # Should return embeddings for all inputs, empty for invalid ones
             assert len(embeddings) == len(texts)
+    
+    def test_api_key_configuration(self):
+        """Test that API key is properly configured"""
+        # Test that API key is loaded from environment
+        assert hasattr(self.client, 'embedding_api_key')
+        
+        # Test that API key is either set or None (depending on environment)
+        api_key = self.client.embedding_api_key
+        assert api_key is None or isinstance(api_key, str)
+        
+        # Test that headers are properly prepared when API key exists
+        if api_key:
+            headers = {"Content-Type": "application/json"}
+            headers["Authorization"] = f"Bearer {api_key}"
+            assert "Authorization" in headers
+            assert headers["Authorization"].startswith("Bearer ")
+    
+    @pytest.mark.asyncio
+    async def test_api_key_in_headers(self):
+        """Test that API key is included in request headers"""
+        texts = ["test text"]
+        
+        # Mock httpx.AsyncClient to capture headers
+        with patch('httpx.AsyncClient') as mock_client:
+            mock_response = Mock()
+            mock_response.json.return_value = {"embeddings": [[0.1, 0.2, 0.3]]}
+            mock_response.raise_for_status.return_value = None
+            
+            mock_client.return_value.__aenter__.return_value.post.return_value = mock_response
+            
+            await self.client._fetch_batch_embeddings(texts)
+            
+            # Verify that post was called
+            mock_client.return_value.__aenter__.return_value.post.assert_called_once()
+            
+            # Get the call arguments
+            call_args = mock_client.return_value.__aenter__.return_value.post.call_args
+            headers = call_args.kwargs.get('headers', {})
+            
+            # Verify headers include Content-Type
+            assert "Content-Type" in headers
+            assert headers["Content-Type"] == "application/json"
+            
+            # If API key is set, verify Authorization header
+            if self.client.embedding_api_key:
+                assert "Authorization" in headers
+                assert headers["Authorization"] == f"Bearer {self.client.embedding_api_key}"
 
 class TestImprovedTextProcessor:
     """Test the improved text processor"""

@@ -16,7 +16,7 @@ import uuid
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 
-import PyPDF2
+import pypdf
 import docx
 from fastapi import APIRouter, HTTPException, UploadFile, File
 from neo4j import GraphDatabase
@@ -432,7 +432,7 @@ async def upload_documents(files: List[UploadFile] = File(...)):
             filename = file.filename.lower()
             
             if filename.endswith(".pdf"):
-                reader = PyPDF2.PdfReader(file.file)
+                reader = pypdf.PdfReader(file.file)
                 text = " ".join(page.extract_text() for page in reader.pages if page.extract_text())
             elif filename.endswith(".docx"):
                 doc = docx.Document(file.file)
