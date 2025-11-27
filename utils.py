@@ -44,6 +44,9 @@ class AsyncOpenAI:
         self.timeout = timeout
 
     async def invoke(self, messages: list) -> str:
+        if not messages or not isinstance(messages, list):
+            raise ValueError("Messages must be a non-empty list")
+        
         payload = {
             "model": self.model,
             "messages": messages,
@@ -52,12 +55,38 @@ class AsyncOpenAI:
         }
         logger.debug(f"LLM Payload Sent: {payload}")
         headers = {"Authorization": f"Bearer {self.api_key}"}
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
-            response = await client.post(self.base_url, json=payload, headers=headers)
-            response.raise_for_status()
-            data = response.json()
-            content = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-            return content
+        
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+                    response = await client.post(self.base_url, json=payload, headers=headers)
+                    response.raise_for_status()
+                    data = response.json()
+                    
+                    content = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+                    if not content:
+                        raise ValueError("Empty response from LLM")
+                    
+                    return content
+                    
+            except httpx.HTTPStatusError as e:
+                logger.error(f"HTTP error {e.response.status_code}: {e.response.text}")
+                if attempt == max_retries - 1:
+                    raise
+                await asyncio.sleep(1 * (attempt + 1))  # Exponential backoff
+                
+            except httpx.RequestError as e:
+                logger.error(f"Request error: {str(e)}")
+                if attempt == max_retries - 1:
+                    raise
+                await asyncio.sleep(1 * (attempt + 1))
+                
+            except Exception as e:
+                logger.error(f"Unexpected error: {str(e)}")
+                if attempt == max_retries - 1:
+                    raise
+                await asyncio.sleep(1 * (attempt + 1))
 
     async def invoke_json(self, messages: list, fallback: bool = True) -> str:
         primary_messages = [{"role": "system", "content": get_refined_system_message()}] + messages
@@ -188,12 +217,16 @@ def get_refined_system_message() -> str:
 
 
 async def extract_entities_with_llm(text: str) -> List[Dict[str, str]]:
+    if not text or not isinstance(text, str) or not text.strip():
+        logger.warning("Empty, None, or invalid text provided for entity extraction")
+        return []
+    
     async_llm = get_async_llm()
     prompt = NER_EXTRACTION_PROMPT + text
     max_retries = NER_MAX_RETRIES
     for attempt in range(max_retries):
         try:
-            response = await async_llm.invoke_json([
+            response = await async_llm.invoke([
                 {"role": "system", "content": NER_SYSTEM_PROMPT},
                 {"role": "user", "content": prompt}
             ])
@@ -204,16 +237,8 @@ async def extract_entities_with_llm(text: str) -> List[Dict[str, str]]:
             if start == -1 or end == -1:
                 raise ValueError("No valid list found in response.")
             list_str = response[start:end + 1]
-            try:
-                entities = ast.literal_eval(list_str)
-            except Exception as eval_error:
-                logger.error(f"ast.literal_eval failed: {eval_error}. Attempting regex extraction.")
-                pattern = r"\[\s*'name':\s*'(.*?)',\s*'type':\s*'(.*?)'\s*\]"
-                matches = re.findall(pattern, list_str)
-                if matches:
-                    entities = [{'name': name, 'type': typ} for name, typ in matches]
-                else:
-                    raise ValueError("Regex extraction did not find any valid entities.")
+            # Enhanced parsing with multiple fallback strategies
+            entities = parse_entities_from_response_enhanced(list_str)
 
             if not isinstance(entities, list):
                 raise ValueError("Extracted value is not a list.")
@@ -227,6 +252,105 @@ async def extract_entities_with_llm(text: str) -> List[Dict[str, str]]:
             if attempt == max_retries - 1:
                 return []
             await asyncio.sleep(1)
+
+def parse_entities_from_response_enhanced(response: str) -> List[Dict[str, str]]:
+    """Parse entities from LLM response with multiple fallback strategies"""
+    
+    # Strategy 1: Direct JSON parsing
+    try:
+        import json
+        # Look for JSON array in response
+        start = response.find('[')
+        end = response.rfind(']')
+        if start != -1 and end != -1:
+            json_str = response[start:end + 1]
+            entities = json.loads(json_str)
+            if isinstance(entities, list):
+                return validate_and_filter_entities_enhanced(entities)
+    except json.JSONDecodeError:
+        pass
+    
+    # Strategy 2: AST literal eval
+    try:
+        entities = ast.literal_eval(response)
+        if isinstance(entities, list):
+            return validate_and_filter_entities_enhanced(entities)
+    except (ValueError, SyntaxError):
+        pass
+    
+    # Strategy 3: Enhanced regex extraction for structured format
+    try:
+        # Pattern for {"name": "...", "type": "..."}
+        pattern = r'\{\s*["\']name["\']\s*:\s*["\']([^"\']+)["\']\s*,\s*["\']type["\']\s*:\s*["\']([^"\']+)["\']\s*\}'
+        matches = re.findall(pattern, response, re.IGNORECASE)
+        if matches:
+            entities = [{'name': name.strip(), 'type': type_.strip()} for name, type_ in matches]
+            return validate_and_filter_entities_enhanced(entities)
+    except Exception:
+        pass
+    
+    # Strategy 4: Original regex pattern as fallback
+    try:
+        pattern = r"\[\s*'name':\s*'(.*?)',\s*'type':\s*'(.*?)'\s*\]"
+        matches = re.findall(pattern, response)
+        if matches:
+            entities = [{'name': name, 'type': typ} for name, typ in matches]
+            return validate_and_filter_entities_enhanced(entities)
+    except Exception:
+        pass
+    
+    logger.warning("All entity parsing strategies failed, returning empty list")
+    return []
+
+def validate_and_filter_entities_enhanced(entities: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """Validate and filter entities with enhanced criteria"""
+    if not isinstance(entities, list):
+        return []
+    
+    valid_types = {
+        'ORGANIZATION', 'TECHNOLOGY', 'PRODUCT', 'PERSON', 'LOCATION', 
+        'CONCEPT', 'EVENT', 'DATE', 'METRIC', 'UNKNOWN',
+        # Also accept some common variations for backward compatibility
+        'Organization', 'Framework', 'Database', 'Model', 'Entity', 'Relationship'
+    }
+    
+    filtered = []
+    seen_names = set()
+    
+    for entity in entities:
+        if not isinstance(entity, dict):
+            continue
+            
+        name = entity.get('name', '').strip()
+        entity_type = entity.get('type', '').strip()
+        
+        # Enhanced validation criteria
+        if (name and entity_type and 
+            len(name) >= 2 and 
+            len(name) <= 100 and
+            entity_type in valid_types and
+            name.lower() not in seen_names and
+            not name.isdigit() and
+            not re.match(r'^[^\w\s]+$', name)):  # Not just punctuation
+            
+            # Normalize the name
+            normalized_name = ' '.join(name.split())  # Clean whitespace
+            
+            # Normalize entity type to standard format
+            if entity_type in ['Organization', 'Entity']:
+                entity_type = 'ORGANIZATION'
+            elif entity_type in ['Framework', 'Database', 'Model']:
+                entity_type = 'TECHNOLOGY'
+            elif entity_type == 'Relationship':
+                entity_type = 'CONCEPT'
+            
+            filtered.append({
+                'name': normalized_name,
+                'type': entity_type.upper()
+            })
+            seen_names.add(normalized_name.lower())
+    
+    return filtered
 
 async def rerank_community_reports(question: str, community_reports: list[dict]) -> list[dict]:
     async_llm = get_async_llm()

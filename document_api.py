@@ -346,8 +346,7 @@ class GraphManager:
                 chunk_query = """
                     MATCH (e:Entity {doc_id: $doc_id})-[:MENTIONED_IN]->(c:Chunk)
                     WHERE toLower(e.name) IN $entity_names AND c.text IS NOT NULL AND c.text <> ""
-                    WITH collect(DISTINCT c.text) AS texts
-                    RETURN apoc.text.join(texts, "\n") AS aggregatedText
+                    RETURN collect(DISTINCT c.text) AS texts
                 """
                 result = session.run(
                     chunk_query,
@@ -355,7 +354,8 @@ class GraphManager:
                     entity_names=[e.lower() for e in entities]
                 )
                 record = result.single()
-                aggregated_text = record["aggregatedText"] if record and record["aggregatedText"] else ""
+                texts = record["texts"] if record and record["texts"] else []
+                aggregated_text = "\n".join(texts)
                 if not aggregated_text.strip():
                     logger.warning(f"No content found for community {comm}. Skipping community summary creation.")
                     continue

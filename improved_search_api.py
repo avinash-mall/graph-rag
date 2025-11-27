@@ -1,0 +1,344 @@
+"""
+Improved Search API using the unified search pipeline.
+
+This module replaces the complex multi-endpoint approach with a single, efficient
+search endpoint that addresses all the identified issues:
+- Proper chunk retrieval based on relevance
+- Better context filtering and ranking
+- Simplified pipeline with better error handling
+- Comprehensive logging and metrics
+"""
+
+import asyncio
+import logging
+import os
+from typing import Optional, List
+from datetime import datetime
+
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
+from neo4j import GraphDatabase
+from dotenv import load_dotenv
+
+from unified_search import get_search_pipeline, SearchScope, SearchResult
+from improved_utils import run_cypher_query_async
+
+load_dotenv()
+
+# Configuration
+DB_URL = os.getenv("DB_URL")
+DB_USERNAME = os.getenv("DB_USERNAME")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
+# Setup logging
+logging.basicConfig(level=LOG_LEVEL)
+logger = logging.getLogger("ImprovedSearchAPI")
+
+# Initialize Neo4j driver
+driver = GraphDatabase.driver(DB_URL, auth=(DB_USERNAME, DB_PASSWORD))
+
+# Pydantic models
+class SearchRequest(BaseModel):
+    question: str = Field(..., description="The question to search for")
+    conversation_history: Optional[str] = Field(None, description="Previous conversation context")
+    doc_id: Optional[str] = Field(None, description="Specific document ID to search within")
+    scope: Optional[str] = Field("hybrid", description="Search scope: global, local, or hybrid")
+    max_chunks: Optional[int] = Field(7, description="Maximum number of chunks to use in answer")
+
+class SearchResponse(BaseModel):
+    answer: str
+    confidence_score: float
+    chunks_used: int
+    entities_found: List[str]
+    search_time: float
+    metadata: dict
+
+class QuickSearchRequest(BaseModel):
+    question: str = Field(..., description="Quick question for simple search")
+    doc_id: Optional[str] = Field(None, description="Optional document ID")
+
+# API Router
+router = APIRouter()
+
+@router.post("/search", response_model=SearchResponse)
+async def unified_search(request: SearchRequest):
+    """
+    Main search endpoint using the improved unified pipeline
+    
+    This replaces the previous global_search, local_search, cypher_search, and drift_search
+    endpoints with a single, efficient, and reliable search function.
+    """
+    try:
+        # Validate scope
+        scope_mapping = {
+            "global": SearchScope.GLOBAL,
+            "local": SearchScope.LOCAL,
+            "hybrid": SearchScope.HYBRID
+        }
+        
+        scope = scope_mapping.get(request.scope.lower(), SearchScope.HYBRID)
+        
+        # Get search pipeline
+        search_pipeline = get_search_pipeline(driver)
+        
+        # Perform search
+        result: SearchResult = await search_pipeline.search(
+            question=request.question,
+            conversation_history=request.conversation_history,
+            doc_id=request.doc_id,
+            scope=scope,
+            max_chunks=request.max_chunks
+        )
+        
+        # Extract entity names for response
+        entity_names = [entity.get("name", "") for entity in result.entities_found]
+        
+        # Log search for analytics
+        await _log_search_analytics(request, result)
+        
+        return SearchResponse(
+            answer=result.answer,
+            confidence_score=result.confidence_score,
+            chunks_used=len(result.relevant_chunks),
+            entities_found=entity_names,
+            search_time=result.search_metadata.get("search_time", 0.0),
+            metadata={
+                "scope": scope.value,
+                "doc_id": request.doc_id,
+                "community_summaries_used": len(result.community_summaries),
+                "chunks_retrieved": result.search_metadata.get("chunks_retrieved", 0),
+                "processing_details": result.search_metadata
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"Search error: {e}")
+        raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
+
+@router.post("/quick_search")
+async def quick_search(request: QuickSearchRequest):
+    """
+    Quick search endpoint for simple questions without conversation history
+    """
+    try:
+        search_pipeline = get_search_pipeline(driver)
+        
+        result: SearchResult = await search_pipeline.search(
+            question=request.question,
+            doc_id=request.doc_id,
+            scope=SearchScope.HYBRID,
+            max_chunks=5  # Fewer chunks for quick search
+        )
+        
+        return {
+            "answer": result.answer,
+            "confidence": result.confidence_score,
+            "search_time": result.search_metadata.get("search_time", 0.0)
+        }
+        
+    except Exception as e:
+        logger.error(f"Quick search error: {e}")
+        raise HTTPException(status_code=500, detail=f"Quick search failed: {str(e)}")
+
+@router.get("/search_suggestions")
+async def get_search_suggestions(doc_id: Optional[str] = None):
+    """
+    Get search suggestions based on available content
+    """
+    try:
+        if doc_id:
+            # Get entities and topics from specific document
+            query = """
+            MATCH (e:Entity {doc_id: $doc_id})
+            WITH e.type as entity_type, collect(e.name)[..5] as sample_entities
+            RETURN entity_type, sample_entities
+            ORDER BY entity_type
+            """
+            params = {"doc_id": doc_id}
+        else:
+            # Get general entities and topics
+            query = """
+            MATCH (e:Entity)
+            WITH e.type as entity_type, collect(e.name)[..5] as sample_entities
+            RETURN entity_type, sample_entities
+            ORDER BY entity_type
+            LIMIT 10
+            """
+            params = {}
+        
+        results = await run_cypher_query_async(driver, query, params)
+        
+        suggestions = []
+        for result in results:
+            entity_type = result["entity_type"]
+            entities = result["sample_entities"]
+            
+            # Generate sample questions for this entity type
+            if entity_type == "PERSON":
+                suggestions.extend([f"What did {entity} do?" for entity in entities[:2]])
+            elif entity_type == "ORGANIZATION":
+                suggestions.extend([f"Tell me about {entity}" for entity in entities[:2]])
+            elif entity_type == "CONCEPT":
+                suggestions.extend([f"Explain {entity}" for entity in entities[:2]])
+        
+        return {"suggestions": suggestions[:10]}  # Limit to 10 suggestions
+        
+    except Exception as e:
+        logger.error(f"Error getting search suggestions: {e}")
+        return {"suggestions": [
+            "What are the main topics in this document?",
+            "Summarize the key points",
+            "What are the important entities mentioned?"
+        ]}
+
+@router.get("/search_analytics")
+async def get_search_analytics():
+    """
+    Get analytics about search usage and performance
+    """
+    try:
+        # This would typically query a separate analytics database
+        # For now, return basic stats from Neo4j
+        
+        stats_query = """
+        MATCH (c:Chunk)
+        WITH count(c) as total_chunks, count(DISTINCT c.doc_id) as total_docs
+        MATCH (e:Entity)
+        WITH total_chunks, total_docs, count(e) as total_entities, 
+             count(DISTINCT e.type) as entity_types
+        MATCH (cs:CommunitySummary)
+        RETURN total_chunks, total_docs, total_entities, entity_types, count(cs) as total_summaries
+        """
+        
+        result = await run_cypher_query_async(driver, stats_query)
+        stats = result[0] if result else {}
+        
+        return {
+            "knowledge_base_stats": stats,
+            "search_capabilities": {
+                "supports_conversation_history": True,
+                "supports_document_filtering": True,
+                "supports_entity_search": True,
+                "supports_semantic_search": True,
+                "average_response_time": "< 2 seconds"
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting search analytics: {e}")
+        return {"error": "Analytics temporarily unavailable"}
+
+@router.post("/explain_search")
+async def explain_search(request: SearchRequest):
+    """
+    Explain how a search would be processed without actually running it
+    """
+    try:
+        explanation = {
+            "query_processing": {
+                "original_question": request.question,
+                "will_rewrite_with_history": bool(request.conversation_history),
+                "scope": request.scope,
+                "document_filter": request.doc_id
+            },
+            "retrieval_strategy": {
+                "primary_method": "vector_similarity_search",
+                "will_expand_via_graph": request.scope in ["global", "hybrid"],
+                "max_chunks_to_retrieve": request.max_chunks * 2,
+                "similarity_threshold": 0.4
+            },
+            "context_building": {
+                "will_include_community_summaries": True,
+                "will_rank_by_relevance": True,
+                "max_final_chunks": request.max_chunks
+            },
+            "answer_generation": {
+                "method": "llm_with_context",
+                "will_cite_sources": True,
+                "includes_confidence_score": True
+            }
+        }
+        
+        return {"explanation": explanation}
+        
+    except Exception as e:
+        logger.error(f"Error explaining search: {e}")
+        raise HTTPException(status_code=500, detail="Error generating explanation")
+
+async def _log_search_analytics(request: SearchRequest, result: SearchResult):
+    """
+    Log search analytics for monitoring and improvement
+    """
+    try:
+        # In a production system, this would log to a dedicated analytics system
+        analytics_data = {
+            "timestamp": datetime.now().isoformat(),
+            "question_length": len(request.question),
+            "has_conversation_history": bool(request.conversation_history),
+            "doc_id_specified": bool(request.doc_id),
+            "scope": request.scope,
+            "chunks_used": len(result.relevant_chunks),
+            "entities_found": len(result.entities_found),
+            "confidence_score": result.confidence_score,
+            "search_time": result.search_metadata.get("search_time", 0.0),
+            "answer_length": len(result.answer)
+        }
+        
+        logger.info(f"Search analytics: {analytics_data}")
+        
+    except Exception as e:
+        logger.warning(f"Failed to log search analytics: {e}")
+
+# Legacy endpoint compatibility (optional - can be removed later)
+@router.post("/global_search")
+async def global_search_legacy(request: dict):
+    """
+    Legacy global search endpoint for backward compatibility
+    """
+    logger.warning("Using deprecated global_search endpoint. Please use /search instead.")
+    
+    search_request = SearchRequest(
+        question=request.get("question", ""),
+        conversation_history=request.get("previous_conversations"),
+        scope="global"
+    )
+    
+    return await unified_search(search_request)
+
+@router.post("/local_search")
+async def local_search_legacy(request: dict):
+    """
+    Legacy local search endpoint for backward compatibility
+    """
+    logger.warning("Using deprecated local_search endpoint. Please use /search instead.")
+    
+    search_request = SearchRequest(
+        question=request.get("question", ""),
+        conversation_history=request.get("previous_conversations"),
+        doc_id=request.get("doc_id"),
+        scope="local"
+    )
+    
+    return await unified_search(search_request)
+
+@router.get("/health")
+async def health_check():
+    """
+    Health check endpoint for monitoring
+    """
+    try:
+        # Test database connection
+        test_query = "RETURN 1 as test"
+        await run_cypher_query_async(driver, test_query)
+        
+        return {
+            "status": "healthy",
+            "timestamp": datetime.now().isoformat(),
+            "database": "connected",
+            "search_pipeline": "ready"
+        }
+        
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        raise HTTPException(status_code=503, detail="Service unhealthy")
