@@ -282,6 +282,7 @@ class AsyncLLMClient:
         self.base_url = os.getenv("OPENAI_BASE_URL")
         self.temperature = float(os.getenv("OPENAI_TEMPERATURE", "0.0"))
         self.timeout = int(os.getenv("API_TIMEOUT", "600"))
+        self.provider = os.getenv("LLM_PROVIDER", "gemini").lower()
         
         stop_str = os.getenv("OPENAI_STOP")
         self.stop = json.loads(stop_str) if stop_str else None
@@ -301,19 +302,25 @@ class AsyncLLMClient:
         if time_since_last < self.min_request_interval:
             await asyncio.sleep(self.min_request_interval - time_since_last)
         
-        # Convert messages to Gemini format
+        if self.provider in {"openai", "ollama"}:
+            return await self._invoke_openai(messages, max_retries)
+        else:
+            return await self._invoke_gemini(messages, max_retries)
+
+    async def _invoke_gemini(self, messages: List[Dict[str, str]], max_retries: int) -> str:
+        """Call Gemini-compatible endpoint."""
         contents = []
         for msg in messages:
-            if msg.get("role") == "user":
-                contents.append({"parts": [{"text": msg.get("content", "")}]})
-            elif msg.get("role") == "system":
-                # Gemini doesn't have system role, prepend to first user message
+            role = msg.get("role", "user")
+            if role == "system":
+                # Gemini expects user/model; fold system into the first user message
                 if contents:
                     contents[0]["parts"][0]["text"] = f"{msg.get('content', '')}\n\n{contents[0]['parts'][0]['text']}"
                 else:
-                    contents.append({"parts": [{"text": msg.get("content", "")}]})
-        
-        # Gemini API format
+                    contents.append({"role": "user", "parts": [{"text": msg.get("content", "")}]})
+            else:
+                contents.append({"role": role, "parts": [{"text": msg.get("content", "")}]})
+
         payload = {
             "contents": contents,
             "generationConfig": {
@@ -321,35 +328,36 @@ class AsyncLLMClient:
                 "maxOutputTokens": 2048
             }
         }
-        
+
         headers = {
-            "x-goog-api-key": self.api_key,
             "Content-Type": "application/json"
         }
-        
-        # Construct the correct Gemini API URL
+
         api_url = f"{self.base_url}/models/{self.model}:generateContent"
-        
+
         for attempt in range(max_retries):
             try:
                 async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
-                    response = await client.post(api_url, json=payload, headers=headers)
+                    response = await client.post(
+                        api_url,
+                        json=payload,
+                        headers=headers,
+                        params={"key": self.api_key} if self.api_key else None
+                    )
                     response.raise_for_status()
-                    
+
                     data = response.json()
-                    # Gemini API response format
                     candidates = data.get("candidates", [])
                     if candidates and candidates[0].get("content", {}).get("parts"):
                         content = candidates[0]["content"]["parts"][0].get("text", "").strip()
-                        
                         if not content:
                             raise ValueError("Empty response from LLM")
-                        
+
                         self.last_request_time = time.time()
                         return content
                     else:
                         raise ValueError("Invalid response format from Gemini API")
-                    
+
             except httpx.HTTPStatusError as e:
                 logger.error(f"HTTP error {e.response.status_code}: {e.response.text}")
                 if e.response.status_code == 429:  # Rate limit
@@ -360,13 +368,69 @@ class AsyncLLMClient:
                     raise
                 else:
                     await asyncio.sleep(1 * (attempt + 1))
-                    
+
             except Exception as e:
                 logger.error(f"Request error (attempt {attempt + 1}): {str(e)}")
                 if attempt == max_retries - 1:
                     raise
                 await asyncio.sleep(1 * (attempt + 1))
-        
+
+        raise Exception("Max retries exceeded")
+
+    async def _invoke_openai(self, messages: List[Dict[str, str]], max_retries: int) -> str:
+        """Call OpenAI/Ollama-compatible chat completions endpoint."""
+        url = f"{self.base_url.rstrip('/')}/v1/chat/completions"
+
+        payload: Dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": self.temperature,
+        }
+        if self.stop:
+            payload["stop"] = self.stop
+
+        headers = {
+            "Content-Type": "application/json"
+        }
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        for attempt in range(max_retries):
+            try:
+                async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+                    response = await client.post(url, json=payload, headers=headers)
+                    response.raise_for_status()
+
+                    data = response.json()
+                    choices = data.get("choices", [])
+                    if choices:
+                        message = choices[0].get("message", {})
+                        content = (message.get("content") or "").strip()
+                        if not content:
+                            raise ValueError("Empty response from LLM")
+
+                        self.last_request_time = time.time()
+                        return content
+                    else:
+                        raise ValueError("Invalid response format from OpenAI-compatible API")
+
+            except httpx.HTTPStatusError as e:
+                logger.error(f"HTTP error {e.response.status_code}: {e.response.text}")
+                if e.response.status_code == 429:
+                    wait_time = 2 ** attempt
+                    logger.info(f"Rate limited, waiting {wait_time}s")
+                    await asyncio.sleep(wait_time)
+                elif attempt == max_retries - 1:
+                    raise
+                else:
+                    await asyncio.sleep(1 * (attempt + 1))
+
+            except Exception as e:
+                logger.error(f"Request error (attempt {attempt + 1}): {str(e)}")
+                if attempt == max_retries - 1:
+                    raise
+                await asyncio.sleep(1 * (attempt + 1))
+
         raise Exception("Max retries exceeded")
 
 class BatchEmbeddingClient:
