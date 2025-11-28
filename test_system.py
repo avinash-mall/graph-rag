@@ -187,15 +187,31 @@ class TestImprovedTextProcessor:
     
     def test_advanced_chunking(self):
         """Test advanced text chunking with overlap"""
+        def overlap_length(chunk_a: str, chunk_b: str) -> int:
+            max_len = min(len(chunk_a), len(chunk_b))
+            for i in range(max_len, 0, -1):
+                if chunk_a[-i:] == chunk_b[:i]:
+                    return i
+            return 0
+
         text = "First sentence. Second sentence. Third sentence. Fourth sentence."
-        chunks = self.processor.chunk_text_advanced(text, max_chunk_size=50, overlap=10)
-        
+        overlap = 10
+        chunks = self.processor.chunk_text_advanced(text, max_chunk_size=50, overlap=overlap)
+
         assert len(chunks) > 1
-        # Check that chunks have some overlap
-        if len(chunks) > 1:
-            # Simple overlap check - last part of first chunk should appear in second
-            first_end = chunks[0][-10:]
-            assert any(word in chunks[1] for word in first_end.split())
+        for prev_chunk, next_chunk in zip(chunks, chunks[1:]):
+            shared = overlap_length(prev_chunk, next_chunk)
+            assert shared >= min(overlap, len(prev_chunk))
+
+        boundary_text = "AAAAAAAAAAAAAAAAAA. BBBBBBBBBBB."
+        boundary_overlap = 5
+        boundary_chunks = self.processor.chunk_text_advanced(
+            boundary_text, max_chunk_size=20, overlap=boundary_overlap
+        )
+
+        assert len(boundary_chunks) == 2
+        boundary_shared = overlap_length(boundary_chunks[0], boundary_chunks[1])
+        assert boundary_shared >= min(boundary_overlap, len(boundary_chunks[0]))
     
     def test_chunking_empty_text(self):
         """Test chunking with empty text"""
