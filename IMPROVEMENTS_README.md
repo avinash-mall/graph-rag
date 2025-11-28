@@ -33,7 +33,7 @@ graph-rag/
 ├── unified_search.py             # Core search pipeline logic
 ├── test_system.py                # Comprehensive system test suite
 ├── requirements.txt              # Dependencies
-└── README.md                     # This file
+└── IMPROVEMENTS_README.md        # This file
 ```
 
 ## ⚡ Performance Optimizations
