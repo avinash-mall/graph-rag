@@ -1,8 +1,10 @@
 """
-Utilities for Graph RAG with efficient NLP preprocessing and optimized performance.
+Utilities for Graph RAG with LLM-based NLP preprocessing and optimized performance.
 
 Features:
-- Fast spaCy-based NLP processing (200-500x faster than LLM-based NER)
+- LLM-based NER using gemma3:1b model via OpenAI-compatible API
+- LLM-based coreference resolution using gemma3:1b model
+- Boilerplate and navigation text removal before chunking
 - Batch embedding processing with intelligent caching
 - Async optimization throughout
 - Comprehensive error handling and logging
@@ -23,9 +25,7 @@ import time
 
 import httpx
 import numpy as np
-import spacy
 import blingfire
-from transformers import pipeline
 from dotenv import load_dotenv
 from fastapi import HTTPException
 
@@ -81,65 +81,146 @@ class ChunkWithMetadata:
 
 class EfficientNLPProcessor:
     """
-    Efficient NLP processor using spaCy for NER and other NLP tasks.
-    Replaces the expensive LLM-based approach with fast, local models.
+    LLM-based NLP processor using OpenAI-compatible API for NER and coreference resolution.
+    Uses gemma3:1b model for efficient processing.
     """
     
     def __init__(self):
-        self.nlp = None
-        self.coref_pipeline = None
-        self._load_models()
+        # NER LLM client
+        self.ner_model = os.getenv("NER_MODEL", "gemma3:1b")
+        self.ner_base_url = os.getenv("NER_BASE_URL", "http://localhost:11434/v1")
+        self.ner_api_key = os.getenv("NER_API_KEY", "test")
+        self.ner_temperature = float(os.getenv("NER_TEMPERATURE", "0.0"))
+        
+        # Coreference LLM client
+        self.coref_model = os.getenv("COREF_MODEL", "gemma3:1b")
+        self.coref_base_url = os.getenv("COREF_BASE_URL", "http://localhost:11434/v1")
+        self.coref_api_key = os.getenv("COREF_API_KEY", "test")
+        self.coref_temperature = float(os.getenv("COREF_TEMPERATURE", "0.0"))
+        
+        self.timeout = int(os.getenv("API_TIMEOUT", "600"))
+        logger.info(f"Initialized LLM-based NLP processor with NER model: {self.ner_model}, Coref model: {self.coref_model}")
     
-    def _load_models(self):
-        """Load spaCy and other NLP models"""
-        try:
-            # Try to load the large English model first
-            try:
-                self.nlp = spacy.load("en_core_web_lg")
-                logger.info("Loaded spaCy large model (en_core_web_lg)")
-            except OSError:
-                try:
-                    self.nlp = spacy.load("en_core_web_sm")
-                    logger.info("Loaded spaCy small model (en_core_web_sm)")
-                except OSError:
-                    logger.error("No spaCy English model found. Please install with: python -m spacy download en_core_web_sm")
-                    raise
-            
-            # Use simple coreference resolution to avoid large model downloads
-            # This is more efficient and sufficient for most use cases
-            self.coref_pipeline = None
-            logger.info("Using simple fallback coreference resolution")
-                
-        except Exception as e:
-            logger.error(f"Failed to load NLP models: {e}")
-            raise
-    
-    def extract_entities(self, text: str) -> List[Entity]:
+    async def extract_entities(self, text: str) -> List[Entity]:
         """
-        Extract entities using spaCy NER - much faster than LLM-based approach
+        Extract entities using LLM-based NER with gemma3:1b model
         """
         if not text or not isinstance(text, str) or not text.strip():
             return []
         
         try:
-            doc = self.nlp(text)
-            entities = []
+            # Use the NER prompt from environment or default
+            ner_prompt = os.getenv("NER_EXTRACTION_PROMPT", "")
+            system_prompt = os.getenv("NER_SYSTEM_PROMPT", "You are a professional NER extraction assistant who responds only in valid python list of dictionaries.")
             
-            for ent in doc.ents:
-                # Map spaCy entity types to our standardized types
-                entity_type = self._map_entity_type(ent.label_)
+            user_prompt = f"{ner_prompt}{text}"
+            
+            # Call LLM for entity extraction
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ]
+            
+            response = await self._call_llm(
+                messages, 
+                self.ner_base_url, 
+                self.ner_model, 
+                self.ner_api_key, 
+                self.ner_temperature
+            )
+            
+            # Parse LLM response
+            entities = self._parse_ner_response(response, text)
+            
+            logger.debug(f"Extracted {len(entities)} unique entities from text using LLM")
+            return entities
+            
+        except Exception as e:
+            logger.error(f"Error in LLM-based entity extraction: {e}")
+            return []
+    
+    async def _call_llm(self, messages: List[Dict[str, str]], base_url: str, model: str, api_key: str, temperature: float) -> str:
+        """Call OpenAI-compatible LLM API"""
+        try:
+            # Construct API URL
+            if "/v1" in base_url:
+                api_url = f"{base_url}/chat/completions"
+            else:
+                api_url = f"{base_url}/v1/chat/completions"
+            
+            payload = {
+                "model": model,
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": 2048
+            }
+            
+            headers = {
+                "Content-Type": "application/json"
+            }
+            
+            if api_key and api_key != "test":
+                headers["Authorization"] = f"Bearer {api_key}"
+            
+            async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+                response = await client.post(api_url, json=payload, headers=headers)
+                response.raise_for_status()
+                data = response.json()
                 
-                # Filter out low-confidence or irrelevant entities
-                if self._is_valid_entity(ent.text, entity_type):
-                    entities.append(Entity(
-                        name=ent.text.strip(),
-                        type=entity_type,
-                        confidence=1.0,  # spaCy doesn't provide confidence scores by default
-                        start_pos=ent.start_char,
-                        end_pos=ent.end_char
-                    ))
+                # Extract content from response
+                if "choices" in data and len(data["choices"]) > 0:
+                    return data["choices"][0]["message"]["content"].strip()
+                else:
+                    raise ValueError("Invalid response format from LLM API")
+                    
+        except Exception as e:
+            logger.error(f"LLM API call failed: {e}")
+            raise
+    
+    def _parse_ner_response(self, response: str, original_text: str) -> List[Entity]:
+        """Parse LLM NER response into Entity objects"""
+        entities = []
+        
+        try:
+            # Try to extract JSON from response
+            # Remove markdown code blocks if present
+            response = re.sub(r'```json\s*', '', response)
+            response = re.sub(r'```\s*', '', response)
+            response = re.sub(r'```python\s*', '', response)
+            response = response.strip()
             
-            # Remove duplicates while preserving order
+            # Try to find JSON array in response
+            json_match = re.search(r'\[.*\]', response, re.DOTALL)
+            if json_match:
+                entities_data = json.loads(json_match.group(0))
+            else:
+                # Try parsing entire response as JSON
+                entities_data = json.loads(response)
+            
+            if not isinstance(entities_data, list):
+                logger.warning("LLM response is not a list, attempting to convert")
+                entities_data = [entities_data] if isinstance(entities_data, dict) else []
+            
+            # Convert to Entity objects
+            for entity_data in entities_data:
+                if isinstance(entity_data, dict):
+                    name = entity_data.get("name", "").strip()
+                    entity_type = entity_data.get("type", "UNKNOWN").strip()
+                    
+                    if name and self._is_valid_entity(name, entity_type):
+                        # Find position in original text
+                        start_pos = original_text.lower().find(name.lower())
+                        end_pos = start_pos + len(name) if start_pos >= 0 else 0
+                        
+                        entities.append(Entity(
+                            name=name,
+                            type=entity_type.upper(),
+                            confidence=0.9,  # LLM-based, assume high confidence
+                            start_pos=start_pos,
+                            end_pos=end_pos
+                        ))
+            
+            # Remove duplicates
             seen = set()
             unique_entities = []
             for entity in entities:
@@ -147,41 +228,16 @@ class EfficientNLPProcessor:
                 if key not in seen:
                     seen.add(key)
                     unique_entities.append(entity)
-
-            # Add domain-specific entities that spaCy may miss or mislabel
-            domain_entities = self._detect_domain_entities(unique_entities, text)
-            unique_entities.extend(domain_entities)
-
-            logger.debug(f"Extracted {len(unique_entities)} unique entities from text")
+            
             return unique_entities
             
-        except Exception as e:
-            logger.error(f"Error in entity extraction: {e}")
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse NER response as JSON: {e}")
+            logger.debug(f"Response was: {response[:500]}")
             return []
-    
-    def _map_entity_type(self, spacy_label: str) -> str:
-        """Map spaCy entity labels to our standardized types"""
-        mapping = {
-            "PERSON": "PERSON",
-            "ORG": "ORGANIZATION", 
-            "GPE": "LOCATION",
-            "LOC": "LOCATION",
-            "PRODUCT": "PRODUCT",
-            "EVENT": "EVENT",
-            "WORK_OF_ART": "PRODUCT",
-            "LAW": "CONCEPT",
-            "LANGUAGE": "CONCEPT",
-            "DATE": "DATE",
-            "TIME": "DATE",
-            "PERCENT": "METRIC",
-            "MONEY": "METRIC",
-            "QUANTITY": "METRIC",
-            "ORDINAL": "METRIC",
-            "CARDINAL": "METRIC",
-            "FAC": "LOCATION",
-            "NORP": "ORGANIZATION"
-        }
-        return mapping.get(spacy_label, "CONCEPT")
+        except Exception as e:
+            logger.error(f"Error parsing NER response: {e}")
+            return []
     
     def _is_valid_entity(self, text: str, entity_type: str) -> bool:
         """Filter out invalid entities"""
@@ -196,80 +252,39 @@ class EfficientNLPProcessor:
 
         return True
 
-    def _detect_domain_entities(self, existing_entities: List[Entity], text: str) -> List[Entity]:
-        """Capture cloud/AI terms that spaCy may miss or miscategorize."""
-
-        patterns = {
-            r"\bSaaS\b": "CONCEPT",
-            r"\bPaaS\b": "CONCEPT",
-            r"\bIaaS\b": "CONCEPT",
-            r"\bAI\b": "CONCEPT",
-            r"\bML\b": "CONCEPT",
-            r"\bGenAI\b": "CONCEPT",
-            r"\bLLMs?\b": "CONCEPT",
-        }
-
-        existing_keys = {(e.name.lower(), e.type) for e in existing_entities}
-        domain_entities: List[Entity] = []
-
-        for pattern, entity_type in patterns.items():
-            for match in re.finditer(pattern, text, flags=re.IGNORECASE):
-                name = match.group(0)
-                key = (name.lower(), entity_type)
-
-                if key in existing_keys:
-                    continue
-
-                domain_entities.append(Entity(
-                    name=name,
-                    type=entity_type,
-                    confidence=0.9,
-                    start_pos=match.start(),
-                    end_pos=match.end()
-                ))
-                existing_keys.add(key)
-
-        return domain_entities
-    
-    def resolve_coreferences(self, text: str) -> str:
+    async def resolve_coreferences(self, text: str) -> str:
         """
-        Resolve coreferences using a lightweight approach.
-        Falls back to simple pronoun replacement if advanced model unavailable.
+        Resolve coreferences using LLM-based approach with gemma3:1b model
         """
         if not text or not text.strip():
             return text
         
         try:
-            if self.coref_pipeline:
-                # Use T5-based coreference resolution with proper prompt
-                prompt = f"Resolve pronouns in this text: {text}"
-                result = self.coref_pipeline(prompt, max_length=512, truncation=True)
-                return result[0]['generated_text'] if result else text
-            else:
-                # Simple pronoun replacement as fallback
-                return self._simple_coref_resolution(text)
-                
-        except Exception as e:
-            logger.warning(f"Coreference resolution failed: {e}")
-            return text
-    
-    def _simple_coref_resolution(self, text: str) -> str:
-        """Simple rule-based coreference resolution"""
-        doc = self.nlp(text)
-        
-        # Extract person names
-        persons = [ent.text for ent in doc.ents if ent.label_ == "PERSON"]
-        
-        if persons:
-            # Replace pronouns with the most recent person mentioned
-            most_recent_person = persons[-1]
+            # Use the coreference prompt from environment or default
+            coref_user_prompt = os.getenv("COREF_USER_PROMPT", "Resolve all ambiguous pronouns and vague references in the following text by replacing them with their appropriate entities. Ensure no unresolved pronouns like 'he', 'she', 'himself', etc. remain. If the referenced entity is unclear, make an intelligent guess based on context.\n\n")
+            coref_system_prompt = os.getenv("COREF_SYSTEM_PROMPT", "You are a professional text refiner skilled in coreference resolution.")
             
-            # Simple pronoun replacement
-            text = re.sub(r'\bhe\b', most_recent_person, text, flags=re.IGNORECASE)
-            text = re.sub(r'\bhim\b', most_recent_person, text, flags=re.IGNORECASE)
-            text = re.sub(r'\bhis\b', f"{most_recent_person}'s", text, flags=re.IGNORECASE)
-        
-        return text
+            user_prompt = f"{coref_user_prompt}{text}"
+            
+            messages = [
+                {"role": "system", "content": coref_system_prompt},
+                {"role": "user", "content": user_prompt}
+            ]
+            
+            resolved_text = await self._call_llm(
+                messages,
+                self.coref_base_url,
+                self.coref_model,
+                self.coref_api_key,
+                self.coref_temperature
+            )
+            
+            logger.debug("Coreference resolution completed using LLM")
+            return resolved_text
+            
+        except Exception as e:
+            logger.warning(f"LLM-based coreference resolution failed: {e}, returning original text")
+            return text
 
 class AsyncLLMClient:
     """
@@ -642,7 +657,7 @@ class ImprovedTextProcessor:
     
     @staticmethod
     def clean_text(text: str) -> str:
-        """Enhanced text cleaning"""
+        """Enhanced text cleaning with boilerplate and navigation text removal"""
         if not isinstance(text, str):
             logger.error(f"Received non-string content: {type(text)}")
             return ""
@@ -650,13 +665,78 @@ class ImprovedTextProcessor:
         # Remove non-printable characters
         text = ''.join(filter(lambda x: x in string.printable, text.strip()))
         
+        # Remove common boilerplate/navigation patterns
+        boilerplate_patterns = [
+            r'\b(page|Page|PAGE)\s+\d+\s+of\s+\d+\b',  # Page numbers
+            r'\b(page|Page|PAGE)\s+\d+\b',  # Simple page numbers
+            r'^\s*Table of Contents.*?\n',  # Table of contents
+            r'^\s*Contents.*?\n',
+            r'^\s*Index.*?\n',
+            r'^\s*Appendix.*?\n',
+            r'^\s*Chapter\s+\d+.*?\n',
+            r'^\s*Section\s+\d+.*?\n',
+            r'^\s*\d+\.\s*\d+\.\s*\d+.*?\n',  # Numbered sections
+            r'^\s*\[.*?\]\s*$',  # Bracketed navigation text
+            r'^\s*←\s*.*?\s*→\s*$',  # Navigation arrows
+            r'^\s*Previous\s+Page.*?Next\s+Page\s*$',
+            r'^\s*Back\s+to\s+Top\s*$',
+            r'^\s*Home\s*$',
+            r'^\s*Menu\s*$',
+            r'^\s*Navigation\s*$',
+            r'^\s*Skip to content\s*$',
+            r'^\s*Copyright\s+©.*?$',  # Copyright notices
+            r'^\s*All rights reserved.*?$',
+            r'^\s*Confidential.*?$',
+            r'^\s*DRAFT.*?$',
+            r'^\s*PROPRIETARY.*?$',
+            r'^\s*Header:.*?$',  # Headers/footers
+            r'^\s*Footer:.*?$',
+            r'^\s*Header\s+\d+.*?$',
+            r'^\s*Footer\s+\d+.*?$',
+            r'^\s*\[.*?Header.*?\]\s*$',
+            r'^\s*\[.*?Footer.*?\]\s*$',
+            r'^\s*Click here.*?$',  # Interactive elements
+            r'^\s*See also.*?$',
+            r'^\s*Related links.*?$',
+            r'^\s*Bookmark.*?$',
+            r'^\s*Print.*?$',
+            r'^\s*Share.*?$',
+            r'^\s*Download.*?$',
+            r'^\s*Email.*?$',
+        ]
+        
+        for pattern in boilerplate_patterns:
+            text = re.sub(pattern, '', text, flags=re.IGNORECASE | re.MULTILINE)
+        
+        # Remove URLs (often navigation)
+        text = re.sub(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', '', text)
+        
+        # Remove email addresses (often in headers/footers)
+        text = re.sub(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', '', text)
+        
+        # Remove repeated navigation-like phrases
+        navigation_phrases = [
+            r'\b(?:previous|next|back|forward|up|down)\s+(?:page|section|chapter)\b',
+            r'\b(?:go to|jump to|see|refer to)\s+(?:page|section|chapter)\s+\d+\b',
+        ]
+        for phrase in navigation_phrases:
+            text = re.sub(phrase, '', text, flags=re.IGNORECASE)
+        
         # Normalize whitespace
         text = re.sub(r'\s+', ' ', text)
         
         # Remove common document artifacts
         text = re.sub(r'\n\s*\n', '\n', text)  # Multiple newlines
         text = re.sub(r'^\s*[-•]\s*', '', text, flags=re.MULTILINE)  # Bullet points
-        text = re.sub(r'\b(page|Page)\s+\d+\b', '', text)  # Page numbers
+        
+        # Remove lines that are too short and likely navigation (less than 10 chars, mostly punctuation)
+        lines = text.split('\n')
+        cleaned_lines = []
+        for line in lines:
+            line = line.strip()
+            if len(line) > 10 or (len(line) > 0 and not re.match(r'^[^\w\s]+$', line)):
+                cleaned_lines.append(line)
+        text = '\n'.join(cleaned_lines)
         
         return text.strip()
     
@@ -789,8 +869,8 @@ text_processor = ImprovedTextProcessor()
 
 # Convenience functions for backward compatibility
 async def extract_entities_efficient(text: str) -> List[Dict[str, str]]:
-    """Extract entities using efficient spaCy-based approach"""
-    entities = nlp_processor.extract_entities(text)
+    """Extract entities using LLM-based approach with gemma3:1b"""
+    entities = await nlp_processor.extract_entities(text)
     return [entity.to_dict() for entity in entities]
 
 async def get_embeddings_batch(texts: List[str]) -> List[List[float]]:

@@ -2,7 +2,9 @@
 Document API for Graph RAG with efficient processing and batch optimization.
 
 Features:
-- Efficient spaCy-based NER (200-500x faster than LLM)
+- LLM-based NER using gemma3:1b model via OpenAI-compatible API
+- LLM-based coreference resolution using gemma3:1b model
+- Boilerplate and navigation text removal before chunking
 - Batch embedding processing (10x speed improvement)
 - Proper async handling throughout
 - Enhanced error handling and logging
@@ -66,6 +68,79 @@ class GraphManager:
     def __init__(self, neo4j_driver):
         self.driver = neo4j_driver
         self.logger = logging.getLogger("GraphManager")
+        self._vector_indexes_created = False
+    
+    async def _ensure_vector_indexes(self, embedding_dim: int = 1024):
+        """Create vector indexes for embeddings if they don't exist"""
+        if self._vector_indexes_created:
+            return
+        
+        try:
+            # Try to get actual embedding dimension from existing chunks
+            try:
+                dim_query = """
+                MATCH (c:Chunk)
+                WHERE c.embedding IS NOT NULL
+                RETURN size(c.embedding) AS dim
+                LIMIT 1
+                """
+                dim_result = await run_cypher_query_async(self.driver, dim_query)
+                if dim_result and dim_result[0].get("dim"):
+                    embedding_dim = dim_result[0]["dim"]
+                    self.logger.info(f"Detected embedding dimension: {embedding_dim}")
+            except Exception as dim_e:
+                self.logger.debug(f"Could not detect embedding dimension, using default {embedding_dim}: {dim_e}")
+            
+            # Create vector index for Chunk embeddings
+            chunk_index_query = f"""
+            CREATE VECTOR INDEX chunk_embedding_index IF NOT EXISTS
+            FOR (c:Chunk) ON c.embedding
+            OPTIONS {{
+                indexConfig: {{
+                    `vector.dimensions`: {embedding_dim},
+                    `vector.similarity_function`: 'cosine'
+                }}
+            }}
+            """
+            
+            # Create vector index for Entity embeddings
+            entity_index_query = f"""
+            CREATE VECTOR INDEX entity_embedding_index IF NOT EXISTS
+            FOR (e:Entity) ON e.embedding
+            OPTIONS {{
+                indexConfig: {{
+                    `vector.dimensions`: {embedding_dim},
+                    `vector.similarity_function`: 'cosine'
+                }}
+            }}
+            """
+            
+            # Create vector index for CommunitySummary embeddings
+            community_index_query = f"""
+            CREATE VECTOR INDEX community_summary_embedding_index IF NOT EXISTS
+            FOR (cs:CommunitySummary) ON cs.embedding
+            OPTIONS {{
+                indexConfig: {{
+                    `vector.dimensions`: {embedding_dim},
+                    `vector.similarity_function`: 'cosine'
+                }}
+            }}
+            """
+            
+            await run_cypher_query_async(self.driver, chunk_index_query)
+            await run_cypher_query_async(self.driver, entity_index_query)
+            await run_cypher_query_async(self.driver, community_index_query)
+            self._vector_indexes_created = True
+            self.logger.info(f"Vector indexes created successfully with dimension {embedding_dim}")
+            
+        except Exception as e:
+            # If vector indexes are not supported (Neo4j < 5.11), log warning and continue
+            if "VECTOR" in str(e).upper() or "index" in str(e).lower():
+                self.logger.warning(f"Vector indexes may not be supported in this Neo4j version: {e}")
+                self.logger.warning("Falling back to property-based storage")
+            else:
+                self.logger.error(f"Error creating vector indexes: {e}")
+                raise
     
     async def build_graph_efficient(
         self, 
@@ -73,7 +148,7 @@ class GraphManager:
         metadata_list: List[Dict[str, Any]]
     ) -> Dict[str, Any]:
         """
-        Build graph efficiently using batch processing and spaCy NER
+        Build graph efficiently using batch processing and LLM-based NER
         """
         start_time = asyncio.get_event_loop().time()
         
@@ -96,10 +171,15 @@ class GraphManager:
         # Step 1: Batch generate embeddings for all chunks
         chunk_embeddings = await embedding_client.get_embeddings(valid_chunks)
         
-        # Step 2: Extract entities from all chunks using efficient spaCy processing
+        # Ensure vector indexes exist (after we have embeddings to detect dimension)
+        if chunk_embeddings and len(chunk_embeddings) > 0:
+            embedding_dim = len(chunk_embeddings[0])
+            await self._ensure_vector_indexes(embedding_dim)
+        
+        # Step 2: Extract entities from all chunks using LLM-based processing
         all_entities_data = []
         for i, chunk in enumerate(valid_chunks):
-            entities = nlp_processor.extract_entities(chunk)
+            entities = await nlp_processor.extract_entities(chunk)
             all_entities_data.append(entities)
         
         # Step 3: Collect unique entities and batch generate their embeddings
@@ -249,11 +329,16 @@ class GraphManager:
     
     async def generate_community_summaries(self, doc_id: str) -> Dict[str, Any]:
         """
-        Generate community summaries using improved clustering and summarization
+        Generate community summaries using Leiden algorithm from Neo4j GDS
         """
         try:
-            # Use simple clustering based on entity co-occurrence
-            communities = await self._detect_communities_simple(doc_id)
+            # Use Leiden algorithm for community detection
+            communities = await self._detect_communities_leiden(doc_id)
+            
+            # Fallback to simple method if Leiden fails
+            if not communities:
+                self.logger.warning("Leiden algorithm failed, falling back to simple co-occurrence")
+                communities = await self._detect_communities_simple(doc_id)
             
             if not communities:
                 self.logger.warning(f"No communities detected for doc_id: {doc_id}")
@@ -302,8 +387,93 @@ class GraphManager:
             self.logger.error(f"Error generating community summaries: {e}")
             return {"communities_created": 0, "error": str(e)}
     
+    async def _detect_communities_leiden(self, doc_id: str) -> Dict[str, List[str]]:
+        """Detect communities using Leiden algorithm from Neo4j GDS"""
+        try:
+            graph_name = f"entity-graph-{doc_id.replace('-', '_')}"  # GDS graph names can't have hyphens
+            
+            # First, create CO_OCCURS relationships if they don't exist
+            create_relationships_query = """
+            MATCH (e1:Entity {doc_id: $doc_id})-[:MENTIONED_IN]->(c:Chunk)<-[:MENTIONED_IN]-(e2:Entity {doc_id: $doc_id})
+            WHERE e1.name <> e2.name AND id(e1) < id(e2)
+            WITH e1, e2, count(c) AS weight
+            WHERE weight >= 2
+            MERGE (e1)-[r:CO_OCCURS]-(e2)
+            SET r.weight = weight, r.doc_id = $doc_id
+            """
+            
+            await run_cypher_query_async(self.driver, create_relationships_query, {"doc_id": doc_id})
+            
+            # Drop existing graph projection if it exists
+            try:
+                drop_existing = f"CALL gds.graph.drop('{graph_name}') YIELD graphName"
+                await run_cypher_query_async(self.driver, drop_existing, {})
+            except:
+                pass  # Graph may not exist
+            
+            # Create a graph projection for GDS using Cypher projection
+            project_query = f"""
+            CALL gds.graph.project.cypher(
+                '{graph_name}',
+                'MATCH (e:Entity {{doc_id: $doc_id}}) RETURN id(e) AS id',
+                'MATCH (e1:Entity {{doc_id: $doc_id}})-[r:CO_OCCURS]-(e2:Entity {{doc_id: $doc_id}}) RETURN id(e1) AS source, id(e2) AS target, coalesce(r.weight, 1.0) AS weight',
+                {{
+                    parameters: {{doc_id: $doc_id}},
+                    relationshipProperties: {{
+                        weight: {{
+                            property: 'weight',
+                            defaultValue: 1.0
+                        }}
+                    }}
+                }}
+            )
+            YIELD graphName, nodeCount, relationshipCount, projectMillis
+            """
+            
+            project_result = await run_cypher_query_async(self.driver, project_query, {"doc_id": doc_id})
+            
+            if not project_result or project_result[0].get("nodeCount", 0) == 0:
+                self.logger.warning("No entities found for Leiden algorithm")
+                return {}
+            
+            # Run Leiden algorithm
+            leiden_query = f"""
+            CALL gds.leiden.stream('{graph_name}', {{
+                maxLevels: 10,
+                randomSeed: 42
+            }})
+            YIELD nodeId, communityId
+            RETURN gds.util.asNode(nodeId).name AS entity_name, communityId
+            """
+            
+            results = await run_cypher_query_async(self.driver, leiden_query, {})
+            
+            # Group entities by community
+            communities = {}
+            for result in results:
+                community_id = f"community_{result['communityId']}"
+                entity_name = result['entity_name']
+                
+                if community_id not in communities:
+                    communities[community_id] = []
+                communities[community_id].append(entity_name)
+            
+            # Clean up graph projection
+            try:
+                drop_query = f"CALL gds.graph.drop('{graph_name}') YIELD graphName"
+                await run_cypher_query_async(self.driver, drop_query, {})
+            except:
+                pass  # Graph may not exist or already dropped
+            
+            self.logger.info(f"Leiden algorithm detected {len(communities)} communities for doc_id: {doc_id}")
+            return communities
+            
+        except Exception as e:
+            self.logger.warning(f"Leiden algorithm failed: {e}")
+            return {}
+    
     async def _detect_communities_simple(self, doc_id: str) -> Dict[str, List[str]]:
-        """Simple community detection based on entity co-occurrence"""
+        """Simple community detection based on entity co-occurrence (fallback method)"""
         
         # Get entity co-occurrence data
         query = """

@@ -1,27 +1,21 @@
 services:
   neo4j:
-    image: neo4j:latest
-    container_name: neo4j
+    image: ${NEO4J_IMAGE}
+    container_name: ${NEO4J_CONTAINER_NAME}
     ports:
-      - "7474:7474"
-      - "7687:7687"
+      - "${NEO4J_HTTP_PORT}:7474"
+      - "${NEO4J_BOLT_PORT}:7687"
     environment:
-      NEO4J_PLUGINS: '["graph-data-science", "apoc"]'
-      NEO4J_AUTH: "neo4j/neo4j123"
-      NEO4J_dbms_security_procedures_unrestricted: "gds.*"
-      NEO4J_dbms_security_procedures_whitelist: "gds.*"
-      # Memory configuration - increase limits significantly
-      NEO4J_dbms_memory_heap_initial__size: "2G"
-      NEO4J_dbms_memory_heap_max__size: "4G"
-      NEO4J_dbms_memory_pagecache_size: "2G"
-      NEO4J_dbms_memory_transaction_total_max: "8G"
-      # Performance tuning
-      NEO4J_dbms_memory_transaction_max: "2G"
-      NEO4J_dbms_memory_transaction_database_max: "4G"
+      NEO4J_PLUGINS: ${NEO4J_PLUGINS}
+      NEO4J_AUTH: ${NEO4J_AUTH}
+      NEO4J_dbms_security_procedures_unrestricted: ${NEO4J_DBMS_SECURITY_PROCEDURES_UNRESTRICTED}
+      NEO4J_dbms_security_procedures_whitelist: ${NEO4J_DBMS_SECURITY_PROCEDURES_WHITELIST}
+      NEO4J_dbms_memory_heap_initial__size: ${NEO4J_DBMS_MEMORY_HEAP_INITIAL_SIZE}
+      NEO4J_dbms_memory_heap_max__size: ${NEO4J_DBMS_MEMORY_HEAP_MAX_SIZE}
+      NEO4J_dbms_memory_pagecache_size: ${NEO4J_DBMS_MEMORY_PAGECACHE_SIZE}
+      NEO4J_dbms_memory_transaction_total_max: ${NEO4J_DBMS_MEMORY_TRANSACTION_TOTAL_MAX}
     volumes:
-      # On Windows, use forward slashes in paths
-      - "D:/neo4j_data:/data"
-    restart: always
-    # Docker container memory limit
-    mem_limit: 8g
-    memswap_limit: 8g
+      - "${NEO4J_DATA_PATH}:/data"
+    restart: ${NEO4J_RESTART_POLICY}
+    mem_limit: ${NEO4J_CONTAINER_MEM_LIMIT}
+    memswap_limit: ${NEO4J_CONTAINER_MEMSWAP_LIMIT}

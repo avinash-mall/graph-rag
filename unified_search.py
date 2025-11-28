@@ -62,6 +62,8 @@ class RetrievedChunk:
     similarity_score: float
     entities: List[str]
     metadata: Dict[str, Any]
+    embedding: Optional[List[float]] = None  # For MMR reranking
+    final_score: Optional[float] = None  # After reranking
 
 class UnifiedSearchPipeline:
     """
@@ -243,8 +245,62 @@ class UnifiedSearchPipeline:
         doc_id: Optional[str],
         top_k: int
     ) -> List[Dict[str, Any]]:
-        """Execute a vector similarity search and return raw results."""
-
+        """Execute a vector similarity search using Neo4j native vector search."""
+        
+        # Use native vector search with db.index.vector.queryNodes
+        # This is much faster than computing similarity for all nodes
+        try:
+            if doc_id:
+                cypher = """
+                CALL db.index.vector.queryNodes('chunk_embedding_index', $top_k, $query_embedding)
+                YIELD node, score
+                WHERE node.doc_id = $doc_id AND node.text IS NOT NULL
+                RETURN node.id AS chunk_id, node.doc_id AS doc_id, node.text AS text,
+                       node.document_name AS document_name, node.embedding AS embedding, score AS similarity
+                ORDER BY similarity DESC
+                LIMIT $limit
+                """
+            else:
+                cypher = """
+                CALL db.index.vector.queryNodes('chunk_embedding_index', $top_k, $query_embedding)
+                YIELD node, score
+                WHERE node.text IS NOT NULL
+                RETURN node.id AS chunk_id, node.doc_id AS doc_id, node.text AS text,
+                       node.document_name AS document_name, node.embedding AS embedding, score AS similarity
+                ORDER BY similarity DESC
+                LIMIT $limit
+                """
+            
+            params = {
+                "query_embedding": question_embedding,
+                "top_k": top_k * 2,  # Get more candidates for filtering
+                "limit": top_k,
+                "doc_id": doc_id if doc_id else None
+            }
+            
+            results = await run_cypher_query_async(self.driver, cypher, params)
+            
+            # Filter by threshold
+            filtered_results = [
+                r for r in results 
+                if r.get("similarity", 0) >= SIMILARITY_THRESHOLD_CHUNKS
+            ]
+            
+            return filtered_results[:top_k]
+            
+        except Exception as e:
+            # Fallback to GDS similarity if vector index doesn't exist
+            logger.warning(f"Vector index search failed, falling back to GDS similarity: {e}")
+            return await self._run_vector_similarity_search_fallback(question_embedding, doc_id, top_k)
+    
+    async def _run_vector_similarity_search_fallback(
+        self,
+        question_embedding: List[float],
+        doc_id: Optional[str],
+        top_k: int
+    ) -> List[Dict[str, Any]]:
+        """Fallback to GDS similarity if vector indexes are not available."""
+        
         if doc_id:
             cypher = """
             WITH $query_embedding AS queryEmbedding
@@ -253,7 +309,7 @@ class UnifiedSearchPipeline:
             WITH c, gds.similarity.cosine(c.embedding, queryEmbedding) AS similarity
             WHERE similarity >= $threshold
             RETURN c.id AS chunk_id, c.doc_id AS doc_id, c.text AS text,
-                   c.document_name AS document_name, similarity
+                   c.document_name AS document_name, c.embedding AS embedding, similarity
             ORDER BY similarity DESC
             LIMIT $limit
             """
@@ -271,7 +327,7 @@ class UnifiedSearchPipeline:
             WITH c, gds.similarity.cosine(c.embedding, queryEmbedding) AS similarity
             WHERE similarity >= $threshold
             RETURN c.id AS chunk_id, c.doc_id AS doc_id, c.text AS text,
-                   c.document_name AS document_name, similarity
+                   c.document_name AS document_name, c.embedding AS embedding, similarity
             ORDER BY similarity DESC
             LIMIT $limit
             """
@@ -296,6 +352,23 @@ class UnifiedSearchPipeline:
         for result in results:
             entities = await self._get_chunk_entities(result["chunk_id"])
             similarity_score = result.get("similarity", default_similarity)
+            
+            # Get embedding for MMR reranking
+            embedding = result.get("embedding")
+            if not embedding:
+                # Fetch embedding from database if not in result
+                try:
+                    cypher = """
+                    MATCH (c:Chunk {id: $chunk_id})
+                    RETURN c.embedding AS embedding
+                    """
+                    emb_result = await run_cypher_query_async(
+                        self.driver, cypher, {"chunk_id": result["chunk_id"]}
+                    )
+                    if emb_result:
+                        embedding = emb_result[0].get("embedding")
+                except Exception as e:
+                    self.logger.warning(f"Could not fetch embedding for chunk {result['chunk_id']}: {e}")
 
             chunks.append(RetrievedChunk(
                 chunk_id=result["chunk_id"],
@@ -303,6 +376,7 @@ class UnifiedSearchPipeline:
                 text=result["text"],
                 similarity_score=similarity_score,
                 entities=entities,
+                embedding=embedding,
                 metadata={
                     "document_name": result.get("document_name", ""),
                     "retrieval_method": retrieval_method
@@ -474,7 +548,7 @@ class UnifiedSearchPipeline:
         max_chunks: int
     ) -> List[RetrievedChunk]:
         """
-        Rank chunks by relevance and filter to top results
+        Rank chunks using graph-aware reranking and MMR diversity reranking
         """
         if not chunks:
             return []
@@ -491,17 +565,237 @@ class UnifiedSearchPipeline:
         
         chunks = list(unique_chunks.values())
         
-        # Sort by similarity score
-        chunks.sort(key=lambda x: x.similarity_score, reverse=True)
-        
-        # Apply relevance threshold
+        # Apply relevance threshold first
         filtered_chunks = [
             chunk for chunk in chunks 
             if chunk.similarity_score >= RELEVANCE_THRESHOLD
         ]
         
-        # Limit to max_chunks
-        return filtered_chunks[:max_chunks]
+        if not filtered_chunks:
+            return []
+        
+        # Step 1: Graph-aware reranking
+        graph_reranked = await self._graph_aware_rerank(filtered_chunks, question)
+        
+        # Step 2: MMR diversity-aware reranking
+        final_chunks = await self._mmr_rerank(graph_reranked, max_chunks, lambda_param=0.7)
+        
+        return final_chunks
+    
+    async def _graph_aware_rerank(
+        self,
+        chunks: List[RetrievedChunk],
+        question: str
+    ) -> List[RetrievedChunk]:
+        """
+        Graph-aware reranking using entity overlap, centrality, and community match
+        """
+        try:
+            # Extract entities from query
+            query_entities = await nlp_processor.extract_entities(question)
+            query_entity_names = {e.name.lower() for e in query_entities}
+            
+            # Get community scores for chunks
+            community_scores = await self._get_community_scores_for_chunks(
+                [c.chunk_id for c in chunks], question
+            )
+            
+            # Get centrality scores (precomputed or compute on the fly)
+            centrality_scores = await self._get_chunk_centrality_scores(
+                [c.chunk_id for c in chunks]
+            )
+            
+            # Get entity overlap for each chunk
+            for chunk in chunks:
+                chunk_entity_names = {e.lower() for e in chunk.entities}
+                entity_overlap = len(query_entity_names & chunk_entity_names)
+                
+                # Normalize overlap (divide by max possible)
+                max_overlap = max(1, len(query_entity_names))
+                entity_overlap_score = entity_overlap / max_overlap
+                
+                # Get community score
+                community_score = community_scores.get(chunk.chunk_id, 0.0)
+                
+                # Get centrality score
+                centrality = centrality_scores.get(chunk.chunk_id, 0.0)
+                
+                # Combine scores: base similarity + graph features
+                # Weights: similarity (0.5), entity overlap (0.3), community (0.15), centrality (0.05)
+                final_score = (
+                    0.5 * chunk.similarity_score +
+                    0.3 * entity_overlap_score +
+                    0.15 * community_score +
+                    0.05 * centrality
+                )
+                
+                chunk.final_score = final_score
+                chunk.metadata.update({
+                    "entity_overlap": entity_overlap,
+                    "entity_overlap_score": entity_overlap_score,
+                    "community_score": community_score,
+                    "centrality": centrality
+                })
+            
+            # Sort by final score
+            chunks.sort(key=lambda x: x.final_score or x.similarity_score, reverse=True)
+            return chunks
+            
+        except Exception as e:
+            self.logger.warning(f"Graph-aware reranking failed: {e}, using similarity scores")
+            for chunk in chunks:
+                chunk.final_score = chunk.similarity_score
+            return chunks
+    
+    async def _get_community_scores_for_chunks(
+        self,
+        chunk_ids: List[str],
+        question: str
+    ) -> Dict[str, float]:
+        """Get community relevance scores for chunks"""
+        try:
+            # Get question embedding
+            question_embedding = await embedding_client.get_embedding(question)
+            
+            # Query to get community scores for chunks
+            # Find chunks that belong to communities via entities
+            cypher = """
+            MATCH (c:Chunk)
+            WHERE c.id IN $chunk_ids
+            MATCH (e:Entity)-[:MENTIONED_IN]->(c)
+            MATCH (cs:CommunitySummary)
+            WHERE cs.embedding IS NOT NULL AND cs.doc_id = c.doc_id
+            WITH c.id AS chunk_id, cs.embedding AS community_embedding, cs.summary AS summary,
+                 cs.community AS community
+            RETURN DISTINCT chunk_id, community_embedding, summary, community
+            """
+            
+            results = await run_cypher_query_async(
+                self.driver, cypher, {"chunk_ids": chunk_ids}
+            )
+            
+            community_scores = {}
+            for result in results:
+                chunk_id = result["chunk_id"]
+                if result.get("community_embedding"):
+                    similarity = cosine_similarity(
+                        question_embedding, result["community_embedding"]
+                    )
+                    # Keep max community score for each chunk
+                    if chunk_id not in community_scores or similarity > community_scores[chunk_id]:
+                        community_scores[chunk_id] = similarity
+            
+            return community_scores
+            
+        except Exception as e:
+            self.logger.warning(f"Error getting community scores: {e}")
+            return {}
+    
+    async def _get_chunk_centrality_scores(
+        self,
+        chunk_ids: List[str]
+    ) -> Dict[str, float]:
+        """Get centrality scores for chunks (precomputed or compute on the fly)"""
+        try:
+            # Try to get precomputed centrality
+            cypher = """
+            MATCH (c:Chunk)
+            WHERE c.id IN $chunk_ids AND c.centrality IS NOT NULL
+            RETURN c.id AS chunk_id, c.centrality AS centrality
+            """
+            
+            results = await run_cypher_query_async(
+                self.driver, cypher, {"chunk_ids": chunk_ids}
+            )
+            
+            centrality_scores = {r["chunk_id"]: r["centrality"] for r in results}
+            
+            # If not precomputed, compute simple degree centrality
+            missing_ids = [cid for cid in chunk_ids if cid not in centrality_scores]
+            if missing_ids:
+                degree_cypher = """
+                MATCH (c:Chunk)
+                WHERE c.id IN $chunk_ids
+                OPTIONAL MATCH (e:Entity)-[:MENTIONED_IN]->(c)
+                WITH c.id AS chunk_id, count(e) AS degree
+                RETURN chunk_id, degree
+                """
+                
+                degree_results = await run_cypher_query_async(
+                    self.driver, degree_cypher, {"chunk_ids": missing_ids}
+                )
+                
+                # Normalize degree centrality
+                if degree_results:
+                    max_degree = max(r["degree"] for r in degree_results) or 1
+                    for result in degree_results:
+                        normalized = result["degree"] / max_degree
+                        centrality_scores[result["chunk_id"]] = normalized
+            
+            return centrality_scores
+            
+        except Exception as e:
+            self.logger.warning(f"Error getting centrality scores: {e}")
+            return {}
+    
+    async def _mmr_rerank(
+        self,
+        candidates: List[RetrievedChunk],
+        top_k: int,
+        lambda_param: float = 0.7
+    ) -> List[RetrievedChunk]:
+        """
+        Maximal Marginal Relevance (MMR) reranking for diversity
+        MMR(doc) = λ * relevance(doc, query) - (1 - λ) * max_sim(doc, already_chosen)
+        """
+        if not candidates or top_k <= 0:
+            return []
+        
+        # Use final_score if available, otherwise similarity_score
+        for c in candidates:
+            if c.final_score is None:
+                c.final_score = c.similarity_score
+        
+        selected: List[RetrievedChunk] = []
+        remaining = candidates.copy()
+        
+        while remaining and len(selected) < top_k:
+            best_doc = None
+            best_score = float('-inf')
+            best_idx = -1
+            
+            for idx, candidate in enumerate(remaining):
+                # Relevance score
+                relevance = candidate.final_score or candidate.similarity_score
+                
+                # Diversity penalty: max similarity to already selected chunks
+                diversity_penalty = 0.0
+                if selected and candidate.embedding:
+                    max_similarity = 0.0
+                    for selected_chunk in selected:
+                        if selected_chunk.embedding:
+                            similarity = cosine_similarity(
+                                candidate.embedding, selected_chunk.embedding
+                            )
+                            max_similarity = max(max_similarity, similarity)
+                    diversity_penalty = max_similarity
+                
+                # MMR score
+                mmr_score = lambda_param * relevance - (1 - lambda_param) * diversity_penalty
+                
+                if mmr_score > best_score:
+                    best_score = mmr_score
+                    best_doc = candidate
+                    best_idx = idx
+            
+            if best_doc:
+                selected.append(best_doc)
+                remaining.pop(best_idx)
+                best_doc.metadata["mmr_score"] = best_score
+            else:
+                break
+        
+        return selected
     
     async def _get_relevant_community_summaries(
         self, 
@@ -510,8 +804,70 @@ class UnifiedSearchPipeline:
         max_summaries: int
     ) -> List[Dict[str, Any]]:
         """
-        Get relevant community summaries based on question similarity
+        Get relevant community summaries using Neo4j native vector search
         """
+        try:
+            question_embedding = await embedding_client.get_embedding(question)
+            
+            # Use native vector search with db.index.vector.queryNodes
+            try:
+                if doc_id:
+                    cypher = """
+                    CALL db.index.vector.queryNodes('community_summary_embedding_index', $top_k, $query_embedding)
+                    YIELD node, score
+                    WHERE node.doc_id = $doc_id AND node.summary IS NOT NULL
+                    RETURN node.community AS community, node.summary AS summary, score AS similarity_score
+                    ORDER BY similarity_score DESC
+                    LIMIT $limit
+                    """
+                else:
+                    cypher = """
+                    CALL db.index.vector.queryNodes('community_summary_embedding_index', $top_k, $query_embedding)
+                    YIELD node, score
+                    WHERE node.summary IS NOT NULL
+                    RETURN node.community AS community, node.summary AS summary, score AS similarity_score
+                    ORDER BY similarity_score DESC
+                    LIMIT $limit
+                    """
+                
+                params = {
+                    "query_embedding": question_embedding,
+                    "top_k": max_summaries * 2,  # Get more candidates for filtering
+                    "limit": max_summaries,
+                    "doc_id": doc_id if doc_id else None
+                }
+                
+                results = await run_cypher_query_async(self.driver, cypher, params)
+                
+                # Filter by threshold
+                scored_summaries = [
+                    {
+                        "community": r["community"],
+                        "summary": r["summary"],
+                        "similarity_score": r["similarity_score"]
+                    }
+                    for r in results
+                    if r.get("similarity_score", 0) >= RELEVANCE_THRESHOLD
+                ]
+                
+                return scored_summaries[:max_summaries]
+                
+            except Exception as e:
+                # Fallback to cosine similarity if vector index doesn't exist
+                self.logger.warning(f"Vector index search for community summaries failed, using fallback: {e}")
+                return await self._get_relevant_community_summaries_fallback(question, doc_id, max_summaries)
+            
+        except Exception as e:
+            self.logger.warning(f"Community summary retrieval failed: {e}")
+            return []
+    
+    async def _get_relevant_community_summaries_fallback(
+        self, 
+        question: str, 
+        doc_id: Optional[str], 
+        max_summaries: int
+    ) -> List[Dict[str, Any]]:
+        """Fallback method using cosine similarity in Python"""
         try:
             # Build query for community summaries
             if doc_id:
@@ -554,7 +910,7 @@ class UnifiedSearchPipeline:
             return scored_summaries[:max_summaries]
             
         except Exception as e:
-            self.logger.warning(f"Community summary retrieval failed: {e}")
+            self.logger.warning(f"Community summary fallback retrieval failed: {e}")
             return []
     
     async def _generate_answer(
