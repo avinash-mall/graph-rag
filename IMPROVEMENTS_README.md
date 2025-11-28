@@ -31,7 +31,7 @@ graph-rag/
 ├── document_api.py               # Document processing API
 ├── search_api.py                 # Unified search API
 ├── unified_search.py             # Core search pipeline logic
-├── test_improved_system.py       # Comprehensive test suite
+├── test_system.py                # Comprehensive system test suite
 ├── requirements.txt              # Dependencies
 └── README.md                     # This file
 ```
