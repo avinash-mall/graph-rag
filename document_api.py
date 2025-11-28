@@ -36,6 +36,7 @@ DB_URL = os.getenv("DB_URL")
 DB_USERNAME = os.getenv("DB_USERNAME")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 CHUNK_SIZE_GDS = int(os.getenv("CHUNK_SIZE_GDS", "512"))
+DOCUMENT_PROCESSING_BATCH_SIZE = int(os.getenv("DOCUMENT_PROCESSING_BATCH_SIZE", "20"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 # Setup logging
@@ -117,8 +118,8 @@ class GraphManager:
         entities_created = 0
         
         try:
-            # Process chunks in batches
-            batch_size = 10
+            # Process chunks in batches (use smaller batches to reduce memory pressure)
+            batch_size = DOCUMENT_PROCESSING_BATCH_SIZE
             for i in range(0, len(valid_chunks), batch_size):
                 batch_chunks = valid_chunks[i:i + batch_size]
                 batch_metadata = valid_metadata[i:i + batch_size]

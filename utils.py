@@ -436,6 +436,7 @@ class AsyncLLMClient:
 class BatchEmbeddingClient:
     """
     Efficient batch embedding client with caching and optimization
+    Supports both Ollama/OpenAI and Gemini embedding APIs
     """
     
     def __init__(self):
@@ -444,13 +445,14 @@ class BatchEmbeddingClient:
         self.model_name = os.getenv("EMBEDDING_MODEL_NAME", "mxbai-embed-large")
         self.timeout = int(os.getenv("API_TIMEOUT", "600"))
         self.batch_size = int(os.getenv("EMBEDDING_BATCH_SIZE", "10"))
+        self.provider = os.getenv("LLM_PROVIDER", "openai").lower()
         
         # In-memory cache with TTL
         self.cache = {}
         self.cache_timestamps = {}
         self.cache_ttl = CACHE_TTL
         
-        logger.info(f"Initialized BatchEmbeddingClient with batch_size={self.batch_size}")
+        logger.info(f"Initialized BatchEmbeddingClient with provider={self.provider}, batch_size={self.batch_size}")
         if not self.embedding_api_key:
             logger.warning("EMBEDDING_API_KEY not found in environment variables")
     
@@ -520,7 +522,11 @@ class BatchEmbeddingClient:
                 batch_indices = [idx for idx, _ in batch]
                 
                 try:
-                    batch_embeddings = await self._fetch_batch_embeddings(batch_texts)
+                    # Choose embedding method based on provider
+                    if self.provider in {"openai", "ollama"}:
+                        batch_embeddings = await self._fetch_batch_embeddings_openai(batch_texts)
+                    else:  # gemini
+                        batch_embeddings = await self._fetch_batch_embeddings_gemini(batch_texts)
                     
                     # Store results and update cache
                     for j, embedding in enumerate(batch_embeddings):
@@ -541,7 +547,43 @@ class BatchEmbeddingClient:
         # Clean up None values
         return [emb if emb is not None else [] for emb in results]
     
-    async def _fetch_batch_embeddings(self, texts: List[str]) -> List[List[float]]:
+    async def _fetch_batch_embeddings_openai(self, texts: List[str]) -> List[List[float]]:
+        """Fetch embeddings for a batch of texts using OpenAI/Ollama compatible API"""
+        # OpenAI/Ollama API format for embeddings
+        payload = {
+            "model": self.model_name,
+            "input": texts
+        }
+        
+        # Prepare headers for OpenAI/Ollama API
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.embedding_api_key}"
+        }
+        
+        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+            response = await client.post(
+                self.embedding_api_url,
+                json=payload,
+                headers=headers
+            )
+            response.raise_for_status()
+            
+            data = response.json()
+            embeddings_data = data.get("data", [])
+            
+            # Extract the actual embedding values
+            embeddings = []
+            for emb_data in embeddings_data:
+                embedding = emb_data.get("embedding", [])
+                embeddings.append(embedding)
+            
+            if len(embeddings) != len(texts):
+                raise ValueError(f"Invalid embedding response: expected {len(texts)}, got {len(embeddings)}")
+            
+            return embeddings
+    
+    async def _fetch_batch_embeddings_gemini(self, texts: List[str]) -> List[List[float]]:
         """Fetch embeddings for a batch of texts using Gemini API"""
         # Gemini API format for embeddings
         requests = []
