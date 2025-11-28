@@ -446,6 +446,7 @@ class BatchEmbeddingClient:
         self.timeout = int(os.getenv("API_TIMEOUT", "600"))
         self.batch_size = int(os.getenv("EMBEDDING_BATCH_SIZE", "10"))
         self.provider = os.getenv("LLM_PROVIDER", "openai").lower()
+        self.include_bearer_auth = os.getenv("EMBEDDING_INCLUDE_BEARER_AUTH", "true").lower() == "true"
         
         # In-memory cache with TTL
         self.cache = {}
@@ -594,15 +595,21 @@ class BatchEmbeddingClient:
                     "parts": [{"text": text}]
                 }
             })
-        
+
         payload = {"requests": requests}
-        
+
         # Prepare headers for Gemini API
         headers = {
             "Content-Type": "application/json",
             "x-goog-api-key": self.embedding_api_key
         }
-        
+
+        # Some services expect both API key styles; allow opt-in via env
+        if self.include_bearer_auth:
+            if not self.embedding_api_key:
+                raise ValueError("EMBEDDING_API_KEY is required when EMBEDDING_INCLUDE_BEARER_AUTH is enabled")
+            headers["Authorization"] = f"Bearer {self.embedding_api_key}"
+
         # Construct the correct Gemini API URL for batch embeddings
         api_url = f"{self.embedding_api_url}/models/{self.model_name}:batchEmbedContents"
         
