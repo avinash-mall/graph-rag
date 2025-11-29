@@ -94,7 +94,7 @@ class GraphManager:
             # Create vector index for Chunk embeddings
             chunk_index_query = f"""
             CREATE VECTOR INDEX chunk_embedding_index IF NOT EXISTS
-            FOR (c:Chunk) ON c.embedding
+            FOR (c:Chunk) ON (c.embedding)
             OPTIONS {{
                 indexConfig: {{
                     `vector.dimensions`: {embedding_dim},
@@ -106,7 +106,7 @@ class GraphManager:
             # Create vector index for Entity embeddings
             entity_index_query = f"""
             CREATE VECTOR INDEX entity_embedding_index IF NOT EXISTS
-            FOR (e:Entity) ON e.embedding
+            FOR (e:Entity) ON (e.embedding)
             OPTIONS {{
                 indexConfig: {{
                     `vector.dimensions`: {embedding_dim},
@@ -118,7 +118,7 @@ class GraphManager:
             # Create vector index for CommunitySummary embeddings
             community_index_query = f"""
             CREATE VECTOR INDEX community_summary_embedding_index IF NOT EXISTS
-            FOR (cs:CommunitySummary) ON cs.embedding
+            FOR (cs:CommunitySummary) ON (cs.embedding)
             OPTIONS {{
                 indexConfig: {{
                     `vector.dimensions`: {embedding_dim},
@@ -317,7 +317,8 @@ class GraphManager:
         
         relationship_query = """
         MATCH (e1:Entity {doc_id: $doc_id})-[:MENTIONED_IN]->(c:Chunk)<-[:MENTIONED_IN]-(e2:Entity {doc_id: $doc_id})
-        WHERE e1.name < e2.name  // Avoid duplicate relationships
+        WHERE e1.name < e2.name
+        // Avoid duplicate relationships
         WITH e1, e2, count(c) as co_occurrence_count
         WHERE co_occurrence_count > 0
         MERGE (e1)-[r:RELATES_TO]-(e2)
