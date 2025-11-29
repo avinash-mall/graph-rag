@@ -142,8 +142,9 @@ class EfficientNLPProcessor:
     async def _call_llm(self, messages: List[Dict[str, str]], base_url: str, model: str, api_key: str, temperature: float) -> str:
         """Call OpenAI-compatible LLM API"""
         try:
-            # Construct API URL
-            if "/v1" in base_url:
+            # Construct API URL - handle base_url that may already include /v1
+            base_url = base_url.rstrip('/')
+            if base_url.endswith('/v1'):
                 api_url = f"{base_url}/chat/completions"
             else:
                 api_url = f"{base_url}/v1/chat/completions"
@@ -394,7 +395,12 @@ class AsyncLLMClient:
 
     async def _invoke_openai(self, messages: List[Dict[str, str]], max_retries: int) -> str:
         """Call OpenAI/Ollama-compatible chat completions endpoint."""
-        url = f"{self.base_url.rstrip('/')}/v1/chat/completions"
+        # Construct URL - handle base_url that may already include /v1
+        base_url = self.base_url.rstrip('/')
+        if base_url.endswith('/v1'):
+            url = f"{base_url}/chat/completions"
+        else:
+            url = f"{base_url}/v1/chat/completions"
 
         payload: Dict[str, Any] = {
             "model": self.model,
