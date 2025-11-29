@@ -6,6 +6,7 @@ python-dotenv
 python-docx
 pypdf
 uvicorn
+python-multipart
 blingfire
 urllib3
 pydantic
