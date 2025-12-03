@@ -26,3 +26,5 @@ redis>=4.5.0
 # Testing and logging
 pytest>=7.4.0
 pytest-asyncio>=0.21.0
+# MCP (Model Context Protocol) for tool calling
+mcp[cli]>=1.0.0

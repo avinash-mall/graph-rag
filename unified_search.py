@@ -25,6 +25,8 @@ from utils import (
     nlp_processor, llm_client, embedding_client, text_processor,
     cosine_similarity, run_cypher_query_async
 )
+from question_classifier import classify_question, ClassificationResult
+from map_reduce import map_reduce_communities
 
 load_dotenv()
 
@@ -84,7 +86,7 @@ class UnifiedSearchPipeline:
         max_chunks: int = MAX_CHUNKS_PER_ANSWER
     ) -> SearchResult:
         """
-        Main search function that implements the improved pipeline
+        Main search function with agentic classification and routing
         
         Args:
             question: User's question
@@ -98,6 +100,157 @@ class UnifiedSearchPipeline:
         """
         start_time = asyncio.get_event_loop().time()
         
+        try:
+            # Step 0: Classify question to determine search strategy
+            classification = await classify_question(question)
+            question_type = classification["type"]
+            classification_reason = classification.get("reason", "")
+            classification_confidence = classification.get("confidence", 0.5)
+            
+            self.logger.info(
+                f"Question classified as: {question_type} "
+                f"(confidence: {classification_confidence:.2f}, reason: {classification_reason})"
+            )
+            
+            # Route based on classification
+            if question_type == "OUT_OF_SCOPE":
+                return await self._handle_out_of_scope_question(question, start_time)
+            elif question_type == "BROAD":
+                return await self._search_with_communities(
+                    question, conversation_history, doc_id, max_chunks, start_time
+                )
+            else:  # CHUNK or default
+                return await self._search_with_chunks(
+                    question, conversation_history, doc_id, scope, max_chunks, start_time
+                )
+            
+        except Exception as e:
+            self.logger.error(f"Search pipeline error: {e}")
+            end_time = asyncio.get_event_loop().time()
+            return SearchResult(
+                answer=f"I apologize, but I encountered an error while searching: {str(e)}",
+                relevant_chunks=[],
+                community_summaries=[],
+                entities_found=[],
+                confidence_score=0.0,
+                search_metadata={
+                    "error": str(e),
+                    "search_time": end_time - start_time
+                }
+            )
+    
+    async def _handle_out_of_scope_question(self, question: str, start_time: float) -> SearchResult:
+        """Handle out-of-scope questions"""
+        end_time = asyncio.get_event_loop().time()
+        self.logger.info("Question is out of scope")
+        
+        return SearchResult(
+            answer="I'm not confident this question can be answered from the knowledge base. "
+                   "Please try rephrasing your question or asking about content in your uploaded documents.",
+            relevant_chunks=[],
+            community_summaries=[],
+            entities_found=[],
+            confidence_score=0.0,
+            search_metadata={
+                "question_type": "OUT_OF_SCOPE",
+                "search_time": end_time - start_time,
+                "routed": True
+            }
+        )
+    
+    async def _search_with_communities(
+        self,
+        question: str,
+        conversation_history: Optional[str],
+        doc_id: Optional[str],
+        max_communities: int,
+        start_time: float
+    ) -> SearchResult:
+        """
+        Search using community summaries with map-reduce for broad questions.
+        """
+        try:
+            # Preprocess query
+            processed_question = await self._preprocess_query(question, conversation_history)
+            
+            # Get more communities for map-reduce (default 20, but configurable)
+            max_comm = int(os.getenv("BROAD_SEARCH_MAX_COMMUNITIES", "20"))
+            community_summaries = await self._get_relevant_community_summaries(
+                processed_question, doc_id, max_comm
+            )
+            
+            self.logger.info(f"Retrieved {len(community_summaries)} community summaries for broad search")
+            
+            # Use map-reduce to generate answer from communities
+            answer = await map_reduce_communities(
+                processed_question, community_summaries, conversation_history
+            )
+            
+            # Extract entities from communities (optional)
+            entities_found = []
+            if community_summaries:
+                # Try to extract entities from summaries
+                all_summaries_text = " ".join([cs.get("summary", "") for cs in community_summaries])
+                if all_summaries_text:
+                    entities = await nlp_processor.extract_entities(all_summaries_text[:2000])
+                    entities_found = [{"name": e.name, "type": e.type} for e in entities]
+            
+            # Calculate confidence based on community relevance
+            if community_summaries:
+                avg_similarity = sum(
+                    cs.get("similarity_score", 0) for cs in community_summaries
+                ) / len(community_summaries)
+                confidence_score = min(1.0, avg_similarity + 0.1)  # Boost for broad understanding
+            else:
+                confidence_score = 0.3
+            
+            end_time = asyncio.get_event_loop().time()
+            search_time = end_time - start_time
+            
+            return SearchResult(
+                answer=answer,
+                relevant_chunks=[],  # No chunks for broad search
+                community_summaries=community_summaries,
+                entities_found=entities_found,
+                confidence_score=round(confidence_score, 2),
+                search_metadata={
+                    "question_type": "BROAD",
+                    "search_time": search_time,
+                    "communities_used": len(community_summaries),
+                    "strategy": "map_reduce_communities",
+                    "doc_id": doc_id
+                }
+            )
+            
+        except Exception as e:
+            self.logger.error(f"Broad search error: {e}")
+            end_time = asyncio.get_event_loop().time()
+            return SearchResult(
+                answer=f"I encountered an error while processing your broad question: {str(e)}",
+                relevant_chunks=[],
+                community_summaries=[],
+                entities_found=[],
+                confidence_score=0.0,
+                search_metadata={
+                    "question_type": "BROAD",
+                    "error": str(e),
+                    "search_time": end_time - start_time
+                }
+            )
+    
+    async def _search_with_chunks(
+        self,
+        question: str,
+        conversation_history: Optional[str],
+        doc_id: Optional[str],
+        scope: SearchScope,
+        max_chunks: int,
+        start_time: float
+    ) -> SearchResult:
+        """
+        Search using chunk-level retrieval for specific questions.
+        This is the original search method, now used for CHUNK-type questions.
+        """
         try:
             # Step 1: Query preprocessing
             processed_question = await self._preprocess_query(question, conversation_history)
@@ -124,9 +277,9 @@ class UnifiedSearchPipeline:
             )
             self.logger.info(f"Final selection: {len(final_chunks)} chunks")
             
-            # Step 5: Get relevant community summaries (if available)
+            # Step 5: Get relevant community summaries (optional, fewer for chunk search)
             community_summaries = await self._get_relevant_community_summaries(
-                processed_question, doc_id, MAX_COMMUNITY_SUMMARIES
+                processed_question, doc_id, min(3, MAX_COMMUNITY_SUMMARIES)  # Fewer summaries for chunk search
             )
             
             # Step 6: Generate answer using selected context
@@ -147,23 +300,30 @@ class UnifiedSearchPipeline:
                 entities_found=await self._extract_entities_from_chunks(final_chunks),
                 confidence_score=confidence_score,
                 search_metadata={
+                    "question_type": "CHUNK",
                     "search_time": search_time,
                     "chunks_retrieved": len(relevant_chunks),
                     "chunks_used": len(final_chunks),
                     "scope": scope.value,
-                    "doc_id": doc_id
+                    "doc_id": doc_id,
+                    "strategy": "chunk_level_retrieval"
                 }
             )
             
         except Exception as e:
-            self.logger.error(f"Search pipeline error: {e}")
+            self.logger.error(f"Chunk search error: {e}")
+            end_time = asyncio.get_event_loop().time()
             return SearchResult(
-                answer=f"I apologize, but I encountered an error while searching: {str(e)}",
+                answer=f"I encountered an error while searching: {str(e)}",
                 relevant_chunks=[],
                 community_summaries=[],
                 entities_found=[],
                 confidence_score=0.0,
-                search_metadata={"error": str(e)}
+                search_metadata={
+                    "question_type": "CHUNK",
+                    "error": str(e),
+                    "search_time": end_time - start_time
+                }
             )
     
     async def _preprocess_query(self, question: str, conversation_history: Optional[str]) -> str:

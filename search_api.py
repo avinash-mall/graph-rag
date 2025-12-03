@@ -77,10 +77,13 @@ def _normalize_doc_id(raw_doc_id: Optional[str]) -> Optional[str]:
 @router.post("/search", response_model=SearchResponse)
 async def unified_search(request: SearchRequest):
     """
-    Main search endpoint using the improved unified pipeline
+    Main search endpoint using agentic classification and routing
     
-    This provides efficient, relevant search results using:
-    - Vector similarity-based chunk retrieval
+    This provides intelligent, context-aware search results using:
+    - Agentic LLM-based question classification (BROAD, CHUNK, OUT_OF_SCOPE)
+    - Map-reduce processing for broad questions using community summaries
+    - Chunk-level retrieval for specific questions
+    - Vector similarity-based retrieval
     - Graph-enhanced context expansion
     - Proper relevance filtering and ranking
     - Confidence scoring and comprehensive metadata
