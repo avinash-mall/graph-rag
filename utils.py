@@ -179,24 +179,57 @@ class EfficientNLPProcessor:
             raise
     
     def _parse_ner_response(self, response: str, original_text: str) -> List[Entity]:
-        """Parse LLM NER response into Entity objects"""
+        """Parse LLM NER response into Entity objects with robust error handling"""
         entities = []
+        original_response = response
         
         try:
-            # Try to extract JSON from response
+            # Step 1: Clean up the response
             # Remove markdown code blocks if present
             response = re.sub(r'```json\s*', '', response)
-            response = re.sub(r'```\s*', '', response)
             response = re.sub(r'```python\s*', '', response)
+            response = re.sub(r'```\s*', '', response)
             response = response.strip()
             
-            # Try to find JSON array in response
-            json_match = re.search(r'\[.*\]', response, re.DOTALL)
-            if json_match:
-                entities_data = json.loads(json_match.group(0))
-            else:
-                # Try parsing entire response as JSON
-                entities_data = json.loads(response)
+            # Remove leading/trailing text that might be before/after JSON
+            # Try to find the JSON array more precisely
+            json_patterns = [
+                r'\[[\s\S]*?\]',  # Non-greedy match for array
+                r'\{[\s\S]*?\}',  # Try object first
+            ]
+            
+            entities_data = None
+            
+            # Strategy 1: Try to find and parse JSON array directly
+            for pattern in json_patterns:
+                json_match = re.search(pattern, response, re.DOTALL)
+                if json_match:
+                    try:
+                        json_str = json_match.group(0)
+                        # Try to fix common JSON issues
+                        json_str = self._fix_json_string(json_str)
+                        entities_data = json.loads(json_str)
+                        break
+                    except json.JSONDecodeError:
+                        continue
+            
+            # Strategy 2: Try parsing entire response as JSON
+            if entities_data is None:
+                try:
+                    cleaned = self._fix_json_string(response)
+                    entities_data = json.loads(cleaned)
+                except json.JSONDecodeError:
+                    pass
+            
+            # Strategy 3: Try to extract entities from text format
+            if entities_data is None:
+                entities_data = self._parse_text_format_entities(response)
+            
+            # Convert to list if needed
+            if entities_data is None:
+                logger.warning("Could not parse NER response in any format")
+                logger.debug(f"Response was: {original_response[:500]}")
+                return []
             
             if not isinstance(entities_data, list):
                 logger.warning("LLM response is not a list, attempting to convert")
@@ -234,11 +267,60 @@ class EfficientNLPProcessor:
             
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse NER response as JSON: {e}")
-            logger.debug(f"Response was: {response[:500]}")
+            logger.debug(f"Response was: {original_response[:500]}")
             return []
         except Exception as e:
             logger.error(f"Error parsing NER response: {e}")
+            logger.debug(f"Response was: {original_response[:500]}")
             return []
+    
+    def _fix_json_string(self, json_str: str) -> str:
+        """Try to fix common JSON formatting issues"""
+        # Remove trailing commas before closing brackets/braces
+        json_str = re.sub(r',\s*}', '}', json_str)
+        json_str = re.sub(r',\s*]', ']', json_str)
+        
+        # Fix single quotes to double quotes (basic cases)
+        # This is tricky, so we'll be conservative
+        json_str = re.sub(r"'(\w+)':", r'"\1":', json_str)
+        json_str = re.sub(r":\s*'([^']*)'", r': "\1"', json_str)
+        
+        # Remove comments (JSON doesn't support comments)
+        json_str = re.sub(r'//.*?$', '', json_str, flags=re.MULTILINE)
+        json_str = re.sub(r'/\*.*?\*/', '', json_str, flags=re.DOTALL)
+        
+        return json_str.strip()
+    
+    def _parse_text_format_entities(self, text: str) -> Optional[List[Dict[str, str]]]:
+        """Fallback: Try to parse entities from text format like 'name: type'"""
+        entities = []
+        lines = text.split('\n')
+        
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            
+            # Try patterns like: "name: type" or "{'name': '...', 'type': '...'}"
+            # Pattern 1: name: type
+            match = re.match(r'["\']?([^"\':]+)["\']?\s*[:=]\s*["\']?([^"\']+)["\']?', line)
+            if match:
+                name = match.group(1).strip()
+                entity_type = match.group(2).strip()
+                if name and entity_type:
+                    entities.append({"name": name, "type": entity_type})
+                    continue
+            
+            # Pattern 2: Try to extract from dict-like strings
+            name_match = re.search(r'["\']name["\']\s*:\s*["\']([^"\']+)["\']', line, re.IGNORECASE)
+            type_match = re.search(r'["\']type["\']\s*:\s*["\']([^"\']+)["\']', line, re.IGNORECASE)
+            if name_match and type_match:
+                entities.append({
+                    "name": name_match.group(1).strip(),
+                    "type": type_match.group(1).strip()
+                })
+        
+        return entities if entities else None
     
     def _is_valid_entity(self, text: str, entity_type: str) -> bool:
         """Filter out invalid entities"""
