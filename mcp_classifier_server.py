@@ -12,10 +12,16 @@ import re
 from typing import Literal, TypedDict
 from dotenv import load_dotenv
 
+# Load environment variables first
+load_dotenv()
+
+# Set PORT environment variable before importing FastMCP
+# FastMCP's streamable-http transport reads PORT from environment
+server_port = os.getenv("MCP_CLASSIFIER_PORT", "8001")
+os.environ["PORT"] = server_port
+
 from mcp.server.fastmcp import FastMCP
 from utils import llm_client
-
-load_dotenv()
 
 logger = logging.getLogger("MCPClassifierServer")
 
@@ -226,14 +232,31 @@ async def classify_question(question: str) -> ClassificationResult:
     return await _classify_question_async(question)
 
 if __name__ == "__main__":
-    # Run the MCP server on HTTP transport
-    # FastMCP with streamable-http uses PORT environment variable
-    server_port = os.getenv("MCP_CLASSIFIER_PORT", "8001")
-    os.environ["PORT"] = server_port
+    import uvicorn
+    
+    # Get port from environment
+    server_port = int(os.getenv("MCP_CLASSIFIER_PORT", "8001"))
+    os.environ["PORT"] = str(server_port)
     
     logger.info(f"Starting MCP classifier server on port {server_port}")
-    logger.info(f"Server will be available at: http://localhost:{server_port}/mcp")
+    logger.info(f"Server will be available at: http://0.0.0.0:{server_port}/mcp")
     
-    # Run with streamable HTTP transport
-    mcp.run(transport="streamable-http")
+    # Use uvicorn directly with FastMCP's streamable_http_app
+    # This allows us to explicitly set the port, which mcp.run() doesn't support
+    try:
+        # Get the ASGI app from FastMCP
+        asgi_app = mcp.streamable_http_app
+        
+        # Run with uvicorn explicitly setting the port
+        uvicorn.run(
+            asgi_app,
+            host="0.0.0.0",
+            port=server_port,
+            log_level="info"
+        )
+    except Exception as e:
+        logger.error(f"Error running with uvicorn: {e}")
+        logger.info("Falling back to mcp.run()...")
+        # Fallback to default run method
+        mcp.run(transport="streamable-http")
 

@@ -19,3 +19,44 @@ services:
     restart: ${NEO4J_RESTART_POLICY}
     mem_limit: ${NEO4J_CONTAINER_MEM_LIMIT}
     memswap_limit: ${NEO4J_CONTAINER_MEMSWAP_LIMIT}
+    networks:
+      - graph-rag-network
+
+  mcp-classifier:
+    build:
+      context: .
+      dockerfile: Dockerfile.mcp
+    container_name: mcp-classifier-server
+    ports:
+      - "${MCP_CLASSIFIER_PORT:-8001}:8001"
+    environment:
+      - MCP_CLASSIFIER_PORT=${MCP_CLASSIFIER_PORT:-8001}
+      - PORT=${MCP_CLASSIFIER_PORT:-8001}
+      - CLASSIFIER_USE_HEURISTICS=${CLASSIFIER_USE_HEURISTICS:-true}
+      - CLASSIFIER_USE_LLM=${CLASSIFIER_USE_LLM:-true}
+      - LLM_PROVIDER=${LLM_PROVIDER:-openai}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL}
+      - OPENAI_MODEL=${OPENAI_MODEL}
+      - OPENAI_TEMPERATURE=${OPENAI_TEMPERATURE:-0.0}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+      - /app/__pycache__
+    working_dir: /app
+    command: python mcp_classifier_server.py
+    restart: ${NEO4J_RESTART_POLICY:-always}
+    networks:
+      - graph-rag-network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8001/mcp', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+networks:
+  graph-rag-network:
+    driver: bridge

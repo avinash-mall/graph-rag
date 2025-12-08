@@ -171,9 +171,35 @@ class GraphManager:
         # Step 1: Batch generate embeddings for all chunks
         chunk_embeddings = await embedding_client.get_embeddings(valid_chunks)
         
+        # Validate embeddings were generated
+        if not chunk_embeddings or len(chunk_embeddings) == 0:
+            raise ValueError("Failed to generate embeddings for chunks")
+        
+        # Validate that embeddings are not empty
+        valid_embeddings = []
+        valid_chunks_filtered = []
+        valid_metadata_filtered = []
+        
+        for i, (chunk, meta, embedding) in enumerate(zip(valid_chunks, valid_metadata, chunk_embeddings)):
+            if embedding and len(embedding) > 0:
+                valid_embeddings.append(embedding)
+                valid_chunks_filtered.append(chunk)
+                valid_metadata_filtered.append(meta)
+            else:
+                self.logger.warning(f"Skipping chunk {i} due to empty embedding")
+        
+        if len(valid_embeddings) == 0:
+            raise ValueError("No valid embeddings generated for any chunks")
+        
+        chunk_embeddings = valid_embeddings
+        valid_chunks = valid_chunks_filtered
+        valid_metadata = valid_metadata_filtered
+        
         # Ensure vector indexes exist (after we have embeddings to detect dimension)
         if chunk_embeddings and len(chunk_embeddings) > 0:
             embedding_dim = len(chunk_embeddings[0])
+            if embedding_dim == 0:
+                raise ValueError("Embedding dimension is 0 - embeddings are empty")
             await self._ensure_vector_indexes(embedding_dim)
         
         # Step 2: Extract entities from all chunks using LLM-based processing
@@ -249,6 +275,11 @@ class GraphManager:
             zip(chunks, metadata_list, embeddings, entities_list)
         ):
             chunk_id = start_index + i
+            
+            # Validate embedding before storing
+            if not embedding or len(embedding) == 0:
+                self.logger.warning(f"Skipping chunk {chunk_id} due to empty embedding")
+                continue
             
             # Create chunk node
             chunk_query = """
@@ -394,9 +425,10 @@ class GraphManager:
             graph_name = f"entity-graph-{doc_id.replace('-', '_')}"  # GDS graph names can't have hyphens
             
             # First, create CO_OCCURS relationships if they don't exist
+            # Note: Using name comparison instead of deprecated id() function
             create_relationships_query = """
             MATCH (e1:Entity {doc_id: $doc_id})-[:MENTIONED_IN]->(c:Chunk)<-[:MENTIONED_IN]-(e2:Entity {doc_id: $doc_id})
-            WHERE e1.name <> e2.name AND id(e1) < id(e2)
+            WHERE e1.name <> e2.name AND e1.name < e2.name
             WITH e1, e2, count(c) AS weight
             WHERE weight >= 2
             MERGE (e1)-[r:CO_OCCURS]-(e2)
@@ -413,19 +445,14 @@ class GraphManager:
                 pass  # Graph may not exist
             
             # Create a graph projection for GDS using Cypher projection
+            # Note: GDS uses internal node IDs (id()) for graph projection - this is acceptable in GDS context
             project_query = f"""
             CALL gds.graph.project.cypher(
                 '{graph_name}',
                 'MATCH (e:Entity {{doc_id: $doc_id}}) RETURN id(e) AS id',
                 'MATCH (e1:Entity {{doc_id: $doc_id}})-[r:CO_OCCURS]-(e2:Entity {{doc_id: $doc_id}}) RETURN id(e1) AS source, id(e2) AS target, coalesce(r.weight, 1.0) AS weight',
                 {{
-                    parameters: {{doc_id: $doc_id}},
-                    relationshipProperties: {{
-                        weight: {{
-                            property: 'weight',
-                            defaultValue: 1.0
-                        }}
-                    }}
+                    parameters: {{doc_id: $doc_id}}
                 }}
             )
             YIELD graphName, nodeCount, relationshipCount, projectMillis
@@ -438,13 +465,14 @@ class GraphManager:
                 return {}
             
             # Run Leiden algorithm
+            # Note: Using elementId() for node lookup instead of deprecated id()
             leiden_query = f"""
             CALL gds.leiden.stream('{graph_name}', {{
                 maxLevels: 10,
                 randomSeed: 42
             }})
             YIELD nodeId, communityId
-            RETURN gds.util.asNode(nodeId).name AS entity_name, communityId
+            RETURN elementId(gds.util.asNode(nodeId)) AS node_element_id, gds.util.asNode(nodeId).name AS entity_name, communityId
             """
             
             results = await run_cypher_query_async(self.driver, leiden_query, {})

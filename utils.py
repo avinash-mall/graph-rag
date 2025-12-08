@@ -583,9 +583,14 @@ class BatchEmbeddingClient:
             "Authorization": f"Bearer {self.embedding_api_key}"
         }
         
+        # Ensure OpenAI/Ollama URL ends with /embeddings
+        api_url = self.embedding_api_url.rstrip('/')
+        if not api_url.endswith('/embeddings'):
+            api_url = f"{api_url}/embeddings"
+        
         async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
             response = await client.post(
-                self.embedding_api_url,
+                api_url,
                 json=payload,
                 headers=headers
             )
@@ -632,7 +637,11 @@ class BatchEmbeddingClient:
             headers["Authorization"] = f"Bearer {self.embedding_api_key}"
 
         # Construct the correct Gemini API URL for batch embeddings
-        api_url = f"{self.embedding_api_url}/models/{self.model_name}:batchEmbedContents"
+        # For Gemini, remove /embeddings from URL if present, as it needs base URL + /models/...
+        base_url = self.embedding_api_url.rstrip('/')
+        if '/embeddings' in base_url:
+            base_url = base_url.split('/embeddings')[0]  # Remove '/embeddings' and anything after
+        api_url = f"{base_url}/models/{self.model_name}:batchEmbedContents"
         
         async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
             response = await client.post(
