@@ -96,7 +96,11 @@ celerybeat.pid
 *.sage.py
 
 # Environments
+# NOTE: .env contains sensitive API keys and credentials - NEVER commit this file
+# .env.example is a template and should be tracked in version control
 .env
+.env.local
+.env.*.local
 .venv
 env/
 venv/
