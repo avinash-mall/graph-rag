@@ -142,43 +142,105 @@ class EfficientNLPProcessor:
             return []
     
     async def _call_llm(self, messages: List[Dict[str, str]], base_url: str, model: str, api_key: str, temperature: float) -> str:
-        """Call OpenAI-compatible LLM API"""
+        """Call LLM API - supports both OpenAI-compatible and Gemini APIs"""
         try:
-            # Construct API URL - handle base_url that may already include /v1
             base_url = base_url.rstrip('/')
-            if base_url.endswith('/v1'):
-                api_url = f"{base_url}/chat/completions"
+            
+            # Detect if this is a Gemini API
+            is_gemini = 'generativelanguage.googleapis.com' in base_url
+            
+            if is_gemini:
+                # Use Gemini API format
+                return await self._call_gemini_api(messages, base_url, model, api_key, temperature)
             else:
-                api_url = f"{base_url}/v1/chat/completions"
-            
-            payload = {
-                "model": model,
-                "messages": messages,
-                "temperature": temperature,
-                "max_tokens": 2048
-            }
-            
-            headers = {
-                "Content-Type": "application/json"
-            }
-            
-            if api_key and api_key != "test":
-                headers["Authorization"] = f"Bearer {api_key}"
-            
-            async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
-                response = await client.post(api_url, json=payload, headers=headers)
-                response.raise_for_status()
-                data = response.json()
-                
-                # Extract content from response
-                if "choices" in data and len(data["choices"]) > 0:
-                    return data["choices"][0]["message"]["content"].strip()
-                else:
-                    raise ValueError("Invalid response format from LLM API")
+                # Use OpenAI-compatible format
+                return await self._call_openai_api(messages, base_url, model, api_key, temperature)
                     
         except Exception as e:
             logger.error(f"LLM API call failed: {e}")
             raise
+    
+    async def _call_gemini_api(self, messages: List[Dict[str, str]], base_url: str, model: str, api_key: str, temperature: float) -> str:
+        """Call Gemini API"""
+        # Convert messages to Gemini format
+        contents = []
+        system_instruction = None
+        
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            
+            if role == "system":
+                system_instruction = content
+            elif role == "assistant":
+                contents.append({"role": "model", "parts": [{"text": content}]})
+            else:
+                contents.append({"role": "user", "parts": [{"text": content}]})
+        
+        # If there's a system instruction and no contents yet, add it as user message
+        if system_instruction and contents:
+            # Prepend system instruction to first user message
+            if contents[0]["role"] == "user":
+                contents[0]["parts"][0]["text"] = f"{system_instruction}\n\n{contents[0]['parts'][0]['text']}"
+        elif system_instruction:
+            contents.append({"role": "user", "parts": [{"text": system_instruction}]})
+        
+        api_url = f"{base_url}/models/{model}:generateContent"
+        
+        payload = {
+            "contents": contents,
+            "generationConfig": {
+                "temperature": temperature,
+                "maxOutputTokens": 2048
+            }
+        }
+        
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": api_key
+        }
+        
+        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+            response = await client.post(api_url, json=payload, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+            
+            candidates = data.get("candidates", [])
+            if candidates and candidates[0].get("content", {}).get("parts"):
+                return candidates[0]["content"]["parts"][0].get("text", "").strip()
+            else:
+                raise ValueError("Invalid response format from Gemini API")
+    
+    async def _call_openai_api(self, messages: List[Dict[str, str]], base_url: str, model: str, api_key: str, temperature: float) -> str:
+        """Call OpenAI-compatible API"""
+        if base_url.endswith('/v1'):
+            api_url = f"{base_url}/chat/completions"
+        else:
+            api_url = f"{base_url}/v1/chat/completions"
+        
+        payload = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": 2048
+        }
+        
+        headers = {
+            "Content-Type": "application/json"
+        }
+        
+        if api_key and api_key != "test":
+            headers["Authorization"] = f"Bearer {api_key}"
+        
+        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+            response = await client.post(api_url, json=payload, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+            
+            if "choices" in data and len(data["choices"]) > 0:
+                return data["choices"][0]["message"]["content"].strip()
+            else:
+                raise ValueError("Invalid response format from LLM API")
     
     def _parse_ner_response(self, response: str, original_text: str) -> List[Entity]:
         """Parse LLM NER response into Entity objects with robust error handling"""
