@@ -95,6 +95,11 @@ celerybeat.pid
 # SageMath parsed files
 *.sage.py
 
+# Markdown files (except README.md)
+# Ignore all .md files but allow README.md
+*.md
+!README.md
+
 # Environments
 # NOTE: .env contains sensitive API keys and credentials - NEVER commit this file
 # .env.example is a template and should be tracked in version control
