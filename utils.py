@@ -89,13 +89,15 @@ class EfficientNLPProcessor:
         # NER LLM client
         self.ner_model = os.getenv("NER_MODEL", "gemma3:1b")
         self.ner_base_url = os.getenv("NER_BASE_URL", "http://localhost:11434/v1")
-        self.ner_api_key = os.getenv("NER_API_KEY", "test")
+        ner_api_key_raw = os.getenv("NER_API_KEY", "test")
+        self.ner_api_key = ner_api_key_raw.strip('"').strip("'") if ner_api_key_raw else "test"
         self.ner_temperature = float(os.getenv("NER_TEMPERATURE", "0.0"))
         
         # Coreference LLM client
         self.coref_model = os.getenv("COREF_MODEL", "gemma3:1b")
         self.coref_base_url = os.getenv("COREF_BASE_URL", "http://localhost:11434/v1")
-        self.coref_api_key = os.getenv("COREF_API_KEY", "test")
+        coref_api_key_raw = os.getenv("COREF_API_KEY", "test")
+        self.coref_api_key = coref_api_key_raw.strip('"').strip("'") if coref_api_key_raw else "test"
         self.coref_temperature = float(os.getenv("COREF_TEMPERATURE", "0.0"))
         
         self.timeout = int(os.getenv("API_TIMEOUT", "600"))
@@ -375,7 +377,9 @@ class AsyncLLMClient:
     """
     
     def __init__(self):
-        self.api_key = os.getenv("OPENAI_API_KEY")
+        # Strip quotes if present (common when values are quoted in .env files)
+        api_key_raw = os.getenv("OPENAI_API_KEY")
+        self.api_key = api_key_raw.strip('"').strip("'") if api_key_raw else None
         self.model = os.getenv("OPENAI_MODEL", "llama3.2")
         self.base_url = os.getenv("OPENAI_BASE_URL")
         self.temperature = float(os.getenv("OPENAI_TEMPERATURE", "0.0"))
@@ -544,7 +548,9 @@ class BatchEmbeddingClient:
     
     def __init__(self):
         self.embedding_api_url = os.getenv("EMBEDDING_API_URL", "http://localhost/api/embed")
-        self.embedding_api_key = os.getenv("EMBEDDING_API_KEY")
+        # Strip quotes if present (common when values are quoted in .env files)
+        embedding_api_key_raw = os.getenv("EMBEDDING_API_KEY")
+        self.embedding_api_key = embedding_api_key_raw.strip('"').strip("'") if embedding_api_key_raw else None
         self.model_name = os.getenv("EMBEDDING_MODEL_NAME", "mxbai-embed-large")
         self.timeout = int(os.getenv("API_TIMEOUT", "600"))
         self.batch_size = int(os.getenv("EMBEDDING_BATCH_SIZE", "10"))
@@ -707,16 +713,11 @@ class BatchEmbeddingClient:
         payload = {"requests": requests}
 
         # Prepare headers for Gemini API
+        # Gemini API uses x-goog-api-key header, not Authorization Bearer
         headers = {
             "Content-Type": "application/json",
             "x-goog-api-key": self.embedding_api_key
         }
-
-        # Some services expect both API key styles; allow opt-in via env
-        if self.include_bearer_auth:
-            if not self.embedding_api_key:
-                raise ValueError("EMBEDDING_API_KEY is required when EMBEDDING_INCLUDE_BEARER_AUTH is enabled")
-            headers["Authorization"] = f"Bearer {self.embedding_api_key}"
 
         # Construct the correct Gemini API URL for batch embeddings
         # For Gemini, remove /embeddings from URL if present, as it needs base URL + /models/...
