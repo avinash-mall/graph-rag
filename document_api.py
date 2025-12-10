@@ -40,6 +40,7 @@ DB_PASSWORD = os.getenv("DB_PASSWORD")
 CHUNK_SIZE_GDS = int(os.getenv("CHUNK_SIZE_GDS", "512"))
 DOCUMENT_PROCESSING_BATCH_SIZE = int(os.getenv("DOCUMENT_PROCESSING_BATCH_SIZE", "20"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+EMBEDDING_DIMENSION = int(os.getenv("EMBEDDING_DIMENSION", "768"))
 
 # Setup logging
 logging.basicConfig(level=LOG_LEVEL)
@@ -70,10 +71,14 @@ class GraphManager:
         self.logger = logging.getLogger("GraphManager")
         self._vector_indexes_created = False
     
-    async def _ensure_vector_indexes(self, embedding_dim: int = 1024):
+    async def _ensure_vector_indexes(self, embedding_dim: Optional[int] = None):
         """Create vector indexes for embeddings if they don't exist"""
         if self._vector_indexes_created:
             return
+        
+        # Use provided dimension, or try to detect from database, or fall back to env variable
+        if embedding_dim is None:
+            embedding_dim = EMBEDDING_DIMENSION
         
         try:
             # Try to get actual embedding dimension from existing chunks
@@ -89,7 +94,7 @@ class GraphManager:
                     embedding_dim = dim_result[0]["dim"]
                     self.logger.info(f"Detected embedding dimension: {embedding_dim}")
             except Exception as dim_e:
-                self.logger.debug(f"Could not detect embedding dimension, using default {embedding_dim}: {dim_e}")
+                self.logger.debug(f"Could not detect embedding dimension, using configured value {embedding_dim}: {dim_e}")
             
             # Create vector index for Chunk embeddings
             chunk_index_query = f"""
@@ -644,7 +649,36 @@ router = APIRouter()
 @router.post("/upload_documents")
 async def upload_documents(files: List[UploadFile] = File(...)):
     """
-    Upload and process documents with improved efficiency and error handling
+    Upload and process documents into the knowledge graph.
+    
+    This endpoint processes uploaded documents by:
+    1. **Text Extraction**: Extracts text from PDF, DOCX, or TXT files
+    2. **Text Cleaning**: Removes boilerplate, navigation text, and noise
+    3. **Chunking**: Splits text into semantic chunks (default: 512 tokens)
+    4. **Entity Extraction**: Uses LLM-based NER to extract entities (PERSON, ORGANIZATION, etc.)
+    5. **Embedding Generation**: Creates vector embeddings for chunks and entities (batch processing)
+    6. **Graph Building**: Stores chunks, entities, and relationships in Neo4j
+    7. **Community Detection**: Uses Leiden algorithm to detect entity communities
+    8. **Summary Generation**: Creates community summaries using LLM
+    
+    **Supported Formats**: PDF, DOCX, TXT
+    
+    **Processing Features**:
+    - Batch embedding optimization (10x speed improvement)
+    - Cross-document entity merging (entities with same name are merged)
+    - Vector index creation for fast similarity search
+    - Community detection and summarization
+    
+    Args:
+        files: List of uploaded files (PDF, DOCX, or TXT)
+    
+    Returns:
+        Processing results with doc_id, chunks created, entities extracted, and processing time
+    
+    Example:
+        POST /api/documents/upload_documents
+        Content-Type: multipart/form-data
+        Files: [document1.pdf, document2.docx]
     """
     if not files:
         raise HTTPException(status_code=400, detail="No files provided")
@@ -722,7 +756,22 @@ async def upload_documents(files: List[UploadFile] = File(...)):
 
 @router.get("/documents")
 async def list_documents():
-    """List all documents with proper async handling"""
+    """
+    List all documents in the knowledge base.
+    
+    Returns a list of all processed documents with:
+    - Document ID (doc_id)
+    - Document name (filename)
+    - Timestamp (when processed)
+    
+    Results are ordered by timestamp (most recent first).
+    
+    Returns:
+        List of documents with metadata
+    
+    Example:
+        GET /api/documents/documents
+    """
     try:
         query = """
         MATCH (c:Chunk)
@@ -739,7 +788,37 @@ async def list_documents():
 
 @router.delete("/delete_document")
 async def delete_document(request: DeleteDocumentRequest):
-    """Delete document with proper async handling"""
+    """
+    Delete a document and all associated data from the knowledge base.
+    
+    This operation removes:
+    - All chunks from the document
+    - All entities (if they only appear in this document)
+    - All relationships involving the document's chunks
+    - All community summaries for the document
+    
+    **Note**: Entities that appear in multiple documents are preserved, but
+    their relationships to this document's chunks are removed.
+    
+    Args:
+        request: DeleteDocumentRequest with either doc_id or document_name
+    
+    Returns:
+        Success message confirming deletion
+    
+    Example:
+        ```json
+        {
+          "doc_id": "abc-123-def-456"
+        }
+        ```
+        or
+        ```json
+        {
+          "document_name": "my-document.pdf"
+        }
+        ```
+    """
     if not request.doc_id and not request.document_name:
         raise HTTPException(
             status_code=400, 
@@ -765,7 +844,26 @@ async def delete_document(request: DeleteDocumentRequest):
 
 @router.get("/community_summaries")
 async def get_community_summaries(doc_id: Optional[str] = None):
-    """Get community summaries with proper filtering"""
+    """
+    Get community summaries generated from entity communities.
+    
+    Community summaries are high-level topic summaries created by:
+    1. Detecting entity communities using Leiden algorithm (or simple co-occurrence)
+    2. Extracting chunks that mention entities in each community
+    3. Generating LLM-based summaries of the community themes
+    
+    These summaries are used for answering broad questions via map-reduce processing.
+    
+    Args:
+        doc_id: Optional document ID to filter summaries to specific document.
+                If not provided, returns summaries from all documents (max 50).
+    
+    Returns:
+        List of community summaries with community ID, summary text, entities, and timestamp
+    
+    Example:
+        GET /api/documents/community_summaries?doc_id=abc-123
+    """
     try:
         if doc_id:
             query = """
@@ -794,7 +892,20 @@ async def get_community_summaries(doc_id: Optional[str] = None):
 
 @router.get("/document_stats")
 async def get_document_stats():
-    """Get statistics about the document collection"""
+    """
+    Get comprehensive statistics about the document collection.
+    
+    Returns:
+        - Total number of chunks
+        - Total number of documents
+        - Total number of entities
+        - Total number of community summaries
+    
+    Useful for monitoring knowledge base size and health.
+    
+    Example:
+        GET /api/documents/document_stats
+    """
     try:
         stats_query = """
         MATCH (c:Chunk)

@@ -34,6 +34,7 @@ load_dotenv()
 
 # Configuration
 CHUNK_SIZE_GDS = int(os.getenv("CHUNK_SIZE_GDS", "512"))
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "50"))
 COSINE_EPSILON = float(os.getenv("COSINE_EPSILON", "1e-8"))
 RELEVANCE_THRESHOLD = float(os.getenv("RELEVANCE_THRESHOLD", "0.5"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "10"))
@@ -901,7 +902,7 @@ class ImprovedTextProcessor:
         return text.strip()
     
     @staticmethod
-    def chunk_text_advanced(text: str, max_chunk_size: int = CHUNK_SIZE_GDS, overlap: int = 50) -> List[str]:
+    def chunk_text_advanced(text: str, max_chunk_size: int = CHUNK_SIZE_GDS, overlap: int = CHUNK_OVERLAP) -> List[str]:
         """
         Advanced text chunking with overlap and sentence boundary preservation
         """

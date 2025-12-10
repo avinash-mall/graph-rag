@@ -138,7 +138,15 @@ app.include_router(search_router, prefix="/api/search", tags=["Search"])
 
 @app.get("/", tags=["Root"])
 async def root():
-    """Root endpoint with API information"""
+    """
+    Root endpoint with API information and capabilities.
+    
+    Returns:
+        API version, status, features, and available endpoints
+    
+    This is the entry point for the Graph RAG API. Use this endpoint to
+    discover available features and endpoints.
+    """
     return {
         "message": "Graph RAG API is running",
         "version": APP_VERSION,
@@ -161,7 +169,19 @@ async def root():
 
 @app.get("/health", tags=["Health"])
 async def health_check():
-    """Comprehensive health check"""
+    """
+    Comprehensive health check endpoint.
+    
+    Verifies the health of all system components:
+    - Database connectivity (Neo4j)
+    - NLP models (spaCy) loading status
+    - Embedding service availability
+    
+    Returns:
+        Health status with component-level details
+    
+    Use this endpoint for monitoring and load balancer health checks.
+    """
     try:
         # Check database connection
         from document_api import driver
@@ -188,7 +208,19 @@ async def health_check():
 
 @app.get("/api/info", tags=["Info"])
 async def api_info():
-    """Get detailed API information and capabilities"""
+    """
+    Get detailed API information and capabilities.
+    
+    Returns comprehensive information about:
+    - API version
+    - Document processing capabilities (formats, features)
+    - Search capabilities (methods, features)
+    
+    Useful for API discovery and understanding system capabilities.
+    
+    Returns:
+        Detailed API capabilities and supported features
+    """
     return {
         "api_version": APP_VERSION,
         "capabilities": {

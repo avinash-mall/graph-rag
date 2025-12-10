@@ -30,6 +30,8 @@ DB_URL = os.getenv("DB_URL")
 DB_USERNAME = os.getenv("DB_USERNAME")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+MAX_CHUNKS_PER_ANSWER = int(os.getenv("MAX_CHUNKS_PER_ANSWER", "7"))
+QUICK_SEARCH_MAX_CHUNKS = int(os.getenv("QUICK_SEARCH_MAX_CHUNKS", "5"))
 
 # Setup logging
 logging.basicConfig(level=LOG_LEVEL)
@@ -44,7 +46,7 @@ class SearchRequest(BaseModel):
     conversation_history: Optional[str] = Field(None, description="Previous conversation context")
     doc_id: Optional[str] = Field(None, description="Specific document ID to search within")
     scope: Optional[str] = Field("hybrid", description="Search scope: global, local, or hybrid")
-    max_chunks: Optional[int] = Field(7, description="Maximum number of chunks to use in answer")
+    max_chunks: Optional[int] = Field(MAX_CHUNKS_PER_ANSWER, description="Maximum number of chunks to use in answer")
 
 class SearchResponse(BaseModel):
     answer: str
@@ -77,16 +79,47 @@ def _normalize_doc_id(raw_doc_id: Optional[str]) -> Optional[str]:
 @router.post("/search", response_model=SearchResponse)
 async def unified_search(request: SearchRequest):
     """
-    Main search endpoint using agentic classification and routing
+    Main search endpoint using MCP-based question classification and intelligent routing.
     
-    This provides intelligent, context-aware search results using:
-    - Agentic LLM-based question classification (BROAD, CHUNK, OUT_OF_SCOPE)
-    - Map-reduce processing for broad questions using community summaries
-    - Chunk-level retrieval for specific questions
-    - Vector similarity-based retrieval
-    - Graph-enhanced context expansion
-    - Proper relevance filtering and ranking
-    - Confidence scoring and comprehensive metadata
+    This endpoint provides intelligent, context-aware search results by:
+    
+    1. **Question Classification (via MCP)**: Uses MCP (Model Context Protocol) server to classify
+       questions into three types:
+       - **BROAD**: Questions requiring overview/understanding → Uses map-reduce with community summaries
+       - **CHUNK**: Questions requiring specific details → Uses chunk-level vector similarity search
+       - **OUT_OF_SCOPE**: Questions not answerable from knowledge base → Returns polite fallback
+    
+    2. **Intelligent Routing**: Based on classification, routes to appropriate search strategy:
+       - Broad questions: Map-reduce processing across multiple community summaries
+       - Specific questions: Vector similarity search with graph-based context expansion
+    
+    3. **Advanced Retrieval**:
+       - Native Neo4j vector index search for fast similarity matching
+       - Graph-based context expansion via entity relationships
+       - Graph-aware reranking (entity overlap, community relevance, centrality)
+       - MMR (Maximal Marginal Relevance) diversity reranking
+    
+    4. **Answer Generation**: Uses LLM with retrieved context to generate comprehensive answers
+    
+    **MCP Integration**: When `USE_MCP_CLASSIFIER=true`, classification is performed via MCP server
+    for improved accuracy and consistency. Falls back to direct LLM/heuristic classification if MCP unavailable.
+    
+    Args:
+        request: SearchRequest containing question, optional conversation history, doc_id filter, and scope
+    
+    Returns:
+        SearchResponse with answer, confidence score, chunks used, entities found, and metadata
+    
+    Example:
+        ```json
+        {
+          "question": "What are the main policies in the document?",
+          "conversation_history": "Previous context...",
+          "doc_id": "optional-document-id",
+          "scope": "hybrid",
+          "max_chunks": 7
+        }
+        ```
     """
     try:
         # Validate scope
@@ -141,7 +174,29 @@ async def unified_search(request: SearchRequest):
 @router.post("/quick_search")
 async def quick_search(request: QuickSearchRequest):
     """
-    Quick search endpoint for simple questions without conversation history
+    Quick search endpoint for simple questions without conversation history.
+    
+    This is a simplified version of the main search endpoint optimized for:
+    - Simple, standalone questions (no conversation context needed)
+    - Faster response times (uses fewer chunks)
+    - Direct question answering without complex routing
+    
+    **Note**: Still uses MCP classification (if enabled) for optimal routing, but with
+    simplified processing for speed.
+    
+    Args:
+        request: QuickSearchRequest with question and optional doc_id
+    
+    Returns:
+        Simplified response with answer, confidence, and search time
+    
+    Example:
+        ```json
+        {
+          "question": "What is the deadline?",
+          "doc_id": "optional-document-id"
+        }
+        ```
     """
     try:
         search_pipeline = get_search_pipeline(driver)
@@ -152,7 +207,7 @@ async def quick_search(request: QuickSearchRequest):
             question=request.question,
             doc_id=normalized_doc_id,
             scope=SearchScope.HYBRID,
-            max_chunks=5  # Fewer chunks for quick search
+            max_chunks=QUICK_SEARCH_MAX_CHUNKS  # Fewer chunks for quick search
         )
         
         return {
@@ -168,7 +223,23 @@ async def quick_search(request: QuickSearchRequest):
 @router.get("/search_suggestions")
 async def get_search_suggestions(doc_id: Optional[str] = None):
     """
-    Get search suggestions based on available content
+    Get search suggestions based on available content in the knowledge base.
+    
+    Generates sample questions based on entities found in the documents:
+    - Extracts entity types (PERSON, ORGANIZATION, CONCEPT, etc.)
+    - Generates contextual questions for each entity type
+    - Filters by document if doc_id is provided
+    
+    Useful for helping users discover what questions they can ask.
+    
+    Args:
+        doc_id: Optional document ID to filter suggestions to specific document
+    
+    Returns:
+        List of suggested questions (max 10)
+    
+    Example:
+        GET /api/search/search_suggestions?doc_id=abc-123
     """
     try:
         if doc_id:
@@ -220,7 +291,14 @@ async def get_search_suggestions(doc_id: Optional[str] = None):
 @router.get("/search_analytics")
 async def get_search_analytics():
     """
-    Get analytics about search usage and performance
+    Get analytics about search usage and knowledge base statistics.
+    
+    Returns:
+        - Knowledge base statistics (total chunks, documents, entities, summaries)
+        - Search capabilities and features
+        - Performance metrics
+    
+    Useful for monitoring system health and understanding knowledge base size.
     """
     try:
         # Get basic stats from Neo4j
@@ -255,7 +333,21 @@ async def get_search_analytics():
 @router.post("/explain_search")
 async def explain_search(request: SearchRequest):
     """
-    Explain how a search would be processed without actually running it
+    Explain how a search would be processed without actually executing it.
+    
+    This endpoint provides transparency into the search pipeline by explaining:
+    - How the question would be classified (BROAD/CHUNK/OUT_OF_SCOPE)
+    - What retrieval strategy would be used
+    - How context would be built and ranked
+    - What answer generation method would be applied
+    
+    Useful for debugging and understanding search behavior.
+    
+    Args:
+        request: SearchRequest with question and parameters
+    
+    Returns:
+        Detailed explanation of search processing steps
     """
     try:
         explanation = {
@@ -313,9 +405,20 @@ async def _log_search_analytics(request: SearchRequest, result: SearchResult, no
         logger.warning(f"Failed to log search analytics: {e}")
 
 @router.get("/health")
-async def health_check():
+async def search_health_check():
     """
-    Health check endpoint for monitoring
+    Search service health check endpoint.
+    
+    This is a search-specific health check that verifies:
+    - Database connectivity (Neo4j)
+    - Search pipeline readiness and initialization
+    - Search service availability
+    
+    **Note**: For general API health, use `/health` endpoint.
+    This endpoint focuses specifically on search functionality.
+    
+    Returns:
+        Health status with timestamp, database status, and search pipeline status
     """
     try:
         # Test database connection
@@ -330,5 +433,5 @@ async def health_check():
         }
         
     except Exception as e:
-        logger.error(f"Health check failed: {e}")
-        raise HTTPException(status_code=503, detail="Service unhealthy")
+        logger.error(f"Search health check failed: {e}")
+        raise HTTPException(status_code=503, detail="Search service unhealthy")
