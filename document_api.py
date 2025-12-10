@@ -209,10 +209,11 @@ class GraphManager:
             all_entities_data.append(entities)
         
         # Step 3: Collect unique entities and batch generate their embeddings
+        # Merge entities by name only (not by name + doc_id) to enable cross-document connections
         unique_entities = {}
         for entities in all_entities_data:
             for entity in entities:
-                key = (entity.name.lower(), valid_metadata[0]["doc_id"])  # Include doc_id in key
+                key = entity.name.lower()  # Use name only, not name + doc_id
                 if key not in unique_entities:
                     unique_entities[key] = entity
         
@@ -238,8 +239,8 @@ class GraphManager:
                 chunks_created += result["chunks_created"]
                 entities_created += result["entities_created"]
             
-            # Step 5: Create entity relationships
-            await self._create_entity_relationships(valid_metadata[0]["doc_id"])
+            # Step 5: Create entity relationships (now works across all documents)
+            await self._create_entity_relationships()
             
             end_time = asyncio.get_event_loop().time()
             processing_time = end_time - start_time
@@ -312,11 +313,25 @@ class GraphManager:
                     self.logger.warning(f"Failed to get embedding for entity {entity.name}: {e}")
                     entity_embedding = []
                 
-                # Create/update entity node
+                # Create/update entity node - merge by name only to enable cross-document connections
+                # Track which documents the entity appears in using a documents property
                 entity_query = """
-                MERGE (e:Entity {name: $name, doc_id: $doc_id})
-                SET e.type = $type,
-                    e.embedding = $embedding
+                MERGE (e:Entity {name: $name})
+                ON CREATE SET e.type = $type,
+                             e.embedding = $embedding,
+                             e.documents = [$doc_id]
+                ON MATCH SET e.type = CASE 
+                                        WHEN e.type IS NULL OR e.type = '' THEN $type 
+                                        ELSE e.type 
+                                      END,
+                             e.embedding = CASE 
+                                            WHEN e.embedding IS NULL OR size(e.embedding) = 0 THEN $embedding 
+                                            ELSE e.embedding 
+                                          END,
+                             e.documents = CASE 
+                                            WHEN $doc_id IN e.documents THEN e.documents 
+                                            ELSE e.documents + $doc_id 
+                                          END
                 """
                 
                 await run_cypher_query_async(self.driver, entity_query, {
@@ -326,11 +341,11 @@ class GraphManager:
                     "embedding": entity_embedding
                 })
                 
-                # Create MENTIONED_IN relationship
+                # Create MENTIONED_IN relationship - works with merged entities across documents
                 mention_query = """
-                MATCH (e:Entity {name: $name, doc_id: $doc_id})
+                MATCH (e:Entity {name: $name})
                 MATCH (c:Chunk {id: $chunk_id, doc_id: $doc_id})
-                MERGE (e)-[:MENTIONED_IN]->(c)
+                MERGE (e)-[:MENTIONED_IN {doc_id: $doc_id}]->(c)
                 """
                 
                 await run_cypher_query_async(self.driver, mention_query, {
@@ -343,21 +358,25 @@ class GraphManager:
         
         return {"chunks_created": chunks_created, "entities_created": entities_created}
     
-    async def _create_entity_relationships(self, doc_id: str):
-        """Create RELATES_TO relationships between entities that co-occur in chunks"""
+    async def _create_entity_relationships(self):
+        """Create RELATES_TO relationships between entities that co-occur in chunks
+        Now works across all documents - entities with same name are merged"""
         
+        # Create cross-document RELATES_TO relationships
+        # Entities are now merged by name, so relationships connect entities across documents
         relationship_query = """
-        MATCH (e1:Entity {doc_id: $doc_id})-[:MENTIONED_IN]->(c:Chunk)<-[:MENTIONED_IN]-(e2:Entity {doc_id: $doc_id})
+        MATCH (e1:Entity)-[:MENTIONED_IN]->(c:Chunk)<-[:MENTIONED_IN]-(e2:Entity)
         WHERE e1.name < e2.name
-        // Avoid duplicate relationships
-        WITH e1, e2, count(c) as co_occurrence_count
+        WITH e1, e2, count(DISTINCT c) as co_occurrence_count
         WHERE co_occurrence_count > 0
         MERGE (e1)-[r:RELATES_TO]-(e2)
-        SET r.weight = co_occurrence_count
+        ON CREATE SET r.weight = co_occurrence_count
+        ON MATCH SET r.weight = co_occurrence_count
         """
         
-        await run_cypher_query_async(self.driver, relationship_query, {"doc_id": doc_id})
-        self.logger.info(f"Created entity relationships for doc_id: {doc_id}")
+        await run_cypher_query_async(self.driver, relationship_query, {})
+        
+        self.logger.info("Created cross-document entity relationships")
     
     async def generate_community_summaries(self, doc_id: str) -> Dict[str, Any]:
         """
@@ -420,19 +439,24 @@ class GraphManager:
             return {"communities_created": 0, "error": str(e)}
     
     async def _detect_communities_leiden(self, doc_id: str) -> Dict[str, List[str]]:
-        """Detect communities using Leiden algorithm from Neo4j GDS"""
+        """Detect communities using Leiden algorithm from Neo4j GDS
+        Now works with merged entities - filters chunks by doc_id but uses cross-document entities"""
         try:
             graph_name = f"entity-graph-{doc_id.replace('-', '_')}"  # GDS graph names can't have hyphens
             
-            # First, create CO_OCCURS relationships if they don't exist
-            # Note: Using name comparison instead of deprecated id() function
+            # First, create CO_OCCURS relationships for this document
+            # Entities are now merged across documents, but we filter chunks by doc_id
             create_relationships_query = """
-            MATCH (e1:Entity {doc_id: $doc_id})-[:MENTIONED_IN]->(c:Chunk)<-[:MENTIONED_IN]-(e2:Entity {doc_id: $doc_id})
+            MATCH (e1:Entity)-[r1:MENTIONED_IN {doc_id: $doc_id}]->(c:Chunk {doc_id: $doc_id})<-[:MENTIONED_IN {doc_id: $doc_id}]-(e2:Entity)
             WHERE e1.name <> e2.name AND e1.name < e2.name
-            WITH e1, e2, count(c) AS weight
+            WITH e1, e2, count(DISTINCT c) AS weight
             WHERE weight >= 2
             MERGE (e1)-[r:CO_OCCURS]-(e2)
-            SET r.weight = weight, r.doc_id = $doc_id
+            ON CREATE SET r.weight = weight, r.doc_id = $doc_id
+            ON MATCH SET r.weight = CASE 
+                                      WHEN r.doc_id = $doc_id THEN weight 
+                                      ELSE r.weight 
+                                    END
             """
             
             await run_cypher_query_async(self.driver, create_relationships_query, {"doc_id": doc_id})
@@ -445,12 +469,13 @@ class GraphManager:
                 pass  # Graph may not exist
             
             # Create a graph projection for GDS using Cypher projection
+            # Filter entities that appear in chunks from this document
             # Note: GDS uses internal node IDs (id()) for graph projection - this is acceptable in GDS context
             project_query = f"""
             CALL gds.graph.project.cypher(
                 '{graph_name}',
-                'MATCH (e:Entity {{doc_id: $doc_id}}) RETURN id(e) AS id',
-                'MATCH (e1:Entity {{doc_id: $doc_id}})-[r:CO_OCCURS]-(e2:Entity {{doc_id: $doc_id}}) RETURN id(e1) AS source, id(e2) AS target, coalesce(r.weight, 1.0) AS weight',
+                'MATCH (e:Entity)-[:MENTIONED_IN {{doc_id: $doc_id}}]->(:Chunk {{doc_id: $doc_id}}) RETURN DISTINCT id(e) AS id',
+                'MATCH (e1:Entity)-[r:CO_OCCURS]-(e2:Entity) WHERE r.doc_id = $doc_id RETURN id(e1) AS source, id(e2) AS target, coalesce(r.weight, 1.0) AS weight',
                 {{
                     parameters: {{doc_id: $doc_id}}
                 }}
@@ -502,13 +527,14 @@ class GraphManager:
             return {}
     
     async def _detect_communities_simple(self, doc_id: str) -> Dict[str, List[str]]:
-        """Simple community detection based on entity co-occurrence (fallback method)"""
+        """Simple community detection based on entity co-occurrence (fallback method)
+        Now works with merged entities - filters chunks by doc_id"""
         
-        # Get entity co-occurrence data
+        # Get entity co-occurrence data - filter chunks by doc_id but use merged entities
         query = """
-        MATCH (e1:Entity {doc_id: $doc_id})-[:MENTIONED_IN]->(c:Chunk)<-[:MENTIONED_IN]-(e2:Entity {doc_id: $doc_id})
+        MATCH (e1:Entity)-[:MENTIONED_IN {doc_id: $doc_id}]->(c:Chunk {doc_id: $doc_id})<-[:MENTIONED_IN {doc_id: $doc_id}]-(e2:Entity)
         WHERE e1.name <> e2.name
-        RETURN e1.name as entity1, e2.name as entity2, count(c) as co_occurrence
+        RETURN e1.name as entity1, e2.name as entity2, count(DISTINCT c) as co_occurrence
         ORDER BY co_occurrence DESC
         """
         
@@ -563,10 +589,11 @@ class GraphManager:
         return communities
     
     async def _get_community_chunks(self, doc_id: str, entity_names: List[str]) -> str:
-        """Get text chunks that mention the community entities"""
+        """Get text chunks that mention the community entities
+        Now works with merged entities - filters chunks by doc_id"""
         
         query = """
-        MATCH (e:Entity {doc_id: $doc_id})-[:MENTIONED_IN]->(c:Chunk)
+        MATCH (e:Entity)-[:MENTIONED_IN {doc_id: $doc_id}]->(c:Chunk {doc_id: $doc_id})
         WHERE e.name IN $entity_names
         RETURN DISTINCT c.text as chunk_text
         LIMIT 10

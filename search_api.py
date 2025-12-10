@@ -173,9 +173,10 @@ async def get_search_suggestions(doc_id: Optional[str] = None):
     try:
         if doc_id:
             # Get entities and topics from specific document
+            # Entities are now merged across documents, so filter by chunks from this doc_id
             query = """
-            MATCH (e:Entity {doc_id: $doc_id})
-            WITH e.type as entity_type, collect(e.name)[..5] as sample_entities
+            MATCH (e:Entity)-[:MENTIONED_IN {doc_id: $doc_id}]->(:Chunk {doc_id: $doc_id})
+            WITH DISTINCT e.type as entity_type, collect(DISTINCT e.name)[..5] as sample_entities
             RETURN entity_type, sample_entities
             ORDER BY entity_type
             """
