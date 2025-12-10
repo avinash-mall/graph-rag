@@ -7,22 +7,24 @@ Classifies questions into:
 - OUT_OF_SCOPE: Not covered by knowledge base
 """
 
-import logging
-import os
 import json
 import re
 from typing import Literal, TypedDict, Optional
 from enum import Enum
-from dotenv import load_dotenv
 
+# Import centralized configuration and logging
+from config import get_config
+from logging_config import get_logger, log_function_call
 from utils import llm_client
 
-load_dotenv()
+# Get configuration
+cfg = get_config()
 
-logger = logging.getLogger("QuestionClassifier")
+# Setup logging using centralized logging config
+logger = get_logger("QuestionClassifier")
 
-# MCP Configuration
-USE_MCP_CLASSIFIER = os.getenv("USE_MCP_CLASSIFIER", "false").lower() == "true"
+# MCP Configuration from centralized config
+USE_MCP_CLASSIFIER = cfg.classifier.mcp_config.enabled
 
 QuestionType = Literal["BROAD", "CHUNK", "OUT_OF_SCOPE"]
 
@@ -49,13 +51,16 @@ class QuestionClassifier:
     """
     
     def __init__(self):
-        self.logger = logging.getLogger("QuestionClassifier")
+        self.logger = get_logger("QuestionClassifier")
         self.use_mcp = USE_MCP_CLASSIFIER
-        self.use_heuristics = os.getenv("CLASSIFIER_USE_HEURISTICS", "true").lower() == "true"
-        self.use_llm = os.getenv("CLASSIFIER_USE_LLM", "true").lower() == "true"
+        self.use_heuristics = cfg.classifier.use_heuristics
+        self.use_llm = cfg.classifier.use_llm
         
         if self.use_mcp:
-            self.logger.info("MCP classifier enabled - will use MCP server for classification")
+            self.logger.info(
+                "MCP classifier enabled - will use MCP server for classification",
+                extra={"classifier": "mcp", "service": "question_classifier"}
+            )
         
     async def classify(self, question: str) -> ClassificationResult:
         """
@@ -80,7 +85,14 @@ class QuestionClassifier:
                 from mcp_classifier_client import classify_question_via_mcp
                 mcp_result = await classify_question_via_mcp(question)
                 if mcp_result and mcp_result.get("type"):
-                    self.logger.info(f"MCP classification: {mcp_result['type']} - {mcp_result.get('reason', '')}")
+                    self.logger.info(
+                        f"MCP classification: {mcp_result['type']} - {mcp_result.get('reason', '')}",
+                        extra={
+                            "classification_type": mcp_result['type'],
+                            "reason": mcp_result.get('reason', ''),
+                            "method": "mcp"
+                        }
+                    )
                     return mcp_result
             except ImportError:
                 self.logger.warning("MCP classifier client not available, falling back to direct classification")

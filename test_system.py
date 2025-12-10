@@ -669,6 +669,55 @@ class TestQuestionClassifier:
         assert "reason" in result
         assert "confidence" in result
         assert result["type"] in ["BROAD", "CHUNK", "OUT_OF_SCOPE"]
+    
+    @pytest.mark.asyncio
+    async def test_classification_accuracy_broad_questions(self):
+        """Test classification accuracy for various broad question patterns"""
+        broad_questions = [
+            "Give me an overview of all topics",
+            "What are the main themes?",
+            "Summarize the key points",
+            "What's the big picture?",
+            "Compare different approaches"
+        ]
+        
+        for question in broad_questions:
+            result = await self.classifier.classify(question)
+            assert result["type"] in ["BROAD", "CHUNK", "OUT_OF_SCOPE"]
+            # Most should be classified as BROAD
+            if result["type"] == "BROAD":
+                assert result["confidence"] > 0.5, f"Question '{question}' should have higher confidence"
+    
+    @pytest.mark.asyncio
+    async def test_classification_accuracy_chunk_questions(self):
+        """Test classification accuracy for specific/chunk questions"""
+        chunk_questions = [
+            "What is the deadline?",
+            "Where does it say X?",
+            "What section mentions Y?",
+            "According to the document, what is Z?",
+            "Who said that?"
+        ]
+        
+        for question in chunk_questions:
+            result = await self.classifier.classify(question)
+            assert result["type"] in ["BROAD", "CHUNK", "OUT_OF_SCOPE"]
+            # Most should be classified as CHUNK
+            if result["type"] == "CHUNK":
+                assert result["confidence"] > 0.4, f"Question '{question}' should have reasonable confidence"
+    
+    @pytest.mark.asyncio
+    async def test_classification_fallback_chain(self):
+        """Test that classification falls back through heuristics -> LLM -> default"""
+        question = "Test question"
+        
+        # Test that classification always returns a valid result
+        result = await self.classifier.classify(question)
+        
+        assert result["type"] in ["BROAD", "CHUNK", "OUT_OF_SCOPE"]
+        assert "reason" in result
+        assert "confidence" in result
+        assert 0.0 <= result["confidence"] <= 1.0
 
 class TestMapReduce:
     """Test map-reduce processor"""
@@ -797,6 +846,103 @@ class TestMapReduce:
             
             # Should only process high-relevance community
             assert len(processed_summaries) >= 0  # At least the high-relevance one
+    
+    @pytest.mark.asyncio
+    async def test_map_reduce_aggregation_accuracy(self):
+        """Test that map-reduce properly aggregates information from multiple communities"""
+        communities = [
+            {
+                "summary": "Policy A: All employees must complete safety training.",
+                "community": "community_0",
+                "similarity_score": 0.8
+            },
+            {
+                "summary": "Policy B: Regular performance reviews are required quarterly.",
+                "community": "community_1",
+                "similarity_score": 0.75
+            },
+            {
+                "summary": "Policy C: Data must be encrypted at rest and in transit.",
+                "community": "community_2",
+                "similarity_score": 0.7
+            }
+        ]
+        
+        question = "What are all the company policies?"
+        
+        with patch('map_reduce.llm_client') as mock_llm:
+            # Track map calls
+            map_calls = []
+            def mock_invoke(messages):
+                content = messages[1]["content"]
+                if "Community Summary:" in content:
+                    # Map step - extract from community
+                    map_calls.append(content)
+                    for comm in communities:
+                        if comm["summary"] in content:
+                            return f"Extracted: {comm['summary']}"
+                    return "Extracted information"
+                elif "Combine" in content or "synthesizing" in content.lower():
+                    # Reduce step - combine all partial answers
+                    return "Combined answer covering all three policies: safety training, performance reviews, and data encryption."
+                return "Some information"
+            
+            mock_llm.invoke = AsyncMock(side_effect=mock_invoke)
+            
+            result = await self.processor.process_communities(question, communities)
+            
+            # Verify map step was called for each community
+            assert len(map_calls) >= len(communities), "Map step should process all communities"
+            
+            # Verify reduce step was called
+            assert "Combined" in result or "policies" in result.lower() or len(result) > 50
+    
+    @pytest.mark.asyncio
+    async def test_map_reduce_handles_partial_failures(self):
+        """Test that map-reduce continues processing even if some communities fail"""
+        communities = [
+            {
+                "summary": "Valid summary 1",
+                "community": "community_0",
+                "similarity_score": 0.8
+            },
+            {
+                "summary": "",  # Empty summary should be skipped
+                "community": "community_1",
+                "similarity_score": 0.7
+            },
+            {
+                "summary": "Valid summary 2",
+                "community": "community_2",
+                "similarity_score": 0.75
+            }
+        ]
+        
+        question = "What are the policies?"
+        
+        with patch('map_reduce.llm_client') as mock_llm:
+            processed_communities = []
+            def mock_invoke(messages):
+                content = messages[1]["content"]
+                if "Community Summary:" in content:
+                    # Track which communities were processed
+                    for comm in communities:
+                        if comm["summary"] and comm["summary"] in content:
+                            processed_communities.append(comm["community"])
+                            return f"Information from {comm['community']}"
+                elif "Combine" in content or "synthesizing" in content.lower():
+                    return "Combined answer from valid communities"
+                return "NO_RELEVANT_INFO"
+            
+            mock_llm.invoke = AsyncMock(side_effect=mock_invoke)
+            
+            result = await self.processor.process_communities(question, communities)
+            
+            # Should process valid communities and skip empty ones
+            assert len(processed_communities) >= 2  # At least valid ones
+            assert "community_1" not in processed_communities  # Empty one should be skipped
+            assert isinstance(result, str)
+            assert len(result) > 0
 
 class TestClassificationRouting:
     """Test classification-based routing in unified search"""

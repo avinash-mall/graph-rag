@@ -10,8 +10,6 @@ multi-endpoint approach with a single, flexible search function. It addresses th
 """
 
 import asyncio
-import logging
-import os
 import re
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
@@ -19,8 +17,10 @@ from enum import Enum
 
 import numpy as np
 from neo4j import GraphDatabase
-from dotenv import load_dotenv
 
+# Import centralized configuration and logging
+from config import get_config
+from logging_config import get_logger, log_function_call, log_error_with_context
 from utils import (
     nlp_processor, llm_client, embedding_client, text_processor,
     cosine_similarity, run_cypher_query_async
@@ -28,16 +28,18 @@ from utils import (
 from question_classifier import classify_question, ClassificationResult
 from map_reduce import map_reduce_communities
 
-load_dotenv()
+# Get configuration
+cfg = get_config()
 
-# Configuration
-RELEVANCE_THRESHOLD = float(os.getenv("RELEVANCE_THRESHOLD", "0.5"))
-MAX_CHUNKS_PER_ANSWER = int(os.getenv("MAX_CHUNKS_PER_ANSWER", "7"))
-MAX_COMMUNITY_SUMMARIES = int(os.getenv("MAX_COMMUNITY_SUMMARIES", "3"))
-SIMILARITY_THRESHOLD_CHUNKS = float(os.getenv("SIMILARITY_THRESHOLD_CHUNKS", "0.4"))
-SIMILARITY_THRESHOLD_ENTITIES = float(os.getenv("SIMILARITY_THRESHOLD_ENTITIES", "0.6"))
+# Use configuration values (backward compatibility)
+RELEVANCE_THRESHOLD = cfg.search.relevance_threshold
+MAX_CHUNKS_PER_ANSWER = cfg.search.max_chunks_per_answer
+MAX_COMMUNITY_SUMMARIES = cfg.search.max_community_summaries
+SIMILARITY_THRESHOLD_CHUNKS = cfg.search.similarity_threshold_chunks
+SIMILARITY_THRESHOLD_ENTITIES = cfg.search.similarity_threshold_entities
 
-logger = logging.getLogger("UnifiedSearch")
+# Setup logging using centralized logging config
+logger = get_logger("UnifiedSearch")
 
 class SearchScope(Enum):
     """Search scope options"""
@@ -75,7 +77,7 @@ class UnifiedSearchPipeline:
     
     def __init__(self, neo4j_driver):
         self.driver = neo4j_driver
-        self.logger = logging.getLogger("UnifiedSearchPipeline")
+        self.logger = get_logger("UnifiedSearchPipeline")
     
     async def search(
         self,
@@ -109,7 +111,12 @@ class UnifiedSearchPipeline:
             
             self.logger.info(
                 f"Question classified as: {question_type} "
-                f"(confidence: {classification_confidence:.2f}, reason: {classification_reason})"
+                f"(confidence: {classification_confidence:.2f}, reason: {classification_reason})",
+                extra={
+                    "question_type": question_type,
+                    "confidence": classification_confidence,
+                    "reason": classification_reason
+                }
             )
             
             # Route based on classification

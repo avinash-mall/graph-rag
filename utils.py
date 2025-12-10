@@ -12,7 +12,6 @@ Features:
 
 import asyncio
 import hashlib
-import logging
 import os
 import re
 import string
@@ -26,28 +25,30 @@ import time
 import httpx
 import numpy as np
 import blingfire
-from dotenv import load_dotenv
 from fastapi import HTTPException
 
-# Load environment variables
-load_dotenv()
-
-# Configuration
-CHUNK_SIZE_GDS = int(os.getenv("CHUNK_SIZE_GDS", "512"))
-CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "50"))
-COSINE_EPSILON = float(os.getenv("COSINE_EPSILON", "1e-8"))
-RELEVANCE_THRESHOLD = float(os.getenv("RELEVANCE_THRESHOLD", "0.5"))
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "10"))
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "4"))
-CACHE_TTL = int(os.getenv("CACHE_TTL", "3600"))  # 1 hour
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-
-# Setup logging
-logging.basicConfig(
-    level=LOG_LEVEL,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+# Import centralized configuration, logging, and resilience
+from config import get_config
+from logging_config import get_logger, log_external_service_call, log_error_with_context
+from resilience import (
+    get_circuit_breaker, call_with_resilience, RetryConfig,
+    CircuitBreakerOpenError
 )
-logger = logging.getLogger("Utils")
+
+# Get configuration
+cfg = get_config()
+
+# Use configuration values (backward compatibility)
+CHUNK_SIZE_GDS = cfg.processing.chunk_size
+CHUNK_OVERLAP = cfg.processing.chunk_overlap
+COSINE_EPSILON = cfg.processing.cosine_epsilon
+RELEVANCE_THRESHOLD = cfg.search.relevance_threshold
+BATCH_SIZE = cfg.processing.batch_size
+MAX_WORKERS = cfg.processing.max_workers
+CACHE_TTL = cfg.processing.cache_ttl
+
+# Setup logging using centralized logging config
+logger = get_logger("Utils")
 
 # Global thread pool for CPU-bound tasks
 thread_pool = ThreadPoolExecutor(max_workers=MAX_WORKERS)
@@ -87,22 +88,36 @@ class EfficientNLPProcessor:
     """
     
     def __init__(self):
+        # Get configuration from centralized config
+        ner_cfg = cfg.ner
+        coref_cfg = cfg.coref
+        
         # NER LLM client
-        self.ner_model = os.getenv("NER_MODEL", "gemma3:1b")
-        self.ner_base_url = os.getenv("NER_BASE_URL", "http://localhost:11434/v1")
-        ner_api_key_raw = os.getenv("NER_API_KEY", "test")
-        self.ner_api_key = ner_api_key_raw.strip('"').strip("'") if ner_api_key_raw else "test"
-        self.ner_temperature = float(os.getenv("NER_TEMPERATURE", "0.0"))
+        self.ner_model = ner_cfg.model
+        self.ner_base_url = ner_cfg.base_url
+        self.ner_api_key = ner_cfg.api_key
+        self.ner_temperature = ner_cfg.temperature
+        self.ner_timeout = ner_cfg.timeout
         
         # Coreference LLM client
-        self.coref_model = os.getenv("COREF_MODEL", "gemma3:1b")
-        self.coref_base_url = os.getenv("COREF_BASE_URL", "http://localhost:11434/v1")
-        coref_api_key_raw = os.getenv("COREF_API_KEY", "test")
-        self.coref_api_key = coref_api_key_raw.strip('"').strip("'") if coref_api_key_raw else "test"
-        self.coref_temperature = float(os.getenv("COREF_TEMPERATURE", "0.0"))
+        self.coref_model = coref_cfg.model
+        self.coref_base_url = coref_cfg.base_url
+        self.coref_api_key = coref_cfg.api_key
+        self.coref_temperature = coref_cfg.temperature
+        self.coref_timeout = coref_cfg.timeout
         
-        self.timeout = int(os.getenv("API_TIMEOUT", "600"))
-        logger.info(f"Initialized LLM-based NLP processor with NER model: {self.ner_model}, Coref model: {self.coref_model}")
+        # Get circuit breakers for resilience
+        self.ner_circuit_breaker = get_circuit_breaker("ner")
+        self.coref_circuit_breaker = get_circuit_breaker("coref")
+        
+        logger.info(
+            "Initialized LLM-based NLP processor",
+            extra={
+                "ner_model": self.ner_model,
+                "coref_model": self.coref_model,
+                "service": "nlp_processor"
+            }
+        )
     
     async def extract_entities(self, text: str) -> List[Entity]:
         """
@@ -129,7 +144,8 @@ class EfficientNLPProcessor:
                 self.ner_base_url, 
                 self.ner_model, 
                 self.ner_api_key, 
-                self.ner_temperature
+                self.ner_temperature,
+                service_type="ner"
             )
             
             # Parse LLM response
@@ -142,23 +158,46 @@ class EfficientNLPProcessor:
             logger.error(f"Error in LLM-based entity extraction: {e}")
             return []
     
-    async def _call_llm(self, messages: List[Dict[str, str]], base_url: str, model: str, api_key: str, temperature: float) -> str:
-        """Call LLM API - supports both OpenAI-compatible and Gemini APIs"""
-        try:
-            base_url = base_url.rstrip('/')
-            
-            # Detect if this is a Gemini API
-            is_gemini = 'generativelanguage.googleapis.com' in base_url
-            
+    async def _call_llm(self, messages: List[Dict[str, str]], base_url: str, model: str, api_key: str, temperature: float, service_type: str = "ner") -> str:
+        """Call LLM API with resilience - supports both OpenAI-compatible and Gemini APIs"""
+        base_url = base_url.rstrip('/')
+        
+        # Detect if this is a Gemini API
+        is_gemini = 'generativelanguage.googleapis.com' in base_url
+        
+        # Select appropriate circuit breaker
+        circuit_breaker = self.ner_circuit_breaker if service_type == "ner" else self.coref_circuit_breaker
+        timeout = self.ner_timeout if service_type == "ner" else self.coref_timeout
+        
+        # Create context for logging
+        context = log_external_service_call(
+            service="llm",
+            endpoint="chat/completions" if not is_gemini else "generateContent",
+            method="POST",
+            model=model,
+            service_type=service_type
+        )
+        
+        async def _call():
             if is_gemini:
-                # Use Gemini API format
                 return await self._call_gemini_api(messages, base_url, model, api_key, temperature)
             else:
-                # Use OpenAI-compatible format
                 return await self._call_openai_api(messages, base_url, model, api_key, temperature)
-                    
+        
+        try:
+            return await call_with_resilience(
+                _call,
+                circuit_breaker=circuit_breaker,
+                timeout=timeout,
+                context=context
+            )
         except Exception as e:
-            logger.error(f"LLM API call failed: {e}")
+            log_error_with_context(
+                logger,
+                f"LLM API call failed: {e}",
+                exception=e,
+                context=context
+            )
             raise
     
     async def _call_gemini_api(self, messages: List[Dict[str, str]], base_url: str, model: str, api_key: str, temperature: float) -> str:
@@ -424,7 +463,8 @@ class EfficientNLPProcessor:
                 self.coref_base_url,
                 self.coref_model,
                 self.coref_api_key,
-                self.coref_temperature
+                self.coref_temperature,
+                service_type="coref"
             )
             
             logger.debug("Coreference resolution completed using LLM")
@@ -440,24 +480,26 @@ class AsyncLLMClient:
     """
     
     def __init__(self):
-        # Strip quotes if present (common when values are quoted in .env files)
-        api_key_raw = os.getenv("OPENAI_API_KEY")
-        self.api_key = api_key_raw.strip('"').strip("'") if api_key_raw else None
-        self.model = os.getenv("OPENAI_MODEL", "llama3.2")
-        self.base_url = os.getenv("OPENAI_BASE_URL")
-        self.temperature = float(os.getenv("OPENAI_TEMPERATURE", "0.0"))
-        self.timeout = int(os.getenv("API_TIMEOUT", "600"))
-        self.provider = os.getenv("LLM_PROVIDER", "gemini").lower()
+        # Get configuration from centralized config
+        llm_cfg = cfg.llm
         
-        stop_str = os.getenv("OPENAI_STOP")
-        self.stop = json.loads(stop_str) if stop_str else None
+        self.api_key = llm_cfg.api_key
+        self.model = llm_cfg.model
+        self.base_url = llm_cfg.base_url
+        self.temperature = llm_cfg.temperature
+        self.timeout = llm_cfg.timeout
+        self.provider = llm_cfg.provider
+        self.stop = llm_cfg.stop
+        
+        # Get circuit breaker for resilience
+        self.circuit_breaker = get_circuit_breaker("llm")
         
         # Rate limiting
         self.last_request_time = 0
         self.min_request_interval = 0.1  # 100ms between requests
     
-    async def invoke(self, messages: List[Dict[str, str]], max_retries: int = 3) -> str:
-        """Invoke LLM with improved error handling and rate limiting"""
+    async def invoke(self, messages: List[Dict[str, str]], max_retries: Optional[int] = None) -> str:
+        """Invoke LLM with resilience: circuit breaker, retries, and timeout"""
         if not messages or not isinstance(messages, list):
             raise ValueError("Messages must be a non-empty list")
         
@@ -467,13 +509,39 @@ class AsyncLLMClient:
         if time_since_last < self.min_request_interval:
             await asyncio.sleep(self.min_request_interval - time_since_last)
         
-        if self.provider in {"openai", "ollama"}:
-            return await self._invoke_openai(messages, max_retries)
-        else:
-            return await self._invoke_gemini(messages, max_retries)
+        # Create context for logging
+        context = log_external_service_call(
+            service="llm",
+            endpoint="chat/completions" if self.provider in {"openai", "ollama"} else "generateContent",
+            method="POST",
+            model=self.model,
+            provider=self.provider
+        )
+        
+        async def _call():
+            if self.provider in {"openai", "ollama"}:
+                return await self._invoke_openai(messages)
+            else:
+                return await self._invoke_gemini(messages)
+        
+        try:
+            return await call_with_resilience(
+                _call,
+                circuit_breaker=self.circuit_breaker,
+                timeout=self.timeout,
+                context=context
+            )
+        except Exception as e:
+            log_error_with_context(
+                logger,
+                f"LLM invocation failed: {e}",
+                exception=e,
+                context=context
+            )
+            raise
 
-    async def _invoke_gemini(self, messages: List[Dict[str, str]], max_retries: int) -> str:
-        """Call Gemini-compatible endpoint."""
+    async def _invoke_gemini(self, messages: List[Dict[str, str]]) -> str:
+        """Call Gemini-compatible endpoint (retry logic handled by resilience module)."""
         contents = []
         for msg in messages:
             role = msg.get("role", "user")
@@ -500,50 +568,29 @@ class AsyncLLMClient:
 
         api_url = f"{self.base_url}/models/{self.model}:generateContent"
 
-        for attempt in range(max_retries):
-            try:
-                async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
-                    response = await client.post(
-                        api_url,
-                        json=payload,
-                        headers=headers,
-                        params={"key": self.api_key} if self.api_key else None
-                    )
-                    response.raise_for_status()
+        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+            response = await client.post(
+                api_url,
+                json=payload,
+                headers=headers,
+                params={"key": self.api_key} if self.api_key else None
+            )
+            response.raise_for_status()
 
-                    data = response.json()
-                    candidates = data.get("candidates", [])
-                    if candidates and candidates[0].get("content", {}).get("parts"):
-                        content = candidates[0]["content"]["parts"][0].get("text", "").strip()
-                        if not content:
-                            raise ValueError("Empty response from LLM")
+            data = response.json()
+            candidates = data.get("candidates", [])
+            if candidates and candidates[0].get("content", {}).get("parts"):
+                content = candidates[0]["content"]["parts"][0].get("text", "").strip()
+                if not content:
+                    raise ValueError("Empty response from LLM")
 
-                        self.last_request_time = time.time()
-                        return content
-                    else:
-                        raise ValueError("Invalid response format from Gemini API")
+                self.last_request_time = time.time()
+                return content
+            else:
+                raise ValueError("Invalid response format from Gemini API")
 
-            except httpx.HTTPStatusError as e:
-                logger.error(f"HTTP error {e.response.status_code}: {e.response.text}")
-                if e.response.status_code == 429:  # Rate limit
-                    wait_time = 2 ** attempt
-                    logger.info(f"Rate limited, waiting {wait_time}s")
-                    await asyncio.sleep(wait_time)
-                elif attempt == max_retries - 1:
-                    raise
-                else:
-                    await asyncio.sleep(1 * (attempt + 1))
-
-            except Exception as e:
-                logger.error(f"Request error (attempt {attempt + 1}): {str(e)}")
-                if attempt == max_retries - 1:
-                    raise
-                await asyncio.sleep(1 * (attempt + 1))
-
-        raise Exception("Max retries exceeded")
-
-    async def _invoke_openai(self, messages: List[Dict[str, str]], max_retries: int) -> str:
-        """Call OpenAI/Ollama-compatible chat completions endpoint."""
+    async def _invoke_openai(self, messages: List[Dict[str, str]]) -> str:
+        """Call OpenAI/Ollama-compatible chat completions endpoint (retry logic handled by resilience module)."""
         # Construct URL - handle base_url that may already include /v1
         base_url = self.base_url.rstrip('/')
         if base_url.endswith('/v1'):
@@ -565,43 +612,22 @@ class AsyncLLMClient:
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
-        for attempt in range(max_retries):
-            try:
-                async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
-                    response = await client.post(url, json=payload, headers=headers)
-                    response.raise_for_status()
+        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+            response = await client.post(url, json=payload, headers=headers)
+            response.raise_for_status()
 
-                    data = response.json()
-                    choices = data.get("choices", [])
-                    if choices:
-                        message = choices[0].get("message", {})
-                        content = (message.get("content") or "").strip()
-                        if not content:
-                            raise ValueError("Empty response from LLM")
+            data = response.json()
+            choices = data.get("choices", [])
+            if choices:
+                message = choices[0].get("message", {})
+                content = (message.get("content") or "").strip()
+                if not content:
+                    raise ValueError("Empty response from LLM")
 
-                        self.last_request_time = time.time()
-                        return content
-                    else:
-                        raise ValueError("Invalid response format from OpenAI-compatible API")
-
-            except httpx.HTTPStatusError as e:
-                logger.error(f"HTTP error {e.response.status_code}: {e.response.text}")
-                if e.response.status_code == 429:
-                    wait_time = 2 ** attempt
-                    logger.info(f"Rate limited, waiting {wait_time}s")
-                    await asyncio.sleep(wait_time)
-                elif attempt == max_retries - 1:
-                    raise
-                else:
-                    await asyncio.sleep(1 * (attempt + 1))
-
-            except Exception as e:
-                logger.error(f"Request error (attempt {attempt + 1}): {str(e)}")
-                if attempt == max_retries - 1:
-                    raise
-                await asyncio.sleep(1 * (attempt + 1))
-
-        raise Exception("Max retries exceeded")
+                self.last_request_time = time.time()
+                return content
+            else:
+                raise ValueError("Invalid response format from OpenAI-compatible API")
 
 class BatchEmbeddingClient:
     """
@@ -610,24 +636,39 @@ class BatchEmbeddingClient:
     """
     
     def __init__(self):
-        self.embedding_api_url = os.getenv("EMBEDDING_API_URL", "http://localhost/api/embed")
-        # Strip quotes if present (common when values are quoted in .env files)
-        embedding_api_key_raw = os.getenv("EMBEDDING_API_KEY")
-        self.embedding_api_key = embedding_api_key_raw.strip('"').strip("'") if embedding_api_key_raw else None
-        self.model_name = os.getenv("EMBEDDING_MODEL_NAME", "mxbai-embed-large")
-        self.timeout = int(os.getenv("API_TIMEOUT", "600"))
-        self.batch_size = int(os.getenv("EMBEDDING_BATCH_SIZE", "10"))
-        self.provider = os.getenv("LLM_PROVIDER", "openai").lower()
-        self.include_bearer_auth = os.getenv("EMBEDDING_INCLUDE_BEARER_AUTH", "true").lower() == "true"
+        # Get configuration from centralized config
+        emb_cfg = cfg.embedding
+        
+        self.embedding_api_url = emb_cfg.api_url
+        self.embedding_api_key = emb_cfg.api_key
+        self.model_name = emb_cfg.model_name
+        self.timeout = emb_cfg.timeout
+        self.batch_size = emb_cfg.batch_size
+        self.provider = emb_cfg.provider
+        self.include_bearer_auth = emb_cfg.include_bearer_auth
+        
+        # Get circuit breaker for resilience
+        self.circuit_breaker = get_circuit_breaker("embedding")
         
         # In-memory cache with TTL
         self.cache = {}
         self.cache_timestamps = {}
         self.cache_ttl = CACHE_TTL
         
-        logger.info(f"Initialized BatchEmbeddingClient with provider={self.provider}, batch_size={self.batch_size}")
+        logger.info(
+            "Initialized BatchEmbeddingClient",
+            extra={
+                "provider": self.provider,
+                "batch_size": self.batch_size,
+                "model": self.model_name,
+                "service": "embedding"
+            }
+        )
         if not self.embedding_api_key:
-            logger.warning("EMBEDDING_API_KEY not found in environment variables")
+            logger.warning(
+                "EMBEDDING_API_KEY not found",
+                extra={"service": "embedding"}
+            )
     
     def _get_text_hash(self, text: str) -> str:
         """Generate hash for caching"""
@@ -695,11 +736,29 @@ class BatchEmbeddingClient:
                 batch_indices = [idx for idx, _ in batch]
                 
                 try:
-                    # Choose embedding method based on provider
-                    if self.provider in {"openai", "ollama"}:
-                        batch_embeddings = await self._fetch_batch_embeddings_openai(batch_texts)
-                    else:  # gemini
-                        batch_embeddings = await self._fetch_batch_embeddings_gemini(batch_texts)
+                    # Create context for logging
+                    context = log_external_service_call(
+                        service="embedding",
+                        endpoint="embeddings" if self.provider in {"openai", "ollama"} else "batchEmbedContents",
+                        method="POST",
+                        model=self.model_name,
+                        batch_size=len(batch_texts)
+                    )
+                    
+                    async def _fetch_batch():
+                        # Choose embedding method based on provider
+                        if self.provider in {"openai", "ollama"}:
+                            return await self._fetch_batch_embeddings_openai(batch_texts)
+                        else:  # gemini
+                            return await self._fetch_batch_embeddings_gemini(batch_texts)
+                    
+                    # Use resilience for API call
+                    batch_embeddings = await call_with_resilience(
+                        _fetch_batch,
+                        circuit_breaker=self.circuit_breaker,
+                        timeout=self.timeout,
+                        context=context
+                    )
                     
                     # Store results and update cache
                     for j, embedding in enumerate(batch_embeddings):
@@ -712,7 +771,12 @@ class BatchEmbeddingClient:
                         self.cache_timestamps[text_hash] = time.time()
                         
                 except Exception as e:
-                    logger.error(f"Batch embedding failed: {e}")
+                    log_error_with_context(
+                        logger,
+                        f"Batch embedding failed: {e}",
+                        exception=e,
+                        context={"batch_size": len(batch_texts), "service": "embedding"}
+                    )
                     # Fill with empty embeddings for failed batch
                     for idx in batch_indices:
                         results[idx] = []
@@ -972,21 +1036,49 @@ def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
 
 async def run_cypher_query_async(driver, query: str, parameters: Dict[str, Any] = None) -> List[Dict[str, Any]]:
     """
-    Async wrapper for Neo4j queries to avoid blocking the event loop
+    Async wrapper for Neo4j queries with resilience: circuit breaker, retries, and timeout.
+    Runs in thread pool to avoid blocking the event loop.
     """
+    from logging_config import log_database_operation
+    
     parameters = parameters or {}
     
-    def _run_query():
-        try:
-            with driver.session() as session:
-                result = session.run(query, **parameters)
-                return [record.data() for record in result]
-        except Exception as e:
-            logger.error(f"Neo4j query error: {e}")
-            raise HTTPException(status_code=500, detail=f"Database query failed: {e}")
+    # Get circuit breaker for Neo4j
+    neo4j_circuit_breaker = get_circuit_breaker("neo4j")
     
-    # Run in thread pool to avoid blocking
-    return await asyncio.get_event_loop().run_in_executor(thread_pool, _run_query)
+    # Create context for logging
+    context = log_database_operation(
+        operation="cypher_query",
+        query_type="cypher",
+        query_preview=query[:100] + "..." if len(query) > 100 else query
+    )
+    
+    def _run_query():
+        """Synchronous query execution function"""
+        with driver.session() as session:
+            result = session.run(query, **parameters)
+            return [record.data() for record in result]
+    
+    async def _call_query():
+        """Async wrapper for thread pool execution"""
+        return await asyncio.get_event_loop().run_in_executor(thread_pool, _run_query)
+    
+    try:
+        # Use resilience for database calls
+        return await call_with_resilience(
+            _call_query,
+            circuit_breaker=neo4j_circuit_breaker,
+            timeout=cfg.resilience.request_timeout,
+            context=context
+        )
+    except Exception as e:
+        log_error_with_context(
+            logger,
+            f"Neo4j query error: {e}",
+            exception=e,
+            context=context
+        )
+        raise HTTPException(status_code=500, detail=f"Database query failed: {e}")
 
 def run_async_safe(coro):
     """

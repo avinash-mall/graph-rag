@@ -5,22 +5,26 @@ This client connects to the MCP classification server and calls the classify_que
 """
 
 import asyncio
-import logging
-import os
 from typing import Optional
-from dotenv import load_dotenv
 
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 from question_classifier import ClassificationResult, QuestionType
 
-load_dotenv()
+# Import centralized configuration, logging, and resilience
+from config import get_config
+from logging_config import get_logger, log_external_service_call, log_error_with_context
+from resilience import call_with_resilience, get_circuit_breaker
 
-logger = logging.getLogger("MCPClassifierClient")
+# Get configuration
+cfg = get_config()
 
-# Configuration
-MCP_CLASSIFIER_URL = os.getenv("MCP_CLASSIFIER_URL", "http://localhost:8001/mcp")
-MCP_CLASSIFIER_TIMEOUT = int(os.getenv("MCP_CLASSIFIER_TIMEOUT", "30"))
+# Setup logging using centralized logging config
+logger = get_logger("MCPClassifierClient")
+
+# Configuration from centralized config
+MCP_CLASSIFIER_URL = cfg.classifier.mcp_config.url
+MCP_CLASSIFIER_TIMEOUT = cfg.classifier.mcp_config.timeout
 
 # Global session cache
 _client_session: Optional[ClientSession] = None
@@ -29,7 +33,7 @@ _write_stream = None
 
 async def classify_question_via_mcp(question: str) -> ClassificationResult:
     """
-    Classify a question using the MCP classification server.
+    Classify a question using the MCP classification server with resilience.
     
     Args:
         question: User's question to classify
@@ -37,7 +41,18 @@ async def classify_question_via_mcp(question: str) -> ClassificationResult:
     Returns:
         ClassificationResult with type, reason, and confidence
     """
-    try:
+    # Get circuit breaker for MCP service
+    mcp_circuit_breaker = get_circuit_breaker("mcp_classifier")
+    
+    # Create context for logging
+    context = log_external_service_call(
+        service="mcp_classifier",
+        endpoint="classify_question",
+        method="POST",
+        question_preview=question[:100]
+    )
+    
+    async def _classify():
         # Connect to the MCP server
         async with streamablehttp_client(MCP_CLASSIFIER_URL) as (
             read_stream,
@@ -67,24 +82,43 @@ async def classify_question_via_mcp(question: str) -> ClassificationResult:
                             "confidence": float(structured_result.get("confidence", 0.5))
                         }
                     else:
-                        logger.warning(f"Invalid classification type from MCP: {question_type}")
+                        logger.warning(
+                            f"Invalid classification type from MCP: {question_type}",
+                            extra=context
+                        )
                         # Fallback
                         return {
                             "type": "CHUNK",
                             "reason": "Invalid MCP response, defaulting to CHUNK",
                             "confidence": 0.5
                         }
-                else:
-                    logger.warning(f"Invalid MCP response structure: {structured_result}")
-                    # Fallback
-                    return {
-                        "type": "CHUNK",
-                        "reason": "Invalid MCP response, defaulting to CHUNK",
-                        "confidence": 0.5
-                    }
-                    
+                    else:
+                        logger.warning(
+                            f"Invalid MCP response structure: {structured_result}",
+                            extra=context
+                        )
+                        # Fallback
+                        return {
+                            "type": "CHUNK",
+                            "reason": "Invalid MCP response, defaulting to CHUNK",
+                            "confidence": 0.5
+                        }
+    
+    try:
+        # Use resilience for MCP call
+        return await call_with_resilience(
+            _classify,
+            circuit_breaker=mcp_circuit_breaker,
+            timeout=MCP_CLASSIFIER_TIMEOUT,
+            context=context
+        )
     except Exception as e:
-        logger.error(f"Error calling MCP classification server: {e}")
+        log_error_with_context(
+            logger,
+            f"Error calling MCP classification server: {e}",
+            exception=e,
+            context=context
+        )
         # Fallback to basic classification
         return {
             "type": "CHUNK",

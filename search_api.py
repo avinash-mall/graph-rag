@@ -10,35 +10,34 @@ Features:
 """
 
 import asyncio
-import logging
-import os
 from typing import Optional, List
 from datetime import datetime
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from neo4j import GraphDatabase
-from dotenv import load_dotenv
 
+# Import centralized configuration and logging
+from config import get_config
+from logging_config import get_logger, log_function_call, log_error_with_context
 from unified_search import get_search_pipeline, SearchScope, SearchResult
 from utils import run_cypher_query_async
 
-load_dotenv()
+# Get configuration
+cfg = get_config()
 
-# Configuration
-DB_URL = os.getenv("DB_URL")
-DB_USERNAME = os.getenv("DB_USERNAME")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-MAX_CHUNKS_PER_ANSWER = int(os.getenv("MAX_CHUNKS_PER_ANSWER", "7"))
-QUICK_SEARCH_MAX_CHUNKS = int(os.getenv("QUICK_SEARCH_MAX_CHUNKS", "5"))
+# Use configuration values (backward compatibility)
+MAX_CHUNKS_PER_ANSWER = cfg.search.max_chunks_per_answer
+QUICK_SEARCH_MAX_CHUNKS = cfg.search.quick_search_max_chunks
 
-# Setup logging
-logging.basicConfig(level=LOG_LEVEL)
-logger = logging.getLogger("SearchAPI")
+# Setup logging using centralized logging config
+logger = get_logger("SearchAPI")
 
 # Initialize Neo4j driver
-driver = GraphDatabase.driver(DB_URL, auth=(DB_USERNAME, DB_PASSWORD))
+driver = GraphDatabase.driver(
+    cfg.database.url,
+    auth=(cfg.database.username, cfg.database.password)
+)
 
 # Pydantic models
 class SearchRequest(BaseModel):
@@ -168,7 +167,12 @@ async def unified_search(request: SearchRequest):
         )
         
     except Exception as e:
-        logger.error(f"Search error: {e}")
+        log_error_with_context(
+            logger,
+            f"Search error: {e}",
+            exception=e,
+            context=log_function_call("unified_search", question=request.question[:100])
+        )
         raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
 
 @router.post("/quick_search")
@@ -217,7 +221,12 @@ async def quick_search(request: QuickSearchRequest):
         }
         
     except Exception as e:
-        logger.error(f"Quick search error: {e}")
+        log_error_with_context(
+            logger,
+            f"Quick search error: {e}",
+            exception=e,
+            context=log_function_call("quick_search", question=request.question[:100])
+        )
         raise HTTPException(status_code=500, detail=f"Quick search failed: {str(e)}")
 
 @router.get("/search_suggestions")

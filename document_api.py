@@ -12,8 +12,6 @@ Features:
 """
 
 import asyncio
-import logging
-import os
 import uuid
 from datetime import datetime
 from typing import List, Dict, Any, Optional
@@ -23,31 +21,32 @@ import docx
 from fastapi import APIRouter, HTTPException, UploadFile, File
 from neo4j import GraphDatabase
 from pydantic import BaseModel
-from dotenv import load_dotenv
 
+# Import centralized configuration, logging, and resilience
+from config import get_config
+from logging_config import get_logger, log_function_call, log_error_with_context
 from utils import (
     nlp_processor, embedding_client, text_processor, 
     run_cypher_query_async, extract_entities_efficient,
     clean_text_improved, chunk_text_improved, llm_client
 )
 
-load_dotenv()
+# Get configuration
+cfg = get_config()
 
-# Configuration
-DB_URL = os.getenv("DB_URL")
-DB_USERNAME = os.getenv("DB_USERNAME")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
-CHUNK_SIZE_GDS = int(os.getenv("CHUNK_SIZE_GDS", "512"))
-DOCUMENT_PROCESSING_BATCH_SIZE = int(os.getenv("DOCUMENT_PROCESSING_BATCH_SIZE", "20"))
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-EMBEDDING_DIMENSION = int(os.getenv("EMBEDDING_DIMENSION", "768"))
+# Use configuration values (backward compatibility)
+CHUNK_SIZE_GDS = cfg.processing.chunk_size
+DOCUMENT_PROCESSING_BATCH_SIZE = cfg.processing.document_processing_batch_size
+EMBEDDING_DIMENSION = cfg.embedding.dimension
 
-# Setup logging
-logging.basicConfig(level=LOG_LEVEL)
-logger = logging.getLogger("DocumentAPI")
+# Setup logging using centralized logging config
+logger = get_logger("DocumentAPI")
 
 # Initialize Neo4j driver
-driver = GraphDatabase.driver(DB_URL, auth=(DB_USERNAME, DB_PASSWORD))
+driver = GraphDatabase.driver(
+    cfg.database.url,
+    auth=(cfg.database.username, cfg.database.password)
+)
 
 # Pydantic models
 class DeleteDocumentRequest(BaseModel):
@@ -68,7 +67,7 @@ class GraphManager:
     
     def __init__(self, neo4j_driver):
         self.driver = neo4j_driver
-        self.logger = logging.getLogger("GraphManager")
+        self.logger = get_logger("GraphManager")
         self._vector_indexes_created = False
     
     async def _ensure_vector_indexes(self, embedding_dim: Optional[int] = None):
@@ -260,7 +259,12 @@ class GraphManager:
             }
             
         except Exception as e:
-            self.logger.error(f"Error in graph building: {e}")
+            log_error_with_context(
+                self.logger,
+                f"Error in graph building: {e}",
+                exception=e,
+                context=log_function_call("build_graph_efficient", chunks_count=len(chunks))
+            )
             raise
     
     async def _process_chunk_batch(
@@ -723,7 +727,10 @@ async def upload_documents(files: List[UploadFile] = File(...)):
             if not chunks:
                 raise HTTPException(status_code=400, detail=f"No valid chunks created from {file.filename}")
             
-            logger.info(f"Processing {file.filename}: {len(chunks)} chunks")
+            logger.info(
+                f"Processing {file.filename}: {len(chunks)} chunks",
+                extra=log_function_call("upload_documents", filename=file.filename, chunks_count=len(chunks))
+            )
             
             # Build graph
             metadata_list = [metadata] * len(chunks)
@@ -746,7 +753,12 @@ async def upload_documents(files: List[UploadFile] = File(...)):
             logger.info(f"Successfully processed {file.filename} in {total_time:.2f}s")
             
         except Exception as e:
-            logger.error(f"Error processing {file.filename}: {e}")
+            log_error_with_context(
+                logger,
+                f"Error processing {file.filename}: {e}",
+                exception=e,
+                context=log_function_call("upload_documents", filename=file.filename)
+            )
             raise HTTPException(status_code=500, detail=f"Error processing {file.filename}: {str(e)}")
     
     return {
@@ -783,7 +795,12 @@ async def list_documents():
         return {"documents": documents}
         
     except Exception as e:
-        logger.error(f"Error listing documents: {e}")
+        log_error_with_context(
+            logger,
+            f"Error listing documents: {e}",
+            exception=e,
+            context=log_function_call("list_documents")
+        )
         raise HTTPException(status_code=500, detail="Error listing documents")
 
 @router.delete("/delete_document")

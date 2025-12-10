@@ -5,21 +5,23 @@ Implements map-reduce pattern for processing large sets of community summaries
 to generate comprehensive answers for broad questions.
 """
 
-import logging
-import os
 from typing import List, Dict, Any, Optional
-from dotenv import load_dotenv
 
+# Import centralized configuration and logging
+from config import get_config
+from logging_config import get_logger, log_function_call
 from utils import llm_client
 
-load_dotenv()
+# Get configuration
+cfg = get_config()
 
-logger = logging.getLogger("MapReduce")
+# Setup logging using centralized logging config
+logger = get_logger("MapReduce")
 
-# Configuration
-MAP_MAX_COMMUNITIES = int(os.getenv("MAP_REDUCE_MAX_COMMUNITIES", "50"))
-MAP_BATCH_SIZE = int(os.getenv("MAP_REDUCE_BATCH_SIZE", "5"))
-MAP_MIN_RELEVANCE = float(os.getenv("MAP_REDUCE_MIN_RELEVANCE", "0.3"))
+# Configuration from centralized config
+MAP_MAX_COMMUNITIES = cfg.map_reduce.max_communities
+MAP_BATCH_SIZE = cfg.map_reduce.batch_size
+MAP_MIN_RELEVANCE = cfg.map_reduce.min_relevance
 
 class MapReduceProcessor:
     """
@@ -30,7 +32,7 @@ class MapReduceProcessor:
     """
     
     def __init__(self):
-        self.logger = logging.getLogger("MapReduceProcessor")
+        self.logger = get_logger("MapReduceProcessor")
     
     async def process_communities(
         self,
