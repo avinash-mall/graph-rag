@@ -59,11 +59,26 @@ async def lifespan(app: FastAPI):
         logger.info("Loading NLP models...")
         from utils import nlp_processor
         
-        # Test database connection
+        # Test database connection with retries
         logger.info("Testing database connection...")
         from document_api import driver
-        with driver.session() as session:
-            session.run("RETURN 1")
+        import time
+        max_retries = 30
+        retry_delay = 2
+        
+        for attempt in range(max_retries):
+            try:
+                with driver.session() as session:
+                    session.run("RETURN 1")
+                logger.info("Database connection successful")
+                break
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    logger.warning(f"Database connection attempt {attempt + 1}/{max_retries} failed: {e}. Retrying in {retry_delay}s...")
+                    time.sleep(retry_delay)
+                else:
+                    logger.error(f"Failed to connect to database after {max_retries} attempts: {e}")
+                    raise
         
         logger.info("Graph RAG API started successfully")
         yield
@@ -188,16 +203,16 @@ async def health_check():
         with driver.session() as session:
             session.run("RETURN 1")
         
-        # Check NLP models
+        # Check NLP processor (LLM-based, not spaCy)
         from utils import nlp_processor
-        nlp_status = "loaded" if nlp_processor.nlp else "not_loaded"
+        nlp_status = "loaded" if nlp_processor else "not_loaded"
         
         return {
             "status": "healthy",
             "version": APP_VERSION,
             "components": {
                 "database": "healthy",
-                "nlp_models": nlp_status,
+                "nlp_processor": nlp_status,
                 "embedding_service": "available"
             }
         }

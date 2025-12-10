@@ -6,9 +6,11 @@ Graph RAG (Graph Retrieval-Augmented Generation) is a production-ready FastAPI a
 
 ### Core Features
 
-- **LLM-based NLP Processing** - Uses gemma3:1b model for efficient entity extraction and coreference resolution
+- **LLM-based NLP Processing** - Uses configurable LLM models (e.g., Gemini, OpenAI-compatible) for efficient entity extraction and coreference resolution
+- **Intelligent Question Classification** - MCP-based routing that classifies questions as BROAD, CHUNK, or OUT_OF_SCOPE for optimal search strategy
+- **Map-Reduce for Broad Questions** - Processes community summaries using map-reduce pattern for comprehensive overview answers
 - **Batch Embedding Optimization** - 10x speed improvement through intelligent batching and caching
-- **Unified Search Pipeline** - Single, flexible endpoint with relevance-based chunk retrieval
+- **Unified Search Pipeline** - Single, flexible endpoint with intelligent routing based on question type
 - **Vector Similarity Search** - Native Neo4j vector indexes for fast semantic search
 - **Graph-Based Context Expansion** - Entity relationship traversal for comprehensive answers
 - **Community Detection** - Leiden algorithm for automatic topic clustering and summarization
@@ -19,13 +21,13 @@ Graph RAG (Graph Retrieval-Augmented Generation) is a production-ready FastAPI a
 ## Table of Contents
 
 - [Overview](#overview)
-- [Architecture & Core Logic](#architecture--core-logic)
+- [Architecture &amp; Core Logic](#architecture--core-logic)
 - [Document Processing Pipeline](#document-processing-pipeline)
 - [Search Pipeline](#search-pipeline)
 - [Quick Start](#quick-start)
 - [Configuration](#configuration)
 - [API Endpoints](#api-endpoints)
-- [Achievements & Current Status](#achievements--current-status)
+- [Achievements &amp; Current Status](#achievements--current-status)
 - [Future Enhancements](#future-enhancements)
 - [Testing](#testing)
 - [Performance Optimizations](#performance-optimizations)
@@ -71,29 +73,45 @@ Graph RAG (Graph Retrieval-Augmented Generation) is a production-ready FastAPI a
 ### Core Components
 
 1. **Main Application** (`main.py`)
+
    - FastAPI application with lifespan management
    - Request logging and error handling middleware
    - Health checks and monitoring endpoints
-
 2. **Document Processing** (`document_api.py`)
-   - Multi-format file processing (PDF, DOCX, TXT)
-   - LLM-based entity extraction using gemma3:1b
-   - Batch embedding generation
-   - Graph construction with entity relationships
-   - Community detection and summarization
 
+   - Multi-format file processing (PDF, DOCX, TXT)
+   - LLM-based entity extraction (configurable model, e.g., Gemini, OpenAI-compatible)
+   - LLM-based coreference resolution
+   - Batch embedding generation with caching
+   - Graph construction with cross-document entity merging
+   - Community detection (Leiden algorithm) and summarization
 3. **Unified Search** (`unified_search.py`)
+
+   - Intelligent question classification and routing
+   - Map-reduce processing for broad questions
    - Vector similarity search with native Neo4j indexes
    - Graph-aware context expansion
    - Graph-aware reranking with entity overlap
    - MMR diversity reranking
    - Community summary integration
+4. **Question Classification** (`question_classifier.py`)
 
-4. **Utilities** (`utils.py`)
+   - MCP-based classification (optional)
+   - Heuristic-based classification (fast fallback)
+   - LLM-based classification (accurate)
+   - Routes questions to appropriate search strategies
+5. **Map-Reduce Processing** (`map_reduce.py`)
+
+   - Map step: Extract relevant info from community summaries
+   - Reduce step: Synthesize partial answers into comprehensive response
+   - Optimized for broad/overview questions
+6. **Utilities** (`utils.py`)
+
    - LLM-based NLP processing (NER, coreference resolution)
    - Batch embedding client with caching (TTL-based)
    - Advanced text cleaning and chunking
    - Async wrappers for database operations
+   - Support for both OpenAI-compatible and Gemini APIs
 
 ---
 
@@ -109,30 +127,30 @@ graph TD
     B -->|PDF| C[Extract Text with PyPDF]
     B -->|DOCX| D[Extract Text with python-docx]
     B -->|TXT| E[Read Text Directly]
-    
+  
     C --> F[Clean Text]
     D --> F
     E --> F
-    
+  
     F --> G[Remove Boilerplate/Navigation]
     G --> H[Coreference Resolution LLM]
     H --> I[Chunk Text with Overlap]
-    
+  
     I --> J[Batch Generate Embeddings]
     J --> K[Extract Entities LLM]
-    
+  
     K --> L[Create Chunk Nodes]
     K --> M[Create Entity Nodes]
     K --> N[Create MENTIONED_IN Relationships]
-    
+  
     L --> O[Create RELATES_TO Relationships]
     M --> O
     N --> O
-    
+  
     O --> P[Community Detection Leiden]
     P --> Q[Generate Community Summaries]
     Q --> R[Store in Neo4j]
-    
+  
     style A fill:#e1f5ff
     style R fill:#c8e6c9
     style J fill:#fff9c4
@@ -143,22 +161,27 @@ graph TD
 ### Key Processing Steps
 
 #### 1. Text Extraction & Cleaning
+
 - **PDF Processing**: Uses PyPDF for text extraction from PDF files
 - **DOCX Processing**: Uses python-docx for Word document parsing
 - **Text Cleaning**: Removes boilerplate, navigation text, headers/footers, URLs
 - **Coreference Resolution**: LLM-based resolution using gemma3:1b model
 
 #### 2. Text Chunking
+
 - **Sentence-aware chunking**: Uses BlingFire for sentence boundary detection
 - **Overlap management**: Configurable overlap (default 50 chars) to maintain context
 - **Size optimization**: Configurable chunk size (default 512 tokens)
 
 #### 3. Entity Extraction
-- **LLM-based NER**: Uses gemma3:1b model via OpenAI-compatible API
+
+- **LLM-based NER**: Uses configurable LLM model (default: Gemini, configurable via NER_MODEL, NER_BASE_URL)
 - **Entity Types**: Supports 18+ entity types (PERSON, ORGANIZATION, LOCATION, etc.)
+- **Cross-Document Merging**: Entities with same name are merged across documents
 - **Batch Processing**: Processes multiple chunks efficiently
 
 #### 4. Graph Construction
+
 ```mermaid
 graph LR
     A[Document] --> B[Chunks]
@@ -167,7 +190,7 @@ graph LR
     C --> E[RELATES_TO]
     E --> F[Communities]
     F --> G[CommunitySummaries]
-    
+  
     style B fill:#e3f2fd
     style C fill:#f3e5f5
     style F fill:#fff9c4
@@ -175,6 +198,7 @@ graph LR
 ```
 
 **Graph Schema:**
+
 - **Chunk Nodes**: Store text, embeddings, document metadata
 - **Entity Nodes**: Store entity names, types, embeddings
 - **MENTIONED_IN**: Relationships between entities and chunks
@@ -182,6 +206,7 @@ graph LR
 - **CommunitySummary Nodes**: Store community summaries with embeddings
 
 #### 5. Community Detection
+
 - **Leiden Algorithm**: Uses Neo4j GDS for community detection
 - **Fallback Method**: Simple co-occurrence clustering if Leiden fails
 - **Automatic Summarization**: LLM-generated summaries for each community
@@ -190,54 +215,87 @@ graph LR
 
 ## Search Pipeline
 
-The unified search pipeline provides intelligent, context-aware answers by combining vector search, graph traversal, and advanced reranking.
+The unified search pipeline provides intelligent, context-aware answers by combining question classification, intelligent routing, vector search, graph traversal, and advanced reranking.
 
 ### Search Flow
 
 ```mermaid
 graph TD
-    A[User Query] --> B[Query Preprocessing]
-    B --> C{Has Conversation History?}
-    C -->|Yes| D[Rewrite Query with Context]
-    C -->|No| E[Use Query as-is]
-    D --> F[Generate Query Embedding]
-    E --> F
-    
-    F --> G{Search Scope?}
-    G -->|Global| H[Vector Search All Documents]
-    G -->|Local| I[Vector Search Specific Doc]
-    G -->|Hybrid| J[Combine Global + Local]
-    
-    H --> K[Retrieve Top-K Chunks]
-    I --> K
-    J --> K
-    
-    K --> L{Graph Expansion?}
-    L -->|Yes| M[Expand via Entity Relationships]
-    L -->|No| N[Skip Expansion]
-    M --> O[Graph-Aware Reranking]
+    A[User Query] --> B[Question Classification]
+    B --> C{Question Type?}
+    C -->|BROAD| D[Map-Reduce with Communities]
+    C -->|CHUNK| E[Chunk-Level Vector Search]
+    C -->|OUT_OF_SCOPE| F[Return Polite Fallback]
+  
+    D --> D1[Retrieve Community Summaries]
+    D1 --> D2[Map: Extract from Each Summary]
+    D2 --> D3[Reduce: Synthesize Final Answer]
+    D3 --> X
+  
+    E --> G{Has Conversation History?}
+    G -->|Yes| H[Rewrite Query with Context]
+    G -->|No| I[Use Query as-is]
+    H --> J[Generate Query Embedding]
+    I --> J
+  
+    J --> K{Search Scope?}
+    K -->|Global| L[Vector Search All Documents]
+    K -->|Local| M[Vector Search Specific Doc]
+    K -->|Hybrid| N[Combine Global + Local]
+  
+    L --> O[Retrieve Top-K Chunks]
+    M --> O
     N --> O
-    
-    O --> P[Entity Overlap Scoring]
-    P --> Q[Community Relevance Scoring]
-    Q --> R[Centrality Scoring]
-    R --> S[MMR Diversity Reranking]
-    
-    S --> T[Retrieve Community Summaries]
-    T --> U[Build Context String]
-    U --> V[Generate Answer with LLM]
-    V --> W[Calculate Confidence Score]
-    W --> X[Return Response]
-    
+  
+    O --> P{Graph Expansion?}
+    P -->|Yes| Q[Expand via Entity Relationships]
+    P -->|No| R[Skip Expansion]
+    Q --> S[Graph-Aware Reranking]
+    R --> S
+  
+    S --> T[Entity Overlap Scoring]
+    T --> U[Community Relevance Scoring]
+    U --> V[Centrality Scoring]
+    V --> W[MMR Diversity Reranking]
+  
+    W --> Y[Build Context String]
+    Y --> Z[Generate Answer with LLM]
+    Z --> AA[Calculate Confidence Score]
+    AA --> X[Return Response]
+  
     style A fill:#e1f5ff
-    style V fill:#fff9c4
+    style B fill:#fff9c4
+    style D fill:#f3e5f5
+    style Z fill:#fff9c4
     style X fill:#c8e6c9
-    style S fill:#f3e5f5
+    style W fill:#f3e5f5
 ```
 
 ### Search Components
 
-#### 1. Query Preprocessing
+#### 1. Question Classification
+
+The system uses intelligent question classification to route queries to the optimal search strategy:
+
+- **MCP-based Classification** (if enabled): Uses Model Context Protocol server for consistent, accurate classification
+- **Heuristic Classification**: Fast keyword-based fallback
+- **LLM Classification**: Direct LLM-based classification for accuracy
+
+**Question Types:**
+
+- **BROAD**: Questions requiring overview/understanding → Uses map-reduce with community summaries
+- **CHUNK**: Questions requiring specific details → Uses chunk-level vector similarity search
+- **OUT_OF_SCOPE**: Questions not answerable from knowledge base → Returns polite fallback
+
+#### 2. Map-Reduce for Broad Questions
+
+For BROAD questions, the system uses a map-reduce pattern:
+
+- **Map Step**: Extract relevant information from each community summary
+- **Reduce Step**: Synthesize partial answers into a comprehensive final answer
+
+#### 3. Query Preprocessing
+
 ```python
 # Query rewriting with conversation history
 if conversation_history:
@@ -246,12 +304,14 @@ else:
     rewritten_query = query
 ```
 
-#### 2. Vector Similarity Search
+#### 4. Vector Similarity Search
+
 - **Native Neo4j Vector Index**: Uses `db.index.vector.queryNodes()` for fast search
 - **Fallback to GDS**: Uses `gds.similarity.cosine()` if vector indexes unavailable
 - **Threshold Filtering**: Configurable similarity threshold (default 0.4)
 
-#### 3. Graph-Based Context Expansion
+#### 5. Graph-Based Context Expansion
+
 ```mermaid
 graph LR
     A[Initial Chunks] --> B[Extract Entities]
@@ -259,24 +319,27 @@ graph LR
     C --> D[Traverse RELATES_TO]
     D --> E[Find Related Chunks]
     E --> F[Add to Context]
-    
+  
     style A fill:#e3f2fd
     style F fill:#c8e6c9
 ```
 
-#### 4. Advanced Reranking
+#### 6. Advanced Reranking
 
 **Graph-Aware Reranking:**
+
 - **Entity Overlap Score**: Measures overlap between query entities and chunk entities
 - **Community Relevance**: Similarity to relevant community summaries
 - **Centrality Score**: Graph centrality of chunks (degree centrality)
 
 **MMR Reranking:**
+
 - **Maximal Marginal Relevance**: Balances relevance and diversity
 - **Formula**: `MMR(doc) = λ × relevance(doc, query) - (1-λ) × max_sim(doc, selected)`
 - **Lambda Parameter**: Default 0.7 (favors relevance over diversity)
 
-#### 5. Answer Generation
+#### 7. Answer Generation
+
 - **Context Building**: Combines community summaries and relevant chunks
 - **LLM Prompting**: Structured prompts with context and conversation history
 - **Confidence Scoring**: Based on chunk similarity, summary availability, and quality
@@ -287,13 +350,52 @@ graph LR
 
 ### Prerequisites
 
-- **Python 3.8+**
-- **Neo4j 5.0+** with GDS and APOC plugins
-- **Docker** (recommended for Neo4j)
-- **LLM Service**: Ollama or compatible OpenAI API (for NER and LLM)
-- **Embedding Service**: Ollama embeddings or compatible API
+#### For Docker Compose Setup:
+- **Docker** and **Docker Compose**
+- **LLM Service**: Gemini API, OpenAI API, or compatible API (for NER and LLM)
+- **Embedding Service**: Gemini, OpenAI, or compatible embedding API
+
+#### For Local Development:
+- **Python 3.11+**
+- **Neo4j 5.0+** with GDS and APOC plugins (or use Docker for Neo4j)
+- **LLM Service**: Gemini API, OpenAI API, or compatible API (for NER and LLM)
+- **Embedding Service**: Gemini, OpenAI, or compatible embedding API
 
 ### Installation
+
+#### Option 1: Docker Compose (Recommended)
+
+The easiest way to run Graph RAG is using Docker Compose, which sets up all services (Neo4j, MCP Classifier, and Graph RAG API) automatically:
+
+```bash
+# 1. Clone the repository
+git clone <repository-url>
+cd graph-rag
+
+# 2. Configure environment variables
+cp .env.example .env
+# Edit .env with your settings (API keys, model configurations, etc.)
+
+# 3. Start all services
+docker-compose up -d
+
+# 4. Check service status
+docker-compose ps
+
+# 5. View logs (optional)
+docker-compose logs -f graph-rag
+```
+
+The API will be available at `http://localhost:8000` with interactive documentation at `/docs`.
+
+**Services:**
+- **Graph RAG API**: http://localhost:8000
+- **MCP Classifier Server**: http://localhost:8001
+- **Neo4j Browser**: http://localhost:7474
+
+#### Option 2: Local Development
+
+For local development without Docker:
 
 ```bash
 # 1. Clone the repository
@@ -307,18 +409,21 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 # 3. Install dependencies
 pip install -r requirements.txt
 
-# 4. Start Neo4j with Docker
+# 4. Start Neo4j with Docker (if not running locally)
 docker-compose up -d neo4j
 
-# 5. Configure environment variables
+# 5. Optionally start MCP classifier server
+docker-compose up -d mcp-classifier
+
+# 6. Configure environment variables
 cp .env.example .env
 # Edit .env with your settings
 
-# 6. Run the application
+# 7. Run the application
 python main.py
 ```
 
-The API will be available at `http://localhost:8000` with interactive documentation at `/docs`.
+**Note**: For local development, update `DB_URL` in `.env` to `bolt://localhost:7687` instead of `bolt://neo4j:7687`.
 
 ---
 
@@ -327,6 +432,7 @@ The API will be available at `http://localhost:8000` with interactive documentat
 ### Environment Variables
 
 #### Application Settings
+
 ```bash
 APP_TITLE="Graph RAG API"
 APP_DESCRIPTION="Production-ready Graph RAG API"
@@ -338,50 +444,101 @@ LOG_LEVEL="INFO"
 ```
 
 #### Database Configuration
+
+**For Docker Compose setup:**
 ```bash
-DB_URL="bolt://localhost:7687"
+DB_URL="bolt://neo4j:7687"  # Use service name 'neo4j' when running in Docker
 DB_USERNAME="neo4j"
 DB_PASSWORD="neo4j123"
-GRAPH_NAME="document_graph"
+GRAPH_NAME="entityGraph"
 ```
 
+**For local development (Neo4j running locally or via Docker):**
+```bash
+DB_URL="bolt://localhost:7687"  # Use 'localhost' when running locally
+DB_USERNAME="neo4j"
+DB_PASSWORD="neo4j123"
+GRAPH_NAME="entityGraph"
+```
+
+**Note**: When using Docker Compose, the `DB_URL` in `.env` is automatically overridden to use the service name. For local development, ensure Neo4j is accessible at `localhost:7687`.
+
 #### LLM Configuration
+
 ```bash
 # Main LLM for answer generation
-LLM_PROVIDER="openai"  # or "gemini"
+LLM_PROVIDER="google"  # or "openai"
 OPENAI_API_KEY="your-api-key"
-OPENAI_MODEL="llama3.2"  # or your model
-OPENAI_BASE_URL="http://localhost:11434/v1"
+OPENAI_MODEL="gemini-2.5-flash"  # or "llama3.2", etc.
+OPENAI_BASE_URL="https://generativelanguage.googleapis.com/v1beta"  # or "http://localhost:11434/v1" for Ollama
 OPENAI_TEMPERATURE="0.0"
 
 # NER Model
-NER_MODEL="gemma3:1b"
-NER_BASE_URL="http://localhost:11434/v1"
+NER_MODEL="gemini-2.5-flash"  # or your preferred model
+NER_BASE_URL="https://generativelanguage.googleapis.com/v1beta"  # or OpenAI-compatible URL
+NER_API_KEY="your-api-key"
 NER_TEMPERATURE="0.0"
 
 # Coreference Resolution Model
-COREF_MODEL="gemma3:1b"
-COREF_BASE_URL="http://localhost:11434/v1"
+COREF_MODEL="gemini-2.5-flash"  # or your preferred model
+COREF_BASE_URL="https://generativelanguage.googleapis.com/v1beta"  # or OpenAI-compatible URL
+COREF_API_KEY="your-api-key"
 COREF_TEMPERATURE="0.0"
 ```
 
 #### Embedding Configuration
+
 ```bash
-EMBEDDING_API_URL="http://localhost:11434/v1/embeddings"
-EMBEDDING_MODEL_NAME="mxbai-embed-large"
+# Embedding API URL (format depends on provider)
+# Gemini: Base URL without /embeddings (e.g., https://generativelanguage.googleapis.com/v1beta)
+# OpenAI/Ollama: Include /embeddings (e.g., http://localhost:11434/v1/embeddings)
+EMBEDDING_API_URL="https://generativelanguage.googleapis.com/v1beta"
+EMBEDDING_MODEL_NAME="gemini-embedding-001"  # or "mxbai-embed-large", "text-embedding-ada-002", etc.
 EMBEDDING_API_KEY="your-api-key"
+EMBEDDING_DIMENSION="768"  # Must match your embedding model dimension
 EMBEDDING_BATCH_SIZE="10"
 ```
 
+#### Question Classifier Configuration
+
+```bash
+# Enable heuristic-based classification (keyword matching)
+CLASSIFIER_USE_HEURISTICS="true"
+
+# Enable LLM-based classification (more accurate)
+CLASSIFIER_USE_LLM="true"
+
+# Use MCP (Model Context Protocol) classifier server
+USE_MCP_CLASSIFIER="true"
+
+# MCP Classifier Server URL
+MCP_CLASSIFIER_URL="http://localhost:8001/mcp"
+MCP_CLASSIFIER_PORT="8001"
+MCP_CLASSIFIER_TIMEOUT="30"
+```
+
+#### Map-Reduce Configuration
+
+```bash
+# Maximum communities to process in map-reduce
+MAP_REDUCE_MAX_COMMUNITIES="50"
+MAP_REDUCE_BATCH_SIZE="5"
+MAP_REDUCE_MIN_RELEVANCE="0.3"
+```
+
 #### Performance Tuning
+
 ```bash
 # Text Processing
 CHUNK_SIZE_GDS="512"
+CHUNK_OVERLAP="50"
 DOCUMENT_PROCESSING_BATCH_SIZE="20"
 
 # Search Parameters
-RELEVANCE_THRESHOLD="0.5"
+RELEVANCE_THRESHOLD="0.40"
 MAX_CHUNKS_PER_ANSWER="7"
+QUICK_SEARCH_MAX_CHUNKS="5"
+MAX_COMMUNITY_SUMMARIES="3"
 SIMILARITY_THRESHOLD_CHUNKS="0.4"
 SIMILARITY_THRESHOLD_ENTITIES="0.6"
 
@@ -398,6 +555,7 @@ MAX_WORKERS="4"
 ### Document Management
 
 #### Upload Documents
+
 ```http
 POST /api/documents/upload_documents
 Content-Type: multipart/form-data
@@ -406,6 +564,7 @@ files: [file1.pdf, file2.docx, ...]
 ```
 
 **Response:**
+
 ```json
 {
   "message": "Successfully processed 2 documents",
@@ -422,11 +581,13 @@ files: [file1.pdf, file2.docx, ...]
 ```
 
 #### List Documents
+
 ```http
 GET /api/documents/documents
 ```
 
 #### Delete Document
+
 ```http
 DELETE /api/documents/delete_document
 Content-Type: application/json
@@ -437,11 +598,13 @@ Content-Type: application/json
 ```
 
 #### Get Community Summaries
+
 ```http
 GET /api/documents/community_summaries?doc_id=uuid-here
 ```
 
 #### Document Statistics
+
 ```http
 GET /api/documents/document_stats
 ```
@@ -449,6 +612,7 @@ GET /api/documents/document_stats
 ### Search Endpoints
 
 #### Unified Search
+
 ```http
 POST /api/search/search
 Content-Type: application/json
@@ -462,7 +626,14 @@ Content-Type: application/json
 }
 ```
 
+**Note**: This endpoint automatically classifies questions using MCP (if enabled) or heuristic/LLM-based classification, then routes to:
+
+- **BROAD questions**: Map-reduce processing with community summaries
+- **CHUNK questions**: Chunk-level vector similarity search
+- **OUT_OF_SCOPE questions**: Polite fallback response
+
 **Response:**
+
 ```json
 {
   "answer": "Detailed answer based on context...",
@@ -479,6 +650,7 @@ Content-Type: application/json
 ```
 
 #### Quick Search
+
 ```http
 POST /api/search/quick_search
 Content-Type: application/json
@@ -490,16 +662,19 @@ Content-Type: application/json
 ```
 
 #### Search Suggestions
+
 ```http
 GET /api/search/search_suggestions?doc_id=optional-doc-id
 ```
 
 #### Search Analytics
+
 ```http
 GET /api/search/search_analytics
 ```
 
 #### Explain Search
+
 ```http
 POST /api/search/explain_search
 Content-Type: application/json
@@ -513,16 +688,19 @@ Content-Type: application/json
 ### System Endpoints
 
 #### Health Check
+
 ```http
 GET /health
 ```
 
 #### API Information
+
 ```http
 GET /api/info
 ```
 
 #### Interactive Documentation
+
 ```http
 GET /docs  # Swagger UI
 GET /redoc  # ReDoc
@@ -535,9 +713,11 @@ GET /redoc  # ReDoc
 ### ✅ Completed Features
 
 #### Core Functionality
+
 - ✅ **Multi-format Document Processing** - PDF, DOCX, TXT support
-- ✅ **LLM-based Entity Extraction** - Using gemma3:1b model
+- ✅ **LLM-based Entity Extraction** - Using configurable models (Gemini, OpenAI-compatible)
 - ✅ **Coreference Resolution** - LLM-based pronoun resolution
+- ✅ **Cross-Document Entity Merging** - Entities with same name merged across documents
 - ✅ **Advanced Text Cleaning** - Boilerplate and navigation text removal
 - ✅ **Intelligent Chunking** - Sentence-aware with overlap
 - ✅ **Batch Embedding Generation** - With TTL-based caching
@@ -545,7 +725,10 @@ GET /redoc  # ReDoc
 - ✅ **Vector Indexing** - Native Neo4j vector indexes for fast search
 
 #### Search Capabilities
-- ✅ **Unified Search Pipeline** - Single endpoint with multiple scopes
+
+- ✅ **Intelligent Question Classification** - MCP-based or heuristic/LLM routing
+- ✅ **Map-Reduce for Broad Questions** - Comprehensive processing of community summaries
+- ✅ **Unified Search Pipeline** - Single endpoint with intelligent routing
 - ✅ **Vector Similarity Search** - Native Neo4j and GDS fallback
 - ✅ **Graph-Based Expansion** - Entity relationship traversal
 - ✅ **Graph-Aware Reranking** - Entity overlap, community, centrality scoring
@@ -554,11 +737,13 @@ GET /redoc  # ReDoc
 - ✅ **Conversation History Support** - Context-aware query rewriting
 
 #### Community Detection
+
 - ✅ **Leiden Algorithm** - Neo4j GDS community detection
 - ✅ **Fallback Clustering** - Simple co-occurrence method
 - ✅ **Automatic Summarization** - LLM-generated community summaries
 
 #### Production Features
+
 - ✅ **Comprehensive Error Handling** - Graceful degradation
 - ✅ **Async Processing** - Non-blocking operations throughout
 - ✅ **Request Logging** - Detailed logging for monitoring
@@ -567,6 +752,7 @@ GET /redoc  # ReDoc
 - ✅ **Modular Architecture** - Clean separation of concerns
 
 #### Performance Optimizations
+
 - ✅ **Batch Processing** - Embeddings, entities, queries
 - ✅ **Intelligent Caching** - TTL-based embedding cache
 - ✅ **Vector Indexes** - Fast similarity search
@@ -579,42 +765,30 @@ GET /redoc  # ReDoc
 - 🔄 **Multi-language Support** - Framework ready, needs language-specific models
 - 🔄 **Advanced Analytics** - Basic analytics exist, needs expansion
 
-### ❌ Not Yet Implemented
-
-- ❌ **User Authentication/Authorization** - Security layer needed
-- ❌ **Rate Limiting** - API protection needed
-- ❌ **Distributed Caching** - Redis integration for multi-instance deployments
-- ❌ **Vector Database Integration** - Faiss/Pinecone/Weaviate for larger scale
-- ❌ **Database Sharding** - For very large knowledge bases
-- ❌ **Custom Domain Models** - Domain-specific NER and embedding models
-- ❌ **Real-time Updates** - WebSocket support for live updates
-- ❌ **Export/Import** - Graph backup and restore functionality
-
----
-
 ## Future Enhancements
 
 ### High Priority
 
 1. **Security & Authentication**
+
    - JWT-based authentication
    - Role-based access control (RBAC)
    - API key management
    - Rate limiting per user/API key
-
 2. **Scalability Improvements**
+
    - Redis for distributed caching
    - Vector database integration (Faiss/Pinecone)
    - Horizontal scaling support
    - Database sharding strategies
-
 3. **Enhanced Search**
+
    - Hybrid search (keyword + vector)
    - Query expansion techniques
    - Faceted search
    - Search result caching
-
 4. **Performance Monitoring**
+
    - APM integration (e.g., Prometheus)
    - Detailed performance metrics
    - Query performance analysis
@@ -623,18 +797,19 @@ GET /redoc  # ReDoc
 ### Medium Priority
 
 5. **Advanced Features**
+
    - Multi-language support expansion
    - Custom entity types and models
    - Graph visualization API
    - Document versioning
-
 6. **Developer Experience**
+
    - SDK/Client libraries
    - Comprehensive tutorials
    - Example applications
    - Migration tools
-
 7. **Data Management**
+
    - Graph backup/restore
    - Incremental updates
    - Document versioning
@@ -643,12 +818,13 @@ GET /redoc  # ReDoc
 ### Low Priority
 
 8. **UI/UX**
+
    - Web interface for document upload
    - Interactive graph visualization
    - Search interface demo
    - Admin dashboard
-
 9. **Integration**
+
    - Slack/Teams bots
    - REST API SDKs
    - Webhook support
@@ -690,22 +866,23 @@ pytest test_system.py::TestUnifiedSearchPipeline -v
 
 ### Implemented Optimizations
 
-| Optimization | Impact | Implementation |
-|-------------|--------|----------------|
-| **Batch Embedding** | 10x faster | Batch API calls with caching |
-| **Vector Indexes** | 100x faster search | Native Neo4j vector indexes |
-| **LLM-based NER** | Flexible | gemma3:1b model |
-| **Async Operations** | Non-blocking | Full async/await pipeline |
-| **Intelligent Caching** | Reduced API calls | TTL-based embedding cache |
-| **Graph-Aware Reranking** | Better relevance | Entity overlap + community scoring |
-| **MMR Reranking** | Better diversity | Maximal Marginal Relevance |
+| Optimization                    | Impact             | Implementation                           |
+| ------------------------------- | ------------------ | ---------------------------------------- |
+| **Batch Embedding**       | 10x faster         | Batch API calls with caching             |
+| **Vector Indexes**        | 100x faster search | Native Neo4j vector indexes              |
+| **LLM-based NER**         | Flexible           | Configurable (Gemini, OpenAI-compatible) |
+| **Async Operations**      | Non-blocking       | Full async/await pipeline                |
+| **Intelligent Caching**   | Reduced API calls  | TTL-based embedding cache                |
+| **Graph-Aware Reranking** | Better relevance   | Entity overlap + community scoring       |
+| **MMR Reranking**         | Better diversity   | Maximal Marginal Relevance               |
 
 ### Performance Metrics
 
 - **Document Processing**: ~0.5-2 seconds per document (depending on size)
-- **Entity Extraction**: ~0.1-0.5 seconds per chunk (LLM-based)
-- **Search Response Time**: 1-3 seconds average
+- **Entity Extraction**: ~0.1-0.5 seconds per chunk (LLM-based, model dependent)
+- **Search Response Time**: 1-3 seconds average (varies by question type and classification method)
 - **Embedding Generation**: Batch of 10 in ~0.5 seconds (cached)
+- **Question Classification**: < 0.5 seconds (MCP or heuristic), 1-2 seconds (direct LLM)
 
 ---
 
@@ -718,12 +895,19 @@ graph-rag/
 ├── main.py                 # FastAPI application entry point
 ├── document_api.py         # Document processing endpoints
 ├── search_api.py           # Search endpoints
-├── unified_search.py       # Core search pipeline logic
+├── unified_search.py       # Core search pipeline logic with classification routing
+├── question_classifier.py  # Question classification (MCP, heuristic, LLM)
+├── map_reduce.py           # Map-reduce processing for broad questions
+├── mcp_classifier_client.py # MCP classifier client
+├── mcp_classifier_server.py # MCP classifier server
 ├── utils.py                # NLP, embeddings, utilities
 ├── test_system.py          # Comprehensive test suite
 ├── requirements.txt        # Python dependencies
-├── docker-compose.yaml     # Neo4j deployment
-├── .env                    # Environment configuration
+├── docker-compose.yaml     # Docker Compose configuration for all services
+├── Dockerfile              # Main Graph RAG API Dockerfile
+├── Dockerfile.mcp          # MCP classifier server Dockerfile
+├── .env                    # Environment configuration (not in git)
+├── .env.example            # Environment configuration template
 └── README.md              # This file
 ```
 
@@ -731,11 +915,12 @@ graph-rag/
 
 - **FastAPI** - Modern async web framework
 - **Neo4j Driver** - Graph database connectivity
-- **HTTPX** - Async HTTP client
+- **HTTPX** - Async HTTP client for LLM and embedding APIs
 - **PyPDF** - PDF text extraction
 - **python-docx** - Word document parsing
 - **BlingFire** - Sentence boundary detection
 - **NumPy** - Numerical computations
+- **MCP (Model Context Protocol)** - For question classification (optional)
 
 ### Documentation
 
@@ -757,10 +942,68 @@ graph-rag/
 
 ### Development
 
-For development, set environment variables:
+#### Docker Development
+
+For development with Docker, you can mount the code as a volume for live reloading:
+
+```yaml
+# In docker-compose.yaml, add volumes to graph-rag service:
+volumes:
+  - ./logs:/app/logs
+  - .:/app  # Mount code for development
+  - /app/__pycache__  # Exclude cache
+```
+
+Then set environment variables in `.env`:
 ```bash
 RELOAD=true
 LOG_LEVEL=DEBUG
+```
+
+#### Local Development
+
+For local development without Docker:
+
+```bash
+# Set environment variables
+export RELOAD=true
+export LOG_LEVEL=DEBUG
+
+# Or create a .env file with:
+# RELOAD=true
+# LOG_LEVEL=DEBUG
+
+# Run the application
+python main.py
+```
+
+### Docker Commands
+
+Common Docker Compose commands:
+
+```bash
+# Start all services
+docker-compose up -d
+
+# Stop all services
+docker-compose down
+
+# View logs
+docker-compose logs -f graph-rag
+docker-compose logs -f neo4j
+docker-compose logs -f mcp-classifier
+
+# Rebuild and restart a service
+docker-compose up -d --build graph-rag
+
+# Check service status
+docker-compose ps
+
+# Execute commands in a container
+docker-compose exec graph-rag python -c "from utils import nlp_processor; print('OK')"
+
+# Stop and remove containers, networks, and volumes
+docker-compose down -v
 ```
 
 ---
@@ -773,7 +1016,7 @@ See LICENSE file for details.
 
 ## Version History
 
-- **v2.0.0** - Unified search pipeline, graph-aware reranking, MMR diversity
+- **v2.0.0** - Unified search pipeline with intelligent question classification, map-reduce for broad questions, MCP classifier integration, graph-aware reranking, MMR diversity, cross-document entity merging
 - **v1.0.0** - Initial release with basic document processing and search
 
 ---

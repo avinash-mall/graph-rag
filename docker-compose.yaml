@@ -21,6 +21,12 @@ services:
     memswap_limit: ${NEO4J_CONTAINER_MEMSWAP_LIMIT}
     networks:
       - graph-rag-network
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:7474"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
 
   mcp-classifier:
     build:
@@ -56,6 +62,41 @@ services:
       timeout: 10s
       retries: 3
       start_period: 10s
+
+  graph-rag:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: graph-rag-api
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    environment:
+      - APP_HOST=0.0.0.0
+      - APP_PORT=8000
+      - DB_URL=bolt://neo4j:7687
+      - DB_USERNAME=${DB_USERNAME:-neo4j}
+      - DB_PASSWORD=${DB_PASSWORD:-neo4j123}
+      - MCP_CLASSIFIER_URL=http://mcp-classifier:8001/mcp
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - PYTHONUNBUFFERED=1
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs
+    depends_on:
+      neo4j:
+        condition: service_started
+      mcp-classifier:
+        condition: service_started
+    restart: ${NEO4J_RESTART_POLICY:-always}
+    networks:
+      - graph-rag-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
 
 networks:
   graph-rag-network:
