@@ -3,6 +3,16 @@ Map-Reduce Module for Community Summaries
 
 Implements map-reduce pattern for processing large sets of community summaries
 to generate comprehensive answers for broad questions.
+
+Process:
+1. Map Step: Extract relevant information from each community summary using LLM
+2. Reduce Step: Combine partial answers into a comprehensive final answer using LLM
+
+This module uses:
+- config.py: Centralized configuration (map-reduce parameters, batch sizes)
+- logging_config.py: Standardized structured logging with context fields
+- resilience.py: Automatic retries and circuit breaking for LLM calls
+- utils.py: LLM client with resilience patterns
 """
 
 from typing import List, Dict, Any, Optional

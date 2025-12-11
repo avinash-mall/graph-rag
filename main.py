@@ -2,11 +2,20 @@
 Graph RAG API - Production Ready Implementation
 
 Features:
-- Efficient spaCy-based NLP processing (200-500x faster than LLM-based NER)
+- LLM-based NLP processing with configurable models
 - Batch embedding optimization (10x speed improvement)
 - Unified search pipeline with proper relevance-based chunk retrieval
 - Comprehensive async handling and error management
 - Vector similarity search with graph-based context expansion
+- Centralized configuration, resilience, and structured logging
+
+Architecture:
+- config.py: Single source of truth for all configuration settings
+- resilience.py: Circuit breakers and retries for all external service calls
+- logging_config.py: Standardized structured logging across all modules
+- Automatic handling of transient failures without user-facing errors
+
+This ensures production-ready reliability with consistent error handling and observability.
 """
 
 import sys

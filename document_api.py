@@ -2,13 +2,19 @@
 Document API for Graph RAG with efficient processing and batch optimization.
 
 Features:
-- LLM-based NER using gemma3:1b model via OpenAI-compatible API
-- LLM-based coreference resolution using gemma3:1b model
+- LLM-based NER using configurable models via OpenAI-compatible API
+- LLM-based coreference resolution using configurable models
 - Boilerplate and navigation text removal before chunking
 - Batch embedding processing (10x speed improvement)
 - Proper async handling throughout
-- Enhanced error handling and logging
+- Centralized configuration and structured logging
+- Resilience patterns for external service calls (retries + circuit breakers)
 - Community detection and summarization
+
+This module uses:
+- config.py: Centralized configuration (database, processing, embedding settings)
+- logging_config.py: Standardized structured logging with context fields
+- resilience.py: Automatic retries and circuit breaking for LLM and database calls
 """
 
 import asyncio
@@ -62,7 +68,14 @@ class DocumentProcessingResult(BaseModel):
 
 class GraphManager:
     """
-    Graph manager with efficient batch processing and better error handling
+    Graph manager with efficient batch processing and better error handling.
+    
+    All database operations use resilience patterns:
+    - Automatic retries with exponential backoff via resilience.py
+    - Circuit breaker protection to prevent cascading failures
+    - Structured logging with database operation context from logging_config.py
+    - Timeout protection for long-running queries
+    - Centralized configuration from config.py
     """
     
     def __init__(self, neo4j_driver):

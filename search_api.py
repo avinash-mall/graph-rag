@@ -5,8 +5,14 @@ Features:
 - Single unified search endpoint replacing multiple complex endpoints
 - Proper chunk retrieval based on relevance
 - Better context filtering and ranking
-- Comprehensive logging and metrics
+- Centralized configuration and structured logging
 - Vector similarity search with graph-based context expansion
+- Resilience patterns for external service calls
+
+This module uses:
+- config.py: Centralized configuration (search parameters, classifier settings)
+- logging_config.py: Standardized structured logging with context fields
+- resilience.py: Automatic retries and circuit breaking for search operations
 """
 
 import asyncio
@@ -79,6 +85,12 @@ def _normalize_doc_id(raw_doc_id: Optional[str]) -> Optional[str]:
 async def unified_search(request: SearchRequest):
     """
     Main search endpoint using MCP-based question classification and intelligent routing.
+    
+    This endpoint uses:
+    - Centralized configuration from config.py (search parameters, thresholds)
+    - Structured logging with request context from logging_config.py
+    - Resilience patterns for all external service calls (LLM, embeddings, Neo4j) via resilience.py
+    - Intelligent question classification to route to appropriate search strategy
     
     This endpoint provides intelligent, context-aware search results by:
     

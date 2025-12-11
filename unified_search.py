@@ -6,7 +6,17 @@ multi-endpoint approach with a single, flexible search function. It addresses th
 - Relevant chunk retrieval based on vector similarity
 - Proper context filtering and ranking
 - Efficient batch processing
-- Better error handling and logging
+- Centralized configuration and structured logging
+- Resilience patterns for external service calls (LLM, embeddings, Neo4j)
+- Question classification with intelligent routing (BROAD/CHUNK/OUT_OF_SCOPE)
+- Map-reduce processing for broad questions
+
+This module uses:
+- config.py: Centralized configuration (search parameters, thresholds)
+- logging_config.py: Standardized structured logging with context fields
+- resilience.py: Automatic retries and circuit breaking for external calls
+- question_classifier.py: Intelligent question classification
+- map_reduce.py: Map-reduce processing for broad questions
 """
 
 import asyncio

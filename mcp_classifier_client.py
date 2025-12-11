@@ -2,6 +2,16 @@
 MCP Client for Question Classification
 
 This client connects to the MCP classification server and calls the classify_question tool.
+
+Features:
+- Resilience patterns with circuit breakers and retries
+- Structured logging with context fields
+- Graceful fallback on connection errors
+
+This module uses:
+- config.py: Centralized configuration (MCP URL, timeout settings)
+- logging_config.py: Standardized structured logging with context fields
+- resilience.py: Automatic retries and circuit breaking for MCP calls
 """
 
 import asyncio

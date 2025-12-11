@@ -2,12 +2,20 @@
 Utilities for Graph RAG with LLM-based NLP preprocessing and optimized performance.
 
 Features:
-- LLM-based NER using gemma3:1b model via OpenAI-compatible API
-- LLM-based coreference resolution using gemma3:1b model
+- LLM-based NER using configurable models via OpenAI-compatible API
+- LLM-based coreference resolution using configurable models
 - Boilerplate and navigation text removal before chunking
 - Batch embedding processing with intelligent caching
 - Async optimization throughout
-- Comprehensive error handling and logging
+- Centralized configuration, resilience (retries + circuit breakers), and structured logging
+
+This module uses:
+- config.py: Centralized configuration management
+- resilience.py: Automatic retries and circuit breaking for external service calls
+- logging_config.py: Standardized structured logging with context fields
+
+All external API calls (LLM, embeddings, Neo4j) are wrapped with resilience utilities
+to handle transient failures gracefully.
 """
 
 import asyncio
@@ -84,7 +92,13 @@ class ChunkWithMetadata:
 class EfficientNLPProcessor:
     """
     LLM-based NLP processor using OpenAI-compatible API for NER and coreference resolution.
-    Uses gemma3:1b model for efficient processing.
+    
+    Uses centralized configuration and resilience patterns:
+    - Configuration loaded from config.py (NER and CorefConfig)
+    - All LLM API calls wrapped with circuit breakers and retries
+    - Structured logging with context fields for observability
+    
+    Supports both OpenAI-compatible and Gemini API formats.
     """
     
     def __init__(self):
@@ -476,7 +490,15 @@ class EfficientNLPProcessor:
 
 class AsyncLLMClient:
     """
-    Async LLM client with improved error handling and retry logic
+    Async LLM client with resilience patterns and centralized configuration.
+    
+    Features:
+    - Centralized configuration from config.py (LLMConfig)
+    - Circuit breaker for LLM service to prevent cascading failures
+    - Automatic retries with exponential backoff via resilience module
+    - Structured logging with context fields
+    - Rate limiting to prevent overwhelming the LLM API
+    - Supports OpenAI-compatible and Gemini APIs
     """
     
     def __init__(self):
@@ -631,8 +653,16 @@ class AsyncLLMClient:
 
 class BatchEmbeddingClient:
     """
-    Efficient batch embedding client with caching and optimization
-    Supports both Ollama/OpenAI and Gemini embedding APIs
+    Efficient batch embedding client with caching and optimization.
+    
+    Features:
+    - Centralized configuration from config.py (EmbeddingConfig)
+    - Circuit breaker for embedding service
+    - Automatic retries with exponential backoff via resilience module
+    - Structured logging with context fields
+    - TTL-based in-memory caching to reduce API calls
+    - Batch processing for efficiency (10x speed improvement)
+    - Supports both OpenAI/Ollama-compatible and Gemini embedding APIs
     """
     
     def __init__(self):
@@ -1037,7 +1067,15 @@ def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
 async def run_cypher_query_async(driver, query: str, parameters: Dict[str, Any] = None) -> List[Dict[str, Any]]:
     """
     Async wrapper for Neo4j queries with resilience: circuit breaker, retries, and timeout.
-    Runs in thread pool to avoid blocking the event loop.
+    
+    Features:
+    - Circuit breaker for Neo4j database to prevent cascading failures
+    - Automatic retries with exponential backoff via resilience module
+    - Structured logging with database operation context
+    - Runs in thread pool to avoid blocking the event loop
+    - Timeout protection to prevent hanging operations
+    
+    All Neo4j queries should use this function to ensure consistent error handling.
     """
     from logging_config import log_database_operation
     

@@ -5,6 +5,17 @@ Classifies questions into:
 - BROAD: Needs broad understanding/overview → use community summaries
 - CHUNK: Needs specific details → use chunk-level retrieval  
 - OUT_OF_SCOPE: Not covered by knowledge base
+
+Classification Methods (in order of preference):
+1. MCP-based classification (if enabled): Uses Model Context Protocol server
+2. Heuristic classification: Fast keyword-based fallback
+3. LLM-based classification: Direct LLM call for accuracy
+
+This module uses:
+- config.py: Centralized configuration (classifier settings, MCP config)
+- logging_config.py: Standardized structured logging with context fields
+- resilience.py: Automatic retries and circuit breaking for LLM calls
+- mcp_classifier_client.py: MCP client for external classification service
 """
 
 import json

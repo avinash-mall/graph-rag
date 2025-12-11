@@ -16,7 +16,9 @@ Graph RAG (Graph Retrieval-Augmented Generation) is a production-ready FastAPI a
 - **Community Detection** - Leiden algorithm for automatic topic clustering and summarization
 - **MMR Reranking** - Maximal Marginal Relevance for diverse, high-quality results
 - **Comprehensive Async Handling** - Non-blocking operations throughout the pipeline
-- **Production-Ready Architecture** - Proper logging, monitoring, and error management
+- **Production-Ready Architecture** - Centralized configuration, resilience patterns, and structured logging
+- **Resilience Patterns** - Circuit breakers and automatic retries for all external service calls
+- **Structured Logging** - Consistent, context-rich logging across all modules for better observability
 
 ## Table of Contents
 
@@ -75,9 +77,35 @@ Graph RAG (Graph Retrieval-Augmented Generation) is a production-ready FastAPI a
 1. **Main Application** (`main.py`)
 
    - FastAPI application with lifespan management
-   - Request logging and error handling middleware
+   - Structured request logging and error handling middleware
    - Health checks and monitoring endpoints
-2. **Document Processing** (`document_api.py`)
+   - Uses centralized configuration and logging
+
+2. **Configuration Management** (`config.py`)
+
+   - **Centralized configuration module** - Single source of truth for all settings
+   - Loads, validates, and documents all configuration from environment variables
+   - Type-safe dataclasses for each configuration section
+   - Reduces duplication and runtime surprises
+   - Provides configuration validation on startup
+
+3. **Resilience Patterns** (`resilience.py`)
+
+   - **Circuit breaker implementation** - Prevents cascading failures (CLOSED/OPEN/HALF_OPEN states)
+   - **Automatic retries with exponential backoff** - Handles transient failures gracefully
+   - **Timeout handling** - Prevents hanging operations
+   - **Per-service circuit breakers** - Separate breakers for LLM, embedding, NER, coref, Neo4j, MCP
+   - All external service calls automatically wrapped with resilience patterns
+
+4. **Structured Logging** (`logging_config.py`)
+
+   - **Standardized logging** - Consistent format across all modules
+   - **Structured context fields** - Request IDs, operation names, service context
+   - **JSON-formatted logs** - Optional for production (enabled via LOG_JSON)
+   - **Request tracking** - Context variables for request/operation correlation
+   - **Helper functions** - Common logging patterns (function calls, external services, DB operations)
+
+5. **Document Processing** (`document_api.py`)
 
    - Multi-format file processing (PDF, DOCX, TXT)
    - LLM-based entity extraction (configurable model, e.g., Gemini, OpenAI-compatible)
@@ -85,7 +113,9 @@ Graph RAG (Graph Retrieval-Augmented Generation) is a production-ready FastAPI a
    - Batch embedding generation with caching
    - Graph construction with cross-document entity merging
    - Community detection (Leiden algorithm) and summarization
-3. **Unified Search** (`unified_search.py`)
+   - All external calls use resilience patterns and structured logging
+
+6. **Unified Search** (`unified_search.py`)
 
    - Intelligent question classification and routing
    - Map-reduce processing for broad questions
@@ -94,24 +124,31 @@ Graph RAG (Graph Retrieval-Augmented Generation) is a production-ready FastAPI a
    - Graph-aware reranking with entity overlap
    - MMR diversity reranking
    - Community summary integration
-4. **Question Classification** (`question_classifier.py`)
+   - Resilient external service calls with structured logging
+
+7. **Question Classification** (`question_classifier.py`)
 
    - MCP-based classification (optional)
    - Heuristic-based classification (fast fallback)
    - LLM-based classification (accurate)
    - Routes questions to appropriate search strategies
-5. **Map-Reduce Processing** (`map_reduce.py`)
+   - Uses centralized config, resilience, and structured logging
+
+8. **Map-Reduce Processing** (`map_reduce.py`)
 
    - Map step: Extract relevant info from community summaries
    - Reduce step: Synthesize partial answers into comprehensive response
    - Optimized for broad/overview questions
-6. **Utilities** (`utils.py`)
+   - Uses resilience patterns for LLM calls
+
+9. **Utilities** (`utils.py`)
 
    - LLM-based NLP processing (NER, coreference resolution)
    - Batch embedding client with caching (TTL-based)
    - Advanced text cleaning and chunking
-   - Async wrappers for database operations
+   - Async wrappers for database operations with resilience
    - Support for both OpenAI-compatible and Gemini APIs
+   - All external calls protected with circuit breakers and retries
 
 ---
 
@@ -429,6 +466,16 @@ python main.py
 
 ## Configuration
 
+### Centralized Configuration
+
+All configuration is managed through the `config.py` module, which:
+- Loads settings from environment variables with sensible defaults
+- Validates configuration on startup
+- Provides type-safe access to all settings
+- Documents expected settings and their purposes
+
+This eliminates configuration duplication and ensures consistent settings across all modules.
+
 ### Environment Variables
 
 #### Application Settings
@@ -441,6 +488,7 @@ APP_HOST="0.0.0.0"
 APP_PORT="8000"
 ENABLE_CORS="true"
 LOG_LEVEL="INFO"
+LOG_JSON="false"  # Set to "true" for JSON-formatted logs in production
 ```
 
 #### Database Configuration
@@ -526,6 +574,29 @@ MAP_REDUCE_BATCH_SIZE="5"
 MAP_REDUCE_MIN_RELEVANCE="0.3"
 ```
 
+#### Resilience Configuration
+
+```bash
+# Retry Configuration
+RESILIENCE_MAX_RETRIES="3"  # Maximum number of retry attempts
+RESILIENCE_BACKOFF_FACTOR="2.0"  # Exponential backoff multiplier
+RESILIENCE_INITIAL_DELAY="1.0"  # Initial delay in seconds before first retry
+
+# Circuit Breaker Configuration
+RESILIENCE_CB_FAILURE_THRESHOLD="5"  # Failures before circuit opens
+RESILIENCE_CB_SUCCESS_THRESHOLD="2"  # Successes needed to close circuit
+RESILIENCE_CB_TIMEOUT="60.0"  # Seconds before circuit transitions from OPEN to HALF_OPEN
+
+# Request Timeout
+RESILIENCE_REQUEST_TIMEOUT="30.0"  # Timeout in seconds for individual requests
+```
+
+**Resilience Patterns:**
+- All external service calls (LLM, embeddings, Neo4j) automatically use circuit breakers and retries
+- Circuit breakers prevent cascading failures by stopping requests to failing services
+- Automatic retries handle transient failures with exponential backoff
+- Separate circuit breakers per service (llm, embedding, ner, coref, neo4j, mcp_classifier)
+
 #### Performance Tuning
 
 ```bash
@@ -541,12 +612,30 @@ QUICK_SEARCH_MAX_CHUNKS="5"
 MAX_COMMUNITY_SUMMARIES="3"
 SIMILARITY_THRESHOLD_CHUNKS="0.4"
 SIMILARITY_THRESHOLD_ENTITIES="0.6"
+BROAD_SEARCH_MAX_COMMUNITIES="20"
 
 # Caching
 CACHE_TTL="3600"  # 1 hour
 BATCH_SIZE="10"
 MAX_WORKERS="4"
 ```
+
+#### Logging Configuration
+
+```bash
+# Log Level
+LOG_LEVEL="INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+
+# Structured Logging
+LOG_JSON="false"  # Set to "true" for JSON-formatted logs (recommended for production)
+LOG_TO_FILE="false"  # Set to "true" to write logs to file
+```
+
+**Structured Logging Features:**
+- Consistent log format across all modules
+- Context fields automatically included (request_id, operation, service, etc.)
+- JSON formatting available for production log aggregation
+- Request tracking for correlation across services
 
 ---
 
@@ -744,9 +833,12 @@ GET /redoc  # ReDoc
 
 #### Production Features
 
-- ✅ **Comprehensive Error Handling** - Graceful degradation
+- ✅ **Centralized Configuration** - Single source of truth (`config.py`) with validation
+- ✅ **Resilience Patterns** - Circuit breakers and automatic retries for all external services
+- ✅ **Structured Logging** - Consistent, context-rich logging across all modules (`logging_config.py`)
+- ✅ **Comprehensive Error Handling** - Graceful degradation with proper error context
 - ✅ **Async Processing** - Non-blocking operations throughout
-- ✅ **Request Logging** - Detailed logging for monitoring
+- ✅ **Request Logging** - Detailed structured logging for monitoring and debugging
 - ✅ **Health Checks** - System and component status
 - ✅ **Type Safety** - Full type hints throughout
 - ✅ **Modular Architecture** - Clean separation of concerns
@@ -859,6 +951,9 @@ pytest test_system.py::TestUnifiedSearchPipeline -v
 - ✅ **Database Operations** - Neo4j connectivity, queries
 - ✅ **Error Handling** - Edge cases, invalid inputs
 - ✅ **Performance** - Batch vs individual processing
+- ✅ **Question Classification** - Accuracy testing for BROAD/CHUNK/OUT_OF_SCOPE classification
+- ✅ **Map-Reduce Processing** - Aggregation accuracy and partial failure handling
+- ✅ **Classification Routing** - Integration tests for question classification and routing
 
 ---
 
@@ -893,6 +988,9 @@ pytest test_system.py::TestUnifiedSearchPipeline -v
 ```
 graph-rag/
 ├── main.py                 # FastAPI application entry point
+├── config.py               # Centralized configuration module
+├── resilience.py           # Resilience patterns (circuit breakers, retries)
+├── logging_config.py       # Standardized structured logging
 ├── document_api.py         # Document processing endpoints
 ├── search_api.py           # Search endpoints
 ├── unified_search.py       # Core search pipeline logic with classification routing
@@ -910,6 +1008,13 @@ graph-rag/
 ├── .env.example            # Environment configuration template
 └── README.md              # This file
 ```
+
+**New Architecture Components:**
+- `config.py`: Centralized configuration loading, validation, and documentation
+- `resilience.py`: Circuit breakers and retry logic for external service calls
+- `logging_config.py`: Standardized structured logging with context fields
+
+All modules now use these infrastructure components for consistency and reliability.
 
 ### Key Dependencies
 
@@ -1016,8 +1121,45 @@ See LICENSE file for details.
 
 ## Version History
 
+- **v2.1.0** - Production-ready resilience patterns: centralized configuration (`config.py`), circuit breakers and automatic retries (`resilience.py`), structured logging (`logging_config.py`). All external service calls now use resilience patterns to handle transient failures gracefully without user-facing errors.
 - **v2.0.0** - Unified search pipeline with intelligent question classification, map-reduce for broad questions, MCP classifier integration, graph-aware reranking, MMR diversity, cross-document entity merging
 - **v1.0.0** - Initial release with basic document processing and search
+
+---
+
+## Resilience & Reliability
+
+### Circuit Breakers
+
+The system uses circuit breakers to prevent cascading failures:
+- **Per-service breakers**: Separate breakers for LLM, embedding, NER, coreference, Neo4j, and MCP classifier
+- **Three states**: CLOSED (normal), OPEN (failing), HALF_OPEN (testing recovery)
+- **Automatic recovery**: Circuit automatically transitions back to CLOSED after successful requests
+- **Configurable thresholds**: Adjust failure/success thresholds and timeout periods via environment variables
+
+### Automatic Retries
+
+All external service calls include automatic retry logic:
+- **Exponential backoff**: Delays increase exponentially between retries (e.g., 1s, 2s, 4s)
+- **Configurable attempts**: Default 3 retries, configurable per service
+- **Smart retryable errors**: Only retries on transient failures, not permanent errors
+- **Timeout protection**: Requests timeout after configured duration to prevent hanging
+
+### Structured Logging
+
+Consistent logging across all modules:
+- **Context fields**: Request IDs, operation names, service context automatically included
+- **Structured format**: Consistent schema for easy parsing and analysis
+- **JSON option**: Can output JSON-formatted logs for production log aggregation (set `LOG_JSON=true`)
+- **Error context**: All errors logged with full context for easier debugging in production
+
+### Configuration Management
+
+Centralized configuration provides:
+- **Single source of truth**: All settings in `config.py` with validation
+- **Type safety**: Type-checked configuration with Pydantic
+- **Documentation**: Settings documented with defaults and descriptions
+- **Runtime validation**: Configuration validated on startup to catch errors early
 
 ---
 
