@@ -315,6 +315,6 @@ if __name__ == "__main__":
         "main:app",
         host=APP_HOST,
         port=APP_PORT,
-        log_level=LOG_LEVEL.lower(),
-        reload=os.getenv("RELOAD", "false").lower() == "true"
+        log_level=cfg.app.log_level.lower(),
+        reload=cfg.app.reload
     )
