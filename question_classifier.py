@@ -37,7 +37,7 @@ logger = get_logger("QuestionClassifier")
 # MCP Configuration from centralized config
 USE_MCP_CLASSIFIER = cfg.classifier.mcp_config.enabled
 
-QuestionType = Literal["BROAD", "CHUNK", "OUT_OF_SCOPE"]
+QuestionType = Literal["BROAD", "CHUNK", "OUT_OF_SCOPE", "GRAPH_ANALYTICAL"]
 
 class ClassificationResult(TypedDict):
     """Result of question classification"""
@@ -50,6 +50,7 @@ class QuestionClassification(Enum):
     BROAD = "BROAD"
     CHUNK = "CHUNK"
     OUT_OF_SCOPE = "OUT_OF_SCOPE"
+    GRAPH_ANALYTICAL = "GRAPH_ANALYTICAL"
 
 class QuestionClassifier:
     """
@@ -137,6 +138,29 @@ class QuestionClassifier:
         """
         q_lower = question.lower()
         
+        # Graph/Analytical question indicators (check first, as they have priority)
+        graph_analytical_indicators = [
+            # Aggregation keywords
+            "how many", "count the number", "what is the total", "what is the average",
+            "total number", "number of", "count of", "sum of", "average of",
+            # Graph connectivity/path queries
+            "how is", "connected to", "find a path", "relationship between",
+            "degrees of separation", "path between", "connected through",
+            # Multi-hop relational questions
+            "who are the", "which", "list all", "find all",
+            # Superlatives or graph analytics
+            "most connected", "most influential", "top", "highest", "lowest",
+            "best", "worst", "largest", "smallest", "maximum", "minimum"
+        ]
+        
+        graph_score = sum(1 for indicator in graph_analytical_indicators if indicator in q_lower)
+        if graph_score >= 1:
+            return {
+                "type": "GRAPH_ANALYTICAL",
+                "reason": f"Question requires graph analytics/aggregation (matched {graph_score} indicators)",
+                "confidence": min(0.9, 0.7 + graph_score * 0.1)
+            }
+        
         # Broad question indicators
         broad_indicators = [
             "overview", "high level", "summary", "main themes", "main topics",
@@ -192,12 +216,19 @@ class QuestionClassifier:
         try:
             classification_prompt = f"""You are a question classifier for a knowledge base system. Classify the user's question into EXACTLY one of these categories:
 
-1. BROAD: Questions that need broad understanding, overviews, summaries across multiple documents or topics, comparisons, general trends
-2. CHUNK: Questions that need specific details, exact quotes, precise information from specific document sections
-3. OUT_OF_SCOPE: Questions that cannot be answered from a local knowledge base (e.g., real-time events, personal questions, unrelated topics)
+1. GRAPH_ANALYTICAL: Questions that require graph-based analytical queries, aggregations, multi-hop reasoning, or relationship traversal. Examples:
+   - Aggregation: "How many products are out of stock?", "Count the number of...", "What is the total/average..."
+   - Graph connectivity: "How is X connected to Y?", "Find a path between A and B", "Degrees of separation"
+   - Multi-hop queries: "Who are the friends of employees of Company Z?", "Which projects are led by someone mentored by Alice?"
+   - Graph analytics: "Who is the most connected person?", "List the top 3 cities by number of events"
+   - Filtered lists with conditions: "List all teams that have both a Project Manager and a Data Scientist"
+
+2. BROAD: Questions that need broad understanding, overviews, summaries across multiple documents or topics, comparisons, general trends
+3. CHUNK: Questions that need specific details, exact quotes, precise information from specific document sections
+4. OUT_OF_SCOPE: Questions that cannot be answered from a local knowledge base (e.g., real-time events, personal questions, unrelated topics)
 
 Return ONLY a JSON object with these exact keys:
-- "type": one of "BROAD", "CHUNK", or "OUT_OF_SCOPE"
+- "type": one of "GRAPH_ANALYTICAL", "BROAD", "CHUNK", or "OUT_OF_SCOPE"
 - "reason": a brief explanation (1-2 sentences)
 - "confidence": a number between 0.0 and 1.0
 
@@ -251,7 +282,7 @@ JSON Response:"""
                 return None
             
             question_type = result.get("type", "").upper()
-            if question_type not in ["BROAD", "CHUNK", "OUT_OF_SCOPE"]:
+            if question_type not in ["GRAPH_ANALYTICAL", "BROAD", "CHUNK", "OUT_OF_SCOPE"]:
                 return None
             
             confidence = float(result.get("confidence", 0.7))

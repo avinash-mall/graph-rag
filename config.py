@@ -211,6 +211,30 @@ class MCPClassifierConfig:
 
 
 @dataclass
+class MCPNeo4jConfig:
+    """MCP Neo4j Cypher server configuration"""
+    enabled: bool
+    url: str
+    timeout: int
+    max_refinement_iterations: int
+    
+    @classmethod
+    def from_env(cls) -> "MCPNeo4jConfig":
+        """Load MCP Neo4j config from environment"""
+        enabled = os.getenv("USE_MCP_NEO4J", "true").lower() == "true"
+        url = os.getenv("MCP_NEO4J_URL", "http://localhost:8002/mcp")
+        timeout = int(os.getenv("MCP_NEO4J_TIMEOUT", "30"))
+        max_refinement_iterations = int(os.getenv("MCP_NEO4J_MAX_REFINEMENT_ITERATIONS", "3"))
+        
+        return cls(
+            enabled=enabled,
+            url=url,
+            timeout=timeout,
+            max_refinement_iterations=max_refinement_iterations
+        )
+
+
+@dataclass
 class ClassifierConfig:
     """Question classifier configuration"""
     use_heuristics: bool
@@ -401,6 +425,7 @@ class Config:
     processing: ProcessingConfig
     search: SearchConfig
     resilience: ResilienceConfig
+    mcp_neo4j: MCPNeo4jConfig
     
     @classmethod
     def load(cls) -> "Config":
@@ -417,7 +442,8 @@ class Config:
                 map_reduce=MapReduceConfig.from_env(),
                 processing=ProcessingConfig.from_env(),
                 search=SearchConfig.from_env(),
-                resilience=ResilienceConfig.from_env()
+                resilience=ResilienceConfig.from_env(),
+                mcp_neo4j=MCPNeo4jConfig.from_env()
             )
         except Exception as e:
             logger.error(f"Failed to load configuration: {e}")

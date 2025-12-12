@@ -20,6 +20,7 @@ This module uses:
 """
 
 import asyncio
+import os
 import re
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
@@ -37,6 +38,7 @@ from utils import (
 )
 from question_classifier import classify_question, ClassificationResult
 from map_reduce import map_reduce_communities
+from mcp_neo4j_cypher import get_mcp_neo4j_client
 
 # Get configuration
 cfg = get_config()
@@ -132,6 +134,10 @@ class UnifiedSearchPipeline:
             # Route based on classification
             if question_type == "OUT_OF_SCOPE":
                 return await self._handle_out_of_scope_question(question, start_time)
+            elif question_type == "GRAPH_ANALYTICAL":
+                return await self._search_with_cypher(
+                    question, conversation_history, start_time
+                )
             elif question_type == "BROAD":
                 return await self._search_with_communities(
                     question, conversation_history, doc_id, max_chunks, start_time
@@ -174,6 +180,77 @@ class UnifiedSearchPipeline:
                 "routed": True
             }
         )
+    
+    async def _search_with_cypher(
+        self,
+        question: str,
+        conversation_history: Optional[str],
+        start_time: float
+    ) -> SearchResult:
+        """
+        Search using Neo4j Cypher queries via MCP for graph/analytical questions.
+        """
+        try:
+            self.logger.info("Routing to Cypher-based graph query")
+            
+            # Check if MCP Neo4j is enabled
+            if not cfg.mcp_neo4j.enabled:
+                self.logger.warning("MCP Neo4j is disabled, falling back to standard search")
+                return await self._search_with_chunks(
+                    question, conversation_history, None, SearchScope.GLOBAL, 
+                    MAX_CHUNKS_PER_ANSWER, start_time
+                )
+            
+            # Get MCP Neo4j client (pass driver for fallback)
+            mcp_client = get_mcp_neo4j_client(neo4j_driver=self.driver)
+            
+            # Answer question using Cypher
+            answer, query_results, metadata = await mcp_client.answer_with_cypher(question)
+            
+            # Extract entities from results if available
+            entities_found = []
+            if query_results:
+                # Try to extract entity names from results
+                for result in query_results[:10]:  # Limit to first 10 results
+                    for key, value in result.items():
+                        if isinstance(value, str) and len(value) < 100:
+                            entities_found.append({"name": value, "source": "cypher_result"})
+            
+            # Calculate confidence based on whether we got results
+            if query_results and len(query_results) > 0:
+                confidence_score = 0.8  # High confidence for successful Cypher query
+            else:
+                confidence_score = 0.3
+            
+            end_time = asyncio.get_event_loop().time()
+            search_time = end_time - start_time
+            
+            return SearchResult(
+                answer=answer,
+                relevant_chunks=[],  # No chunks for Cypher queries
+                community_summaries=[],
+                entities_found=entities_found[:20],  # Limit entities
+                confidence_score=round(confidence_score, 2),
+                search_metadata={
+                    "question_type": "GRAPH_ANALYTICAL",
+                    "search_time": search_time,
+                    "strategy": "cypher_query",
+                    "iterations": metadata.get("iterations", 0),
+                    "final_query": metadata.get("final_query"),
+                    "results_count": len(query_results) if query_results else 0
+                }
+            )
+            
+        except Exception as e:
+            self.logger.error(f"Cypher search error: {e}")
+            end_time = asyncio.get_event_loop().time()
+            
+            # Fallback to standard search on error
+            self.logger.info("Falling back to standard chunk search")
+            return await self._search_with_chunks(
+                question, conversation_history, None, SearchScope.GLOBAL,
+                MAX_CHUNKS_PER_ANSWER, start_time
+            )
     
     async def _search_with_communities(
         self,

@@ -77,6 +77,8 @@ services:
       - DB_USERNAME=${DB_USERNAME:-neo4j}
       - DB_PASSWORD=${DB_PASSWORD:-neo4j123}
       - MCP_CLASSIFIER_URL=http://mcp-classifier:8001/mcp
+      - MCP_NEO4J_URL=${MCP_NEO4J_URL:-http://localhost:8002/mcp}
+      - USE_MCP_NEO4J=${USE_MCP_NEO4J:-true}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - PYTHONUNBUFFERED=1
     env_file:
