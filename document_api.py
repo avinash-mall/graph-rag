@@ -742,7 +742,7 @@ async def upload_documents(files: List[UploadFile] = File(...)):
             
             logger.info(
                 f"Processing {file.filename}: {len(chunks)} chunks",
-                extra=log_function_call("upload_documents", filename=file.filename, chunks_count=len(chunks))
+                extra=log_function_call("upload_documents", file_name=file.filename, chunks_count=len(chunks))
             )
             
             # Build graph
@@ -770,7 +770,7 @@ async def upload_documents(files: List[UploadFile] = File(...)):
                 logger,
                 f"Error processing {file.filename}: {e}",
                 exception=e,
-                context=log_function_call("upload_documents", filename=file.filename)
+                context=log_function_call("upload_documents", file_name=file.filename)
             )
             raise HTTPException(status_code=500, detail=f"Error processing {file.filename}: {str(e)}")
     

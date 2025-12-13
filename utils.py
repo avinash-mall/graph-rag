@@ -194,9 +194,9 @@ class EfficientNLPProcessor:
         
         async def _call():
             if is_gemini:
-                return await self._call_gemini_api(messages, base_url, model, api_key, temperature)
+                return await self._call_gemini_api(messages, base_url, model, api_key, temperature, timeout)
             else:
-                return await self._call_openai_api(messages, base_url, model, api_key, temperature)
+                return await self._call_openai_api(messages, base_url, model, api_key, temperature, timeout)
         
         try:
             return await call_with_resilience(
@@ -214,7 +214,7 @@ class EfficientNLPProcessor:
             )
             raise
     
-    async def _call_gemini_api(self, messages: List[Dict[str, str]], base_url: str, model: str, api_key: str, temperature: float) -> str:
+    async def _call_gemini_api(self, messages: List[Dict[str, str]], base_url: str, model: str, api_key: str, temperature: float, timeout: float = 60.0) -> str:
         """Call Gemini API"""
         # Convert messages to Gemini format
         contents = []
@@ -254,7 +254,7 @@ class EfficientNLPProcessor:
             "x-goog-api-key": api_key
         }
         
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+        async with httpx.AsyncClient(timeout=timeout, verify=False) as client:
             response = await client.post(api_url, json=payload, headers=headers)
             response.raise_for_status()
             data = response.json()
@@ -265,7 +265,7 @@ class EfficientNLPProcessor:
             else:
                 raise ValueError("Invalid response format from Gemini API")
     
-    async def _call_openai_api(self, messages: List[Dict[str, str]], base_url: str, model: str, api_key: str, temperature: float) -> str:
+    async def _call_openai_api(self, messages: List[Dict[str, str]], base_url: str, model: str, api_key: str, temperature: float, timeout: float = 60.0) -> str:
         """Call OpenAI-compatible API"""
         if base_url.endswith('/v1'):
             api_url = f"{base_url}/chat/completions"
@@ -286,7 +286,7 @@ class EfficientNLPProcessor:
         if api_key and api_key != "test":
             headers["Authorization"] = f"Bearer {api_key}"
         
-        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+        async with httpx.AsyncClient(timeout=timeout, verify=False) as client:
             response = await client.post(api_url, json=payload, headers=headers)
             response.raise_for_status()
             data = response.json()
