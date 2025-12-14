@@ -211,36 +211,46 @@ class MCPNeo4jCypherClient:
             if refinement_feedback:
                 system_prompt = f"""You are a Cypher query expert. The last query you generated had an issue: {refinement_feedback}
 
-Refine the Cypher query to correctly answer the question. Use only the schema elements provided below. Do not invent new labels or relationships.
-
 Graph Schema:
 {schema_context}
 
-Instructions:
-- Use only the labels, relationships, and properties from the schema above
-- Return ONLY the Cypher query, nothing else
-- Do not include markdown code blocks
-- Ensure the query is syntactically correct
-- If the question asks for a count, use COUNT()
-- If the question asks for a list, return appropriate fields
-- Use LIMIT to avoid returning too many results (default: 10)
+The previous query failed. Try a DIFFERENT approach:
+1. If searching for specific entities, use FUZZY matching: WHERE toLower(e.name) CONTAINS toLower('term')
+2. If no results, try a BROADER query without specific entity names
+3. If looking for relationships, try matching any entity first: MATCH (e:Entity)-[r]-(other:Entity) RETURN e.name, type(r), other.name LIMIT 20
+4. Try simpler queries that explore the data rather than looking for exact matches
+
+Alternative patterns to try:
+- List all entities matching a term: MATCH (e:Entity) WHERE toLower(e.name) CONTAINS toLower('partial_term') RETURN e.name, e.type LIMIT 10
+- Browse relationships: MATCH (e1:Entity)-[r]->(e2:Entity) RETURN e1.name, type(r), e2.name LIMIT 20
+- Count entities by type: MATCH (e:Entity) RETURN e.type, COUNT(*) AS count ORDER BY count DESC
+
+CRITICAL: 
+- Use toLower() and CONTAINS for fuzzy matching
+- ONLY use labels: Entity, Chunk, CommunitySummary
+- Return ONLY the Cypher query, no explanations
 """
             else:
-                system_prompt = f"""You are a Cypher query expert. Generate a Cypher query to answer the user's question using the provided graph schema.
+                system_prompt = f"""You are a Cypher query expert. Generate a Cypher query to answer the user's question.
 
 Graph Schema:
 {schema_context}
 
-Instructions:
-- Use only the labels, relationships, and properties from the schema above
-- Do not invent new labels or relationships that don't exist
-- Return ONLY the Cypher query, nothing else
-- Do not include markdown code blocks or explanations
-- Ensure the query is syntactically correct
-- If the question asks for a count, use COUNT()
-- If the question asks for a list, return appropriate fields
-- Use LIMIT to avoid returning too many results (default: 10)
-- Use at most 2-hop traversals unless absolutely necessary
+QUERY PATTERNS (use these exactly):
+1. Count entities: MATCH (e:Entity) RETURN COUNT(e) AS total
+2. List entities by name: MATCH (e:Entity) WHERE toLower(e.name) CONTAINS toLower('term') RETURN e.name, e.type LIMIT 20
+3. Find all connections for an entity: MATCH (e:Entity)-[r]-(other:Entity) WHERE toLower(e.name) CONTAINS toLower('term') RETURN e.name, type(r), other.name LIMIT 20
+4. Multiple search terms (use OR): MATCH (e:Entity) WHERE toLower(e.name) CONTAINS 'term1' OR toLower(e.name) CONTAINS 'term2' RETURN e.name LIMIT 20
+5. Explore relationships: MATCH (e1:Entity)-[r]->(e2:Entity) RETURN e1.name, type(r), e2.name LIMIT 30
+
+CRITICAL RULES:
+1. Labels: ONLY use Entity, Chunk, CommunitySummary
+2. Relationships: ONLY use MENTIONED_IN, CO_OCCURS, RELATES_TO
+3. ALWAYS use toLower() and CONTAINS for name matching - NEVER use =
+4. For relationship queries, match ONE entity first, then return its connections
+5. NEVER use AND to require BOTH entities to match - use OR or match just ONE entity
+6. Return ONLY the raw Cypher query, no markdown or explanations
+7. Use LIMIT 20 or higher for relationship queries
 """
             
             user_prompt = f"Question: {question}\n\nCypher Query:"
@@ -483,7 +493,7 @@ Instructions:
                 # Check if result is satisfactory
                 if result.success and self._is_result_relevant(result, question):
                     # Success! Format the answer
-                    answer = self._format_answer(question, result.data)
+                    answer = await self._format_answer(question, result.data)
                     metadata["final_query"] = cypher_query
                     return answer, result.data, metadata
                 
@@ -506,7 +516,7 @@ Instructions:
                     # Max iterations reached
                     if result.success:
                         # Query executed but might not be relevant
-                        answer = self._format_answer(question, result.data)
+                        answer = await self._format_answer(question, result.data)
                         return answer, result.data, metadata
                     else:
                         return (
@@ -531,25 +541,25 @@ Instructions:
                 metadata
             )
     
-    def _format_answer(
+    async def _format_answer(
         self,
         question: str,
         results: List[Dict[str, Any]]
     ) -> str:
         """
-        Format Cypher query results into a natural language answer.
+        Format Cypher query results into a natural language answer using LLM.
         
         Args:
             question: Original question
             results: Query results from Neo4j
             
         Returns:
-            Formatted answer string
+            Formatted natural language answer string
         """
         if not results:
             return "I couldn't find any results for your question in the graph data."
         
-        # If result is a single count/number
+        # If result is a single count/number, return directly
         if len(results) == 1:
             result = results[0]
             keys = list(result.keys())
@@ -557,20 +567,54 @@ Instructions:
                 value = result[keys[0]]
                 if isinstance(value, (int, float)):
                     return f"The answer is {value}."
-                elif isinstance(value, str) and len(value) < 100:
-                    return f"The answer is {value}."
         
-        # If result is a list of items
+        # Use LLM to format results into natural language
+        try:
+            # Format results as JSON for the LLM
+            results_text = json.dumps(results[:15], indent=2, default=str)  # Limit to 15 results
+            
+            prompt = f"""Based on the following graph database query results, provide a clear and helpful natural language answer to the user's question.
+
+Question: {question}
+
+Query Results (from Neo4j graph database):
+{results_text}
+
+Instructions:
+1. Summarize the key findings in 2-4 sentences
+2. Highlight the most relevant relationships or entities found
+3. Be specific and cite actual entity names from the results
+4. If the results show relationships, explain how the entities are connected
+5. Do NOT just list the raw data - synthesize it into a meaningful answer
+
+Answer:"""
+
+            messages = [
+                {"role": "system", "content": "You are a helpful assistant that explains graph database query results in clear, natural language. Be concise but informative."},
+                {"role": "user", "content": prompt}
+            ]
+            
+            answer = await llm_client.invoke(messages)
+            
+            if answer and len(answer.strip()) > 20:
+                return answer.strip()
+            else:
+                # Fallback to simple formatting
+                return self._simple_format(question, results)
+                
+        except Exception as e:
+            self.logger.warning(f"LLM formatting failed: {e}, using simple format")
+            return self._simple_format(question, results)
+    
+    def _simple_format(self, question: str, results: List[Dict[str, Any]]) -> str:
+        """Simple fallback formatting without LLM."""
         if len(results) <= 10:
-            # Format as a list
             answer_parts = ["Here are the results:"]
             for i, result in enumerate(results, 1):
-                # Format result as key-value pairs
                 formatted = ", ".join([f"{k}: {v}" for k, v in result.items()])
                 answer_parts.append(f"{i}. {formatted}")
             return "\n".join(answer_parts)
         else:
-            # Too many results, summarize
             return f"I found {len(results)} results. Here are the first few:\n" + "\n".join([
                 f"{i}. {', '.join([f'{k}: {v}' for k, v in result.items()])}"
                 for i, result in enumerate(results[:5], 1)

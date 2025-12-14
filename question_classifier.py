@@ -114,7 +114,7 @@ class QuestionClassifier:
         # Step 1: Try heuristics first (fast, cheap)
         if self.use_heuristics:
             heuristic_result = self._classify_with_heuristics(question)
-            if heuristic_result["confidence"] >= 0.8:
+            if heuristic_result["confidence"] >= 0.7:  # Lowered from 0.8 to use heuristic more often
                 self.logger.info(f"High-confidence heuristic classification: {heuristic_result['type']}")
                 return heuristic_result
         
@@ -252,7 +252,7 @@ JSON Response:"""
             # Parse JSON from response
             result = self._parse_classification_response(response)
             
-            if result and result.get("type") in ["BROAD", "CHUNK", "OUT_OF_SCOPE"]:
+            if result and result.get("type") in ["GRAPH_ANALYTICAL", "BROAD", "CHUNK", "OUT_OF_SCOPE"]:
                 return result
             else:
                 self.logger.warning(f"Invalid LLM classification result: {result}")
