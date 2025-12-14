@@ -343,6 +343,30 @@ class SearchConfig:
 
 
 @dataclass
+class ExplainabilityConfig:
+    """Explainability configuration for LLM responses with inline citations and references"""
+    enabled: bool                    # Feature flag to enable/disable explainability
+    max_sources: int                 # Maximum sources to show in references block
+    snippet_chars: int               # Maximum characters per snippet in references
+    only_cited_sources: bool         # Only show sources actually cited by the LLM
+    
+    @classmethod
+    def from_env(cls) -> "ExplainabilityConfig":
+        """Load explainability config from environment"""
+        enabled = os.getenv("EXPLAIN_ENABLED", "true").lower() == "true"
+        max_sources = int(os.getenv("EXPLAIN_MAX_SOURCES", "8"))
+        snippet_chars = int(os.getenv("EXPLAIN_SNIPPET_CHARS", "320"))
+        only_cited_sources = os.getenv("EXPLAIN_ONLY_CITED_SOURCES", "true").lower() == "true"
+        
+        return cls(
+            enabled=enabled,
+            max_sources=max_sources,
+            snippet_chars=snippet_chars,
+            only_cited_sources=only_cited_sources
+        )
+
+
+@dataclass
 class ResilienceConfig:
     """Resilience configuration for external service calls"""
     max_retries: int
@@ -426,6 +450,7 @@ class Config:
     search: SearchConfig
     resilience: ResilienceConfig
     mcp_neo4j: MCPNeo4jConfig
+    explainability: ExplainabilityConfig
     
     @classmethod
     def load(cls) -> "Config":
@@ -443,7 +468,8 @@ class Config:
                 processing=ProcessingConfig.from_env(),
                 search=SearchConfig.from_env(),
                 resilience=ResilienceConfig.from_env(),
-                mcp_neo4j=MCPNeo4jConfig.from_env()
+                mcp_neo4j=MCPNeo4jConfig.from_env(),
+                explainability=ExplainabilityConfig.from_env()
             )
         except Exception as e:
             logger.error(f"Failed to load configuration: {e}")

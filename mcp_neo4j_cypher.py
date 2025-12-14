@@ -409,6 +409,165 @@ CRITICAL RULES:
                 query=cypher_query
             )
     
+    def _extract_terms_from_question(self, question: str) -> List[str]:
+        """Extract key terms from the question for entity searching."""
+        import re
+        # Remove common words and extract meaningful terms
+        stop_words = {
+            'how', 'is', 'are', 'was', 'were', 'what', 'which', 'who', 'whom',
+            'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
+            'of', 'with', 'by', 'from', 'as', 'into', 'through', 'during', 'before',
+            'after', 'above', 'below', 'between', 'under', 'again', 'further', 'then',
+            'once', 'here', 'there', 'when', 'where', 'why', 'all', 'each', 'few',
+            'more', 'most', 'other', 'some', 'such', 'than', 'too', 'very', 'can',
+            'will', 'just', 'should', 'now', 'related', 'about', 'its', 'it', 'this',
+            'that', 'these', 'those', 'does', 'do', 'did', 'has', 'have', 'had'
+        }
+        
+        # Extract words, keeping multi-word phrases in quotes
+        words = re.findall(r'"([^"]+)"|(\w+)', question.lower())
+        terms = []
+        for phrase, word in words:
+            term = phrase if phrase else word
+            if term and term not in stop_words and len(term) > 2:
+                terms.append(term)
+        
+        return terms
+    
+    async def find_similar_entities(self, terms: List[str]) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Find entities with names similar to the given terms using fuzzy matching.
+        Returns a dict mapping each term to matching entities.
+        """
+        matches: Dict[str, List[Dict[str, Any]]] = {}
+        
+        try:
+            from utils import run_cypher_query_async
+            
+            for term in terms[:5]:  # Limit to 5 terms
+                # Try fuzzy match with CONTAINS and partial matching
+                query = """
+                MATCH (e:Entity)
+                WHERE toLower(e.name) CONTAINS toLower($term)
+                   OR toLower($term) CONTAINS toLower(e.name)
+                RETURN e.name AS name, e.type AS type, 
+                       CASE WHEN toLower(e.name) = toLower($term) THEN 1.0
+                            WHEN toLower(e.name) CONTAINS toLower($term) THEN 0.8
+                            ELSE 0.6 END AS similarity
+                ORDER BY similarity DESC
+                LIMIT 5
+                """
+                
+                results = await self._execute_direct(query.replace("$term", f"'{term}'"), self.neo4j_driver)
+                if results.success and results.data:
+                    matches[term] = [{"name": r["name"], "type": r.get("type", ""), "similarity": r.get("similarity", 0.5)} for r in results.data]
+                else:
+                    matches[term] = []
+                    
+        except Exception as e:
+            self.logger.warning(f"Fuzzy entity search failed: {e}")
+            
+        return matches
+    
+    async def generate_multiple_cypher_queries(
+        self, 
+        question: str, 
+        schema_context: str,
+        terms: List[str],
+        fuzzy_matches: Dict[str, List[Dict[str, Any]]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Generate 5 different Cypher query strategies to explore the question.
+        
+        Returns list of dicts with: type, query, description
+        """
+        queries = []
+        
+        # Get actual entity names from fuzzy matches
+        matched_entities = []
+        for term, matches in fuzzy_matches.items():
+            if matches:
+                matched_entities.append(matches[0]["name"])  # Best match
+        
+        # If no matches found, use original terms
+        search_terms = matched_entities if matched_entities else terms
+        
+        # Strategy 1: Fuzzy search on all extracted terms
+        if terms:
+            term_conditions = " OR ".join([f"toLower(e.name) CONTAINS toLower('{t}')" for t in terms[:3]])
+            queries.append({
+                "type": "fuzzy_search",
+                "description": f"Searching entities matching: {', '.join(terms[:3])}",
+                "query": f"""
+                    MATCH (e:Entity)
+                    WHERE {term_conditions}
+                    RETURN e.name AS entity, e.type AS type
+                    LIMIT 10
+                """
+            })
+        
+        # Strategy 2: Relationship exploration between matched entities
+        if len(search_terms) >= 2:
+            e1, e2 = search_terms[0], search_terms[1]
+            queries.append({
+                "type": "relationship_exploration",
+                "description": f"Finding relationships between '{e1}' and '{e2}'",
+                "query": f"""
+                    MATCH (e1:Entity)-[r]-(e2:Entity)
+                    WHERE (toLower(e1.name) CONTAINS toLower('{e1}') OR toLower(e1.name) = toLower('{e1}'))
+                      AND (toLower(e2.name) CONTAINS toLower('{e2}') OR toLower(e2.name) = toLower('{e2}'))
+                    RETURN e1.name AS from_entity, type(r) AS relationship, e2.name AS to_entity
+                    LIMIT 15
+                """
+            })
+        
+        # Strategy 3: Path finding via intermediate nodes
+        if len(search_terms) >= 2:
+            e1, e2 = search_terms[0], search_terms[1]
+            queries.append({
+                "type": "path_finding",
+                "description": f"Finding paths connecting '{e1}' to '{e2}'",
+                "query": f"""
+                    MATCH (e1:Entity), (e2:Entity)
+                    WHERE toLower(e1.name) CONTAINS toLower('{e1}')
+                      AND toLower(e2.name) CONTAINS toLower('{e2}')
+                    MATCH path = (e1)-[*1..3]-(e2)
+                    RETURN [n IN nodes(path) | CASE WHEN 'Entity' IN labels(n) THEN n.name ELSE 'chunk' END] AS path_nodes,
+                           length(path) AS path_length
+                    LIMIT 10
+                """
+            })
+        
+        # Strategy 4: Related entities via RELATES_TO for first term
+        if search_terms:
+            e1 = search_terms[0]
+            queries.append({
+                "type": "related_entities",
+                "description": f"Finding entities related to '{e1}'",
+                "query": f"""
+                    MATCH (e1:Entity)-[:RELATES_TO]-(related:Entity)
+                    WHERE toLower(e1.name) CONTAINS toLower('{e1}')
+                    RETURN e1.name AS source_entity, related.name AS related_entity, related.type AS related_type
+                    LIMIT 20
+                """
+            })
+        
+        # Strategy 5: Chunks containing the entities (for context)
+        if search_terms:
+            term_conditions = " OR ".join([f"toLower(e.name) CONTAINS toLower('{t}')" for t in search_terms[:2]])
+            queries.append({
+                "type": "chunk_context",
+                "description": f"Finding document chunks mentioning these entities",
+                "query": f"""
+                    MATCH (e:Entity)-[:MENTIONED_IN]->(c:Chunk)
+                    WHERE {term_conditions}
+                    RETURN e.name AS entity, c.text AS chunk_text, c.document_name AS document
+                    LIMIT 5
+                """
+            })
+        
+        return queries
+    
     def _is_result_relevant(self, result: CypherQueryResult, question: str) -> bool:
         """
         Check if query result is relevant to the question.
@@ -443,13 +602,14 @@ CRITICAL RULES:
         max_iterations: Optional[int] = None
     ) -> Tuple[str, Optional[List[Dict[str, Any]]], Dict[str, Any]]:
         """
-        Answer a question using Cypher query generation and iterative refinement.
+        Answer a question using multiple Cypher query strategies.
         
-        This is the main entry point that:
-        1. Gets graph schema
-        2. Generates initial Cypher query
-        3. Executes and refines iteratively
-        4. Formats final answer
+        This enhanced version:
+        1. Extracts key terms from the question
+        2. Finds fuzzy entity matches for those terms
+        3. Generates 5 different query strategies
+        4. Executes all queries and combines results
+        5. Formats a comprehensive answer
         
         Args:
             question: User's question
@@ -458,80 +618,111 @@ CRITICAL RULES:
         Returns:
             Tuple of (answer_text, query_results, metadata)
         """
-        max_iters = max_iterations or self.max_refinement_iterations
+        import asyncio
+        
         metadata = {
             "iterations": 0,
             "final_query": None,
-            "refinement_history": []
+            "query_strategies": [],
+            "fuzzy_matches": {},
+            "extracted_terms": []
         }
         
         try:
-            # Step 1: Get graph schema
-            self.logger.info("Retrieving Neo4j schema")
-            schema_context = await self.get_neo4j_schema()
+            # Step 1: Extract key terms from the question
+            self.logger.info("Extracting terms from question")
+            terms = self._extract_terms_from_question(question)
+            metadata["extracted_terms"] = terms
+            self.logger.info(f"Extracted terms: {terms}")
             
-            if not schema_context:
+            if not terms:
                 return (
-                    "I'm sorry, I couldn't retrieve the graph schema. Please ensure Neo4j is accessible.",
+                    "I couldn't identify specific topics in your question. Could you please rephrase with more specific terms?",
                     None,
                     metadata
                 )
             
-            # Step 2: Generate initial Cypher query
-            cypher_query = await self.generate_cypher_query(question, schema_context)
-            metadata["final_query"] = cypher_query
+            # Step 2: Find fuzzy entity matches
+            self.logger.info("Finding similar entities via fuzzy matching")
+            fuzzy_matches = await self.find_similar_entities(terms)
+            metadata["fuzzy_matches"] = {k: [m["name"] for m in v] for k, v in fuzzy_matches.items()}
             
-            # Step 3: Iterative refinement loop
-            for attempt in range(1, max_iters + 1):
-                metadata["iterations"] = attempt
+            # Log what we found
+            for term, matches in fuzzy_matches.items():
+                if matches:
+                    self.logger.info(f"Term '{term}' matched entities: {[m['name'] for m in matches]}")
+            
+            # Step 3: Get schema context for LLM fallback
+            schema_context = await self.get_neo4j_schema()
+            
+            # Step 4: Generate multiple query strategies
+            self.logger.info("Generating multiple Cypher query strategies")
+            query_strategies = await self.generate_multiple_cypher_queries(
+                question, schema_context, terms, fuzzy_matches
+            )
+            
+            # Step 5: Execute all queries and collect results
+            all_results: List[Dict[str, Any]] = []
+            query_outcomes = []
+            
+            for strategy in query_strategies:
+                self.logger.info(f"Executing strategy: {strategy['type']}")
+                result = await self.execute_cypher_query(strategy["query"])
                 
-                self.logger.info(f"Executing Cypher query (attempt {attempt}/{max_iters})")
+                outcome = {
+                    "type": strategy["type"],
+                    "description": strategy["description"],
+                    "success": result.success,
+                    "result_count": len(result.data) if result.data else 0,
+                    "query": strategy["query"].strip()
+                }
+                query_outcomes.append(outcome)
                 
-                # Execute query
+                if result.success and result.data:
+                    # Tag results with their source strategy
+                    for r in result.data:
+                        r["_strategy"] = strategy["type"]
+                    all_results.extend(result.data)
+                    self.logger.info(f"Strategy '{strategy['type']}' returned {len(result.data)} results")
+            
+            metadata["query_strategies"] = query_outcomes
+            metadata["iterations"] = len(query_strategies)
+            
+            # Find the most successful query for metadata
+            successful_queries = [q for q in query_outcomes if q["result_count"] > 0]
+            if successful_queries:
+                best_query = max(successful_queries, key=lambda x: x["result_count"])
+                metadata["final_query"] = best_query["query"]
+            
+            # Step 6: If no results from structured queries, try LLM-generated query
+            if not all_results:
+                self.logger.info("No results from structured queries, trying LLM-generated query")
+                cypher_query = await self.generate_cypher_query(question, schema_context)
                 result = await self.execute_cypher_query(cypher_query)
                 
-                # Check if result is satisfactory
-                if result.success and self._is_result_relevant(result, question):
-                    # Success! Format the answer
-                    answer = await self._format_answer(question, result.data)
+                if result.success and result.data:
+                    all_results.extend(result.data)
                     metadata["final_query"] = cypher_query
-                    return answer, result.data, metadata
-                
-                # If we reach here, query needs refinement
-                if attempt < max_iters:
-                    feedback = result.error_message if result.error_message else "Query returned no relevant results"
-                    metadata["refinement_history"].append({
-                        "attempt": attempt,
-                        "query": cypher_query,
-                        "feedback": feedback
+                    query_outcomes.append({
+                        "type": "llm_generated",
+                        "description": "LLM-generated fallback query",
+                        "success": True,
+                        "result_count": len(result.data),
+                        "query": cypher_query
                     })
-                    
-                    self.logger.info(f"Refining query based on feedback: {feedback}")
-                    
-                    # Generate refined query
-                    cypher_query = await self.generate_cypher_query(
-                        question, schema_context, refinement_feedback=feedback
-                    )
-                else:
-                    # Max iterations reached
-                    if result.success:
-                        # Query executed but might not be relevant
-                        answer = await self._format_answer(question, result.data)
-                        return answer, result.data, metadata
-                    else:
-                        return (
-                            f"I'm sorry, I couldn't generate a valid Cypher query to answer your question after {max_iters} attempts. "
-                            f"Error: {result.error_message}",
-                            None,
-                            metadata
-                        )
             
-            # Should not reach here, but just in case
-            return (
-                "I'm sorry, I couldn't find an answer to your question in the graph data.",
-                None,
-                metadata
-            )
+            # Step 7: Format the comprehensive answer
+            if all_results:
+                # Deduplicate results
+                unique_results = self._deduplicate_results(all_results)
+                answer = await self._format_comprehensive_answer(
+                    question, unique_results, terms, fuzzy_matches, query_outcomes
+                )
+                return answer, unique_results, metadata
+            else:
+                # No results found
+                answer = await self._format_no_results_answer(question, terms, fuzzy_matches)
+                return answer, None, metadata
             
         except Exception as e:
             self.logger.error(f"Error in answer_with_cypher: {e}")
@@ -539,6 +730,109 @@ CRITICAL RULES:
                 f"I encountered an error while processing your graph query: {str(e)}",
                 None,
                 metadata
+            )
+    
+    def _deduplicate_results(self, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Remove duplicate results based on key fields."""
+        seen = set()
+        unique = []
+        for r in results:
+            # Create a hashable key from non-strategy fields
+            key_fields = {k: v for k, v in r.items() if k != "_strategy" and isinstance(v, (str, int, float, bool))}
+            key = tuple(sorted(key_fields.items()))
+            if key not in seen:
+                seen.add(key)
+                unique.append(r)
+        return unique
+    
+    async def _format_comprehensive_answer(
+        self,
+        question: str,
+        results: List[Dict[str, Any]],
+        terms: List[str],
+        fuzzy_matches: Dict[str, List[Dict[str, Any]]],
+        query_outcomes: List[Dict[str, Any]]
+    ) -> str:
+        """Format a comprehensive, natural language answer from multi-query results."""
+        
+        # Build context about what was found
+        fuzzy_context = []
+        for term, matches in fuzzy_matches.items():
+            if matches:
+                fuzzy_context.append(f"'{term}' matched entity '{matches[0]['name']}'")
+        
+        successful_strategies = [q["type"] for q in query_outcomes if q["result_count"] > 0]
+        
+        # Format results for LLM
+        results_text = json.dumps(results[:20], indent=2, default=str)
+        
+        prompt = f"""Answer this question based on the graph database results. Be conversational and helpful.
+
+QUESTION: {question}
+
+FUZZY MATCHING:
+{chr(10).join(fuzzy_context) if fuzzy_context else "No fuzzy matches needed - entities found directly."}
+
+SUCCESSFUL QUERY STRATEGIES: {', '.join(successful_strategies) if successful_strategies else 'None'}
+
+GRAPH QUERY RESULTS:
+{results_text}
+
+INSTRUCTIONS:
+1. Write a natural, conversational response (3-5 sentences)
+2. Directly address the question the user asked
+3. Mention specific entities and relationships found in the results
+4. If the user's spelling was corrected (fuzzy match), acknowledge this naturally
+5. Explain HOW the entities are connected based on the relationships found
+6. If no direct connection was found, explain what WAS found and what it might mean
+7. Do NOT just list raw data - synthesize it into a meaningful answer
+
+ANSWER:"""
+
+        try:
+            messages = [
+                {"role": "system", "content": "You are a helpful assistant that explains graph database findings in clear, natural language. Be conversational and insightful."},
+                {"role": "user", "content": prompt}
+            ]
+            
+            answer = await llm_client.invoke(messages)
+            
+            if answer and len(answer.strip()) > 30:
+                return answer.strip()
+            else:
+                return self._simple_format(question, results)
+                
+        except Exception as e:
+            self.logger.warning(f"LLM formatting failed: {e}")
+            return self._simple_format(question, results)
+    
+    async def _format_no_results_answer(
+        self,
+        question: str,
+        terms: List[str],
+        fuzzy_matches: Dict[str, List[Dict[str, Any]]]
+    ) -> str:
+        """Generate a helpful response when no results were found."""
+        
+        unmatched_terms = [t for t in terms if not fuzzy_matches.get(t)]
+        matched_terms = {t: fuzzy_matches[t][0]["name"] for t in terms if fuzzy_matches.get(t)}
+        
+        if unmatched_terms:
+            return (
+                f"I couldn't find entities matching '{', '.join(unmatched_terms)}' in the knowledge graph. "
+                f"This might mean the entity isn't in the database or has a different name. "
+                f"Try searching for related topics or check the spelling."
+            )
+        elif matched_terms:
+            return (
+                f"I found entities matching your terms ({', '.join(matched_terms.values())}), "
+                f"but couldn't find any direct relationships between them in the graph. "
+                f"They may not be directly connected in the current knowledge base."
+            )
+        else:
+            return (
+                "I couldn't find relevant information in the knowledge graph. "
+                "Please try rephrasing your question or using different terms."
             )
     
     async def _format_answer(

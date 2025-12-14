@@ -81,6 +81,109 @@ class RetrievedChunk:
     embedding: Optional[List[float]] = None  # For MMR reranking
     final_score: Optional[float] = None  # After reranking
 
+@dataclass
+class GraphTraceEdge:
+    """Trace record for graph expansion reasoning - captures why a chunk was added during graph expansion"""
+    seed_chunk_id: str      # The original chunk that triggered expansion
+    seed_entity: str        # Entity in the seed chunk that led to expansion
+    related_entity: str     # The related entity found via graph traversal
+    added_chunk_id: str     # The new chunk added due to this relationship
+    relationship: str       # The relationship type (e.g., "RELATES_TO")
+
+
+# ============================================================================
+# Explainability Helper Functions
+# ============================================================================
+
+CITATION_REGEX = r"\[(\d+)\]"
+
+
+def extract_cited_indices(answer_text: str) -> set:
+    """Extract citation indices from LLM answer text.
+    
+    Args:
+        answer_text: The LLM-generated answer containing citations like [1], [2][5]
+        
+    Returns:
+        Set of integer indices that were cited
+    """
+    return {int(x) for x in re.findall(CITATION_REGEX, answer_text)}
+
+
+def sanitize_citations(answer_text: str, max_idx: int) -> str:
+    """Replace invalid citation indices with [?].
+    
+    Args:
+        answer_text: The LLM-generated answer
+        max_idx: The maximum valid citation index
+        
+    Returns:
+        Answer text with invalid citations replaced by [?]
+    """
+    def replace_invalid(m):
+        idx = int(m.group(1))
+        return m.group(0) if 1 <= idx <= max_idx else "[?]"
+    return re.sub(CITATION_REGEX, replace_invalid, answer_text)
+
+
+def build_explainability_block(
+    answer_text: str,
+    all_sources: List['RetrievedChunk'],
+    graph_trace_edges: List[GraphTraceEdge],
+    confidence_score: float,
+    explain_cfg
+) -> str:
+    """Build a markdown explainability block with references and graph trace.
+    
+    Args:
+        answer_text: The LLM-generated answer (used to extract cited indices)
+        all_sources: All source chunks in the same order as labeled in prompt
+        graph_trace_edges: Graph expansion trace edges
+        confidence_score: The calculated confidence score
+        explain_cfg: ExplainabilityConfig instance
+        
+    Returns:
+        Markdown-formatted explainability block to append to the answer
+    """
+    cited = extract_cited_indices(answer_text)
+    
+    # Select sources to show
+    if explain_cfg.only_cited_sources and cited:
+        picked = [(i, all_sources[i-1]) for i in sorted(cited) if 1 <= i <= len(all_sources)]
+    else:
+        # Fallback: top K sources by their original order
+        picked = [(i+1, src) for i, src in enumerate(all_sources[:explain_cfg.max_sources])]
+    
+    # Format references
+    refs_lines = []
+    for idx, src in picked:
+        doc = src.metadata.get("document_name") or "unknown"
+        score = src.similarity_score
+        method = src.metadata.get("retrieval_method", "vector_search")
+        snippet = src.text[:explain_cfg.snippet_chars].replace("\n", " ").strip()
+        refs_lines.append(f"[{idx}] {doc} | score={score:.2f} | via={method}\n  \"{snippet}…\"")
+    
+    # Format graph trace (only for picked sources that came from graph expansion)
+    trace_lines = []
+    picked_ids = {src.chunk_id for _, src in picked}
+    for edge in graph_trace_edges:
+        if edge.added_chunk_id in picked_ids:
+            trace_lines.append(
+                f"- Added chunk {edge.added_chunk_id[:8]}... because '{edge.seed_entity}' "
+                f"(in seed {edge.seed_chunk_id[:8]}...) {edge.relationship} '{edge.related_entity}'."
+            )
+    
+    # Build block
+    block = ["\n\n---\n## Explainability", f"**Confidence:** {confidence_score:.2f}"]
+    block.append("\n### References")
+    block.append("\n".join(refs_lines) if refs_lines else "_No sources available._")
+    
+    if trace_lines:
+        block.append("\n### Graph Trace (Neo4j)")
+        block.append("\n".join(trace_lines))
+    
+    return "\n".join(block)
+
 class UnifiedSearchPipeline:
     """
     Unified search pipeline that combines the best aspects of the original system
@@ -222,6 +325,54 @@ class UnifiedSearchPipeline:
             else:
                 confidence_score = 0.3
             
+            # Apply explainability for Cypher queries
+            if cfg.explainability.enabled:
+                explain_block = ["\n\n---\n## Explainability", f"**Confidence:** {confidence_score:.2f}"]
+                
+                # Show extracted terms and fuzzy matches
+                extracted_terms = metadata.get("extracted_terms", [])
+                fuzzy_matches = metadata.get("fuzzy_matches", {})
+                
+                if extracted_terms:
+                    explain_block.append(f"\n### Terms Extracted")
+                    explain_block.append(f"From your question: **{', '.join(extracted_terms)}**")
+                
+                if fuzzy_matches:
+                    fuzzy_info = []
+                    for term, matches in fuzzy_matches.items():
+                        if matches:
+                            fuzzy_info.append(f"'{term}' → '{matches[0]}'")
+                    if fuzzy_info:
+                        explain_block.append(f"\n### Fuzzy Entity Matching")
+                        explain_block.append(", ".join(fuzzy_info))
+                
+                # Show query strategies tried
+                query_strategies = metadata.get("query_strategies", [])
+                if query_strategies:
+                    explain_block.append("\n### Query Strategies")
+                    for qs in query_strategies:
+                        status = "✓" if qs.get("result_count", 0) > 0 else "✗"
+                        count = qs.get("result_count", 0)
+                        explain_block.append(f"{status} **{qs['type']}**: {qs['description']} ({count} results)")
+                
+                # Show final query
+                final_query = metadata.get("final_query", "")
+                if final_query:
+                    query_display = final_query[:300] + "..." if len(final_query) > 300 else final_query
+                    explain_block.append(f"\n### Best Query\n```cypher\n{query_display}\n```")
+                
+                explain_block.append(f"\n**Total Results:** {len(query_results) if query_results else 0}")
+                
+                # Show sample of results
+                if query_results and len(query_results) > 0:
+                    explain_block.append("\n### Sample Results")
+                    for i, result in enumerate(query_results[:5], 1):
+                        result_str = ", ".join(f"{k}={v}" for k, v in result.items() 
+                                              if isinstance(v, str) and k != "_strategy")[:cfg.explainability.snippet_chars]
+                        explain_block.append(f"[{i}] {result_str}")
+                
+                answer += "\n".join(explain_block)
+            
             end_time = asyncio.get_event_loop().time()
             search_time = end_time - start_time
             
@@ -234,10 +385,15 @@ class UnifiedSearchPipeline:
                 search_metadata={
                     "question_type": "GRAPH_ANALYTICAL",
                     "search_time": search_time,
-                    "strategy": "cypher_query",
+                    "strategy": "multi_cypher_query",
                     "iterations": metadata.get("iterations", 0),
                     "final_query": metadata.get("final_query"),
-                    "results_count": len(query_results) if query_results else 0
+                    "results_count": len(query_results) if query_results else 0,
+                    "extracted_terms": metadata.get("extracted_terms", []),
+                    "fuzzy_matches": metadata.get("fuzzy_matches", {}),
+                    "query_strategies": [{"type": q["type"], "results": q.get("result_count", 0)} 
+                                        for q in metadata.get("query_strategies", [])],
+                    "explainability_enabled": cfg.explainability.enabled
                 }
             )
             
@@ -298,6 +454,21 @@ class UnifiedSearchPipeline:
             else:
                 confidence_score = 0.3
             
+            # Apply explainability for broad search (simplified - no graph trace for communities)
+            if cfg.explainability.enabled and community_summaries:
+                # Build a simplified references block for community summaries
+                explain_block = ["\n\n---\n## Explainability", f"**Confidence:** {confidence_score:.2f}"]
+                explain_block.append("\n### Community Sources")
+                
+                max_to_show = min(cfg.explainability.max_sources, len(community_summaries))
+                for i, cs in enumerate(community_summaries[:max_to_show], 1):
+                    community_id = cs.get("community", "unknown")
+                    score = cs.get("similarity_score", 0.0)
+                    snippet = cs.get("summary", "")[:cfg.explainability.snippet_chars].replace("\n", " ").strip()
+                    explain_block.append(f"[{i}] Community {community_id} | score={score:.2f}\n  \"{snippet}…\"")
+                
+                answer += "\n".join(explain_block)
+            
             end_time = asyncio.get_event_loop().time()
             search_time = end_time - start_time
             
@@ -312,7 +483,8 @@ class UnifiedSearchPipeline:
                     "search_time": search_time,
                     "communities_used": len(community_summaries),
                     "strategy": "map_reduce_communities",
-                    "doc_id": doc_id
+                    "doc_id": doc_id,
+                    "explainability_enabled": cfg.explainability.enabled
                 }
             )
             
@@ -357,8 +529,9 @@ class UnifiedSearchPipeline:
             self.logger.info(f"Retrieved {len(relevant_chunks)} candidate chunks")
             
             # Step 3: Expand context using graph relationships (optional)
+            trace_edges: List[GraphTraceEdge] = []
             if scope in [SearchScope.GLOBAL, SearchScope.HYBRID]:
-                expanded_chunks = await self._expand_context_via_graph(
+                expanded_chunks, trace_edges = await self._expand_context_via_graph(
                     relevant_chunks, processed_question, max_chunks
                 )
                 self.logger.info(f"Expanded to {len(expanded_chunks)} chunks via graph")
@@ -384,6 +557,17 @@ class UnifiedSearchPipeline:
             # Step 7: Calculate confidence score
             confidence_score = self._calculate_confidence_score(final_chunks, community_summaries)
             
+            # Step 8: Apply explainability if enabled
+            if cfg.explainability.enabled and final_chunks:
+                # Sanitize any invalid citations
+                answer = sanitize_citations(answer, len(final_chunks))
+                
+                # Append explainability block
+                answer += build_explainability_block(
+                    answer, final_chunks, trace_edges, 
+                    confidence_score, cfg.explainability
+                )
+            
             end_time = asyncio.get_event_loop().time()
             search_time = end_time - start_time
             
@@ -400,7 +584,8 @@ class UnifiedSearchPipeline:
                     "chunks_used": len(final_chunks),
                     "scope": scope.value,
                     "doc_id": doc_id,
-                    "strategy": "chunk_level_retrieval"
+                    "strategy": "chunk_level_retrieval",
+                    "explainability_enabled": cfg.explainability.enabled
                 }
             )
             
@@ -730,23 +915,34 @@ class UnifiedSearchPipeline:
         initial_chunks: List[RetrievedChunk], 
         question: str, 
         max_total: int
-    ) -> List[RetrievedChunk]:
+    ) -> Tuple[List[RetrievedChunk], List[GraphTraceEdge]]:
         """
-        Expand context by finding related chunks through entity relationships
+        Expand context by finding related chunks through entity relationships.
+        Also captures graph trace edges for explainability.
+        
+        Returns:
+            Tuple of (expanded_chunks, trace_edges)
         """
+        trace_edges: List[GraphTraceEdge] = []
+        
         if not initial_chunks:
-            return initial_chunks
+            return initial_chunks, trace_edges
         
         try:
-            # Get all entities from initial chunks
-            all_entities = set()
+            # Build a mapping from entity to seed chunks that contain it
+            entity_to_seed_chunks: Dict[str, List[str]] = {}
             for chunk in initial_chunks:
-                all_entities.update(chunk.entities)
+                for entity in chunk.entities:
+                    if entity not in entity_to_seed_chunks:
+                        entity_to_seed_chunks[entity] = []
+                    entity_to_seed_chunks[entity].append(chunk.chunk_id)
+            
+            all_entities = set(entity_to_seed_chunks.keys())
             
             if not all_entities:
-                return initial_chunks
+                return initial_chunks, trace_edges
             
-            # Find related chunks through shared entities
+            # Find related chunks through shared entities - include entity info for tracing
             cypher = """
             MATCH (e:Entity)-[:MENTIONED_IN]->(c1:Chunk)
             WHERE e.name IN $entities
@@ -754,7 +950,8 @@ class UnifiedSearchPipeline:
             MATCH (related_e)-[:MENTIONED_IN]->(c2:Chunk)
             WHERE c2.id NOT IN $existing_chunk_ids AND c2.text IS NOT NULL
             RETURN DISTINCT c2.id AS chunk_id, c2.doc_id AS doc_id, c2.text AS text,
-                   c2.document_name AS document_name, c2.embedding AS embedding
+                   c2.document_name AS document_name, c2.embedding AS embedding,
+                   e.name AS seed_entity, related_e.name AS related_entity
             LIMIT $limit
             """
             
@@ -777,7 +974,7 @@ class UnifiedSearchPipeline:
                     if similarity >= SIMILARITY_THRESHOLD_CHUNKS:
                         entities = await self._get_chunk_entities(result["chunk_id"])
                         
-                        expanded_chunks.append(RetrievedChunk(
+                        new_chunk = RetrievedChunk(
                             chunk_id=result["chunk_id"],
                             doc_id=result["doc_id"],
                             text=result["text"],
@@ -787,13 +984,30 @@ class UnifiedSearchPipeline:
                                 "document_name": result.get("document_name", ""),
                                 "retrieval_method": "graph_expansion"
                             }
+                        )
+                        expanded_chunks.append(new_chunk)
+                        
+                        # Create trace edge for explainability
+                        seed_entity = result.get("seed_entity", "")
+                        related_entity = result.get("related_entity", "")
+                        
+                        # Find a seed chunk that contains this entity
+                        seed_chunk_ids = entity_to_seed_chunks.get(seed_entity, [])
+                        seed_chunk_id = seed_chunk_ids[0] if seed_chunk_ids else "unknown"
+                        
+                        trace_edges.append(GraphTraceEdge(
+                            seed_chunk_id=seed_chunk_id,
+                            seed_entity=seed_entity,
+                            related_entity=related_entity,
+                            added_chunk_id=result["chunk_id"],
+                            relationship="RELATES_TO"
                         ))
             
-            return expanded_chunks
+            return expanded_chunks, trace_edges
             
         except Exception as e:
             self.logger.warning(f"Graph expansion failed: {e}")
-            return initial_chunks
+            return initial_chunks, trace_edges
     
     async def _rank_and_filter_chunks(
         self, 
@@ -1175,7 +1389,9 @@ class UnifiedSearchPipeline:
         conversation_history: Optional[str]
     ) -> str:
         """
-        Generate answer using retrieved context
+        Generate answer using retrieved context.
+        When explainability is enabled, sources are labeled [1], [2], etc. and the LLM
+        is instructed to cite them inline.
         """
         try:
             # Build context string
@@ -1185,32 +1401,62 @@ class UnifiedSearchPipeline:
             if conversation_history:
                 context_parts.append(f"Conversation History:\n{conversation_history}\n")
             
-            # Add community summaries for high-level context
-            if community_summaries:
-                context_parts.append("Relevant Topic Summaries:")
-                for i, summary in enumerate(community_summaries, 1):
-                    context_parts.append(f"{i}. {summary['summary']}")
-                context_parts.append("")
+            # Check if explainability is enabled to determine labeling format
+            use_citations = cfg.explainability.enabled
             
-            # Add specific document excerpts
+            # Add specific document excerpts with labeled sources for citations
             if chunks:
-                context_parts.append("Relevant Document Excerpts:")
+                context_parts.append("Sources:")
                 for i, chunk in enumerate(chunks, 1):
                     # Truncate very long chunks
                     text = chunk.text[:800] + "..." if len(chunk.text) > 800 else chunk.text
-                    context_parts.append(f"Excerpt {i} (similarity: {chunk.similarity_score:.2f}): {text}")
+                    doc_name = chunk.metadata.get("document_name", "unknown")
+                    
+                    if use_citations:
+                        # Labeled format for citation support
+                        context_parts.append(
+                            f"[{i}] (doc={doc_name}, score={chunk.similarity_score:.2f})\n{text}"
+                        )
+                    else:
+                        # Original format
+                        context_parts.append(
+                            f"Excerpt {i} (similarity: {chunk.similarity_score:.2f}): {text}"
+                        )
+                context_parts.append("")
+            
+            # Add community summaries for high-level context
+            # Note: for citation purposes, we continue numbering after chunks
+            if community_summaries:
+                start_idx = len(chunks) + 1 if use_citations else 1
+                context_parts.append("Topic Summaries:")
+                for i, summary in enumerate(community_summaries):
+                    idx = start_idx + i if use_citations else i + 1
+                    if use_citations:
+                        context_parts.append(f"[{idx}] (community summary)\n{summary['summary']}")
+                    else:
+                        context_parts.append(f"{idx}. {summary['summary']}")
                 context_parts.append("")
             
             context = "\n".join(context_parts)
             
-            # Generate answer
-            system_message = """You are a helpful assistant that answers questions based on provided context. 
-            Follow these guidelines:
-            1. Answer only based on the provided excerpts and summaries
-            2. If the answer is not in the context, say you don't know
-            3. Be specific and cite relevant information
-            4. Keep your answer concise but comprehensive
-            5. If multiple sources provide different information, acknowledge this"""
+            # Generate answer with citation rules when explainability is enabled
+            if use_citations:
+                system_message = """You are a helpful assistant that answers questions based on provided context.
+You MUST follow these rules:
+- Answer ONLY using the provided sources.
+- Every non-trivial claim MUST include one or more citations like [1] or [2][5].
+- Citations must refer to the provided source indices ONLY.
+- If sources do not support the answer, say you don't have enough information.
+- Keep your answer concise but comprehensive.
+- If multiple sources provide different information, acknowledge this and cite each."""
+            else:
+                system_message = """You are a helpful assistant that answers questions based on provided context. 
+Follow these guidelines:
+1. Answer only based on the provided excerpts and summaries
+2. If the answer is not in the context, say you don't know
+3. Be specific and cite relevant information
+4. Keep your answer concise but comprehensive
+5. If multiple sources provide different information, acknowledge this"""
             
             user_message = f"{context}\n\nQuestion: {question}\n\nAnswer:"
             
