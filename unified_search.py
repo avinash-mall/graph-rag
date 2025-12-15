@@ -60,9 +60,33 @@ class SearchScope(Enum):
     HYBRID = "hybrid"  # Combine global and local approaches
 
 @dataclass
+class Citation:
+    """Structured citation for API response - grounded to actual source content"""
+    citation_id: int
+    source_type: str  # "chunk", "community", "cypher_result"
+    source_id: str
+    source_title: str
+    full_text: str  # Complete, untruncated text from database
+    relevance_score: float
+    metadata: Dict[str, Any] = None  # Additional source metadata
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for JSON serialization"""
+        return {
+            "citation_id": self.citation_id,
+            "source_type": self.source_type,
+            "source_id": self.source_id,
+            "source_title": self.source_title,
+            "full_text": self.full_text,
+            "relevance_score": self.relevance_score,
+            "metadata": self.metadata or {}
+        }
+
+@dataclass
 class SearchResult:
     """Structured search result"""
     answer: str
+    citations: List[Citation]  # Structured citations with full content
     relevant_chunks: List[Dict[str, Any]]
     community_summaries: List[Dict[str, Any]]
     entities_found: List[Dict[str, Any]]
@@ -101,13 +125,24 @@ CITATION_REGEX = r"\[(\d+)\]"
 def extract_cited_indices(answer_text: str) -> set:
     """Extract citation indices from LLM answer text.
     
+    Handles various citation formats:
+    - Simple: [1], [2], [10]
+    - Combined: [1,2], [1, 2, 3], [1][2]
+    
     Args:
-        answer_text: The LLM-generated answer containing citations like [1], [2][5]
+        answer_text: The LLM-generated answer containing citations
         
     Returns:
         Set of integer indices that were cited
     """
-    return {int(x) for x in re.findall(CITATION_REGEX, answer_text)}
+    indices = set()
+    # Find all bracketed content that might contain numbers
+    brackets = re.findall(r'\[([\d,\s]+)\]', answer_text)
+    for content in brackets:
+        # Extract all numbers from the bracket content
+        nums = re.findall(r'\d+', content)
+        indices.update(int(n) for n in nums)
+    return indices
 
 
 def sanitize_citations(answer_text: str, max_idx: int) -> str:
@@ -124,6 +159,83 @@ def sanitize_citations(answer_text: str, max_idx: int) -> str:
         idx = int(m.group(1))
         return m.group(0) if 1 <= idx <= max_idx else "[?]"
     return re.sub(CITATION_REGEX, replace_invalid, answer_text)
+
+
+def validate_citations(answer_text: str, max_idx: int) -> Tuple[str, List[str]]:
+    """Validate citations and return warnings for issues.
+    
+    Args:
+        answer_text: The LLM-generated answer
+        max_idx: Maximum valid citation index
+        
+    Returns:
+        Tuple of (sanitized answer, list of warning messages)
+    """
+    warnings = []
+    cited = extract_cited_indices(answer_text)
+    
+    # Check for missing citations
+    if not cited:
+        warnings.append("⚠️ This answer contains no source citations and may include unsupported statements.")
+    
+    # Check for out-of-range citations
+    invalid = [i for i in cited if i < 1 or i > max_idx]
+    if invalid:
+        warnings.append(f"⚠️ Some citations could not be verified: {invalid}")
+    
+    sanitized = sanitize_citations(answer_text, max_idx)
+    return sanitized, warnings
+
+
+def score_to_relevance_label(score: float) -> str:
+    """Convert numeric score to user-friendly relevance label."""
+    if score >= 0.8:
+        return "High relevance"
+    elif score >= 0.6:
+        return "Medium relevance"
+    else:
+        return "Low relevance"
+
+
+def calculate_citation_confidence(answer_text: str, num_sources: int) -> Tuple[float, str]:
+    """Calculate confidence based on citation coverage.
+    
+    Args:
+        answer_text: The LLM-generated answer
+        num_sources: Number of sources provided
+        
+    Returns:
+        Tuple of (coverage ratio, confidence label)
+    """
+    # Split into sentences
+    sentences = re.split(r'[.!?]+', answer_text)
+    sentences = [s.strip() for s in sentences if s.strip() and len(s.strip()) > 10]
+    
+    if not sentences:
+        return 0.0, "Low"
+    
+    # Count sentences with citations
+    cited_sentences = sum(1 for s in sentences if re.search(r'\[\d+\]', s))
+    coverage = cited_sentences / len(sentences)
+    
+    if coverage >= 0.7:
+        return coverage, "High"
+    elif coverage >= 0.4:
+        return coverage, "Medium"
+    else:
+        return coverage, "Low"
+
+
+# Relation name mapping for readable Graph Trace
+RELATION_DISPLAY_MAP = {
+    "RELATES_TO": "is related to",
+    "MENTIONED_IN": "is mentioned in",
+    "CO_OCCURS": "co-occurs with",
+    "PART_OF": "is part of",
+    "HAS": "has",
+    "BELONGS_TO": "belongs to",
+    "CONNECTED_TO": "is connected to"
+}
 
 
 def build_explainability_block(
@@ -145,6 +257,13 @@ def build_explainability_block(
     Returns:
         Markdown-formatted explainability block to append to the answer
     """
+    # Validate citations and get warnings
+    _, warnings = validate_citations(answer_text, len(all_sources))
+    
+    # Calculate citation confidence
+    coverage, confidence_label = calculate_citation_confidence(answer_text, len(all_sources))
+    
+    # Extract cited indices
     cited = extract_cited_indices(answer_text)
     
     # Select sources to show
@@ -154,35 +273,177 @@ def build_explainability_block(
         # Fallback: top K sources by their original order
         picked = [(i+1, src) for i, src in enumerate(all_sources[:explain_cfg.max_sources])]
     
-    # Format references
+    # Format references with improved formatting
     refs_lines = []
     for idx, src in picked:
-        doc = src.metadata.get("document_name") or "unknown"
+        doc = src.metadata.get("document_name") or src.metadata.get("doc_id", "Unknown Document")
         score = src.similarity_score
-        method = src.metadata.get("retrieval_method", "vector_search")
+        relevance = score_to_relevance_label(score)
         snippet = src.text[:explain_cfg.snippet_chars].replace("\n", " ").strip()
-        refs_lines.append(f"[{idx}] {doc} | score={score:.2f} | via={method}\n  \"{snippet}…\"")
+        if len(src.text) > explain_cfg.snippet_chars:
+            snippet += "..."
+        refs_lines.append(f"[{idx}] *{doc}* ({relevance})\n    \"{snippet}\"")
     
-    # Format graph trace (only for picked sources that came from graph expansion)
+    # Format graph trace with readable relations
     trace_lines = []
     picked_ids = {src.chunk_id for _, src in picked}
     for edge in graph_trace_edges:
         if edge.added_chunk_id in picked_ids:
+            # Use friendly relation name if available
+            relation_display = RELATION_DISPLAY_MAP.get(edge.relationship, edge.relationship.lower().replace("_", " "))
             trace_lines.append(
-                f"- Added chunk {edge.added_chunk_id[:8]}... because '{edge.seed_entity}' "
-                f"(in seed {edge.seed_chunk_id[:8]}...) {edge.relationship} '{edge.related_entity}'."
+                f"• **{edge.seed_entity}** {relation_display} **{edge.related_entity}**, "
+                f"which led to source [{next((i for i, s in picked if s.chunk_id == edge.added_chunk_id), '?')}]"
             )
     
-    # Build block
-    block = ["\n\n---\n## Explainability", f"**Confidence:** {confidence_score:.2f}"]
-    block.append("\n### References")
-    block.append("\n".join(refs_lines) if refs_lines else "_No sources available._")
+    # Build block with improved formatting
+    confidence_detail = f"{confidence_label} – {coverage*100:.0f}% of statements are cited" if cited else "Unable to calculate – no citations found"
     
+    block = [
+        "\n\n---",
+        "## Explainability",
+        f"**Confidence:** {confidence_score:.2f} ({confidence_detail})"
+    ]
+    
+    # Add references section
+    block.append("\n### References")
+    if refs_lines:
+        block.append("\n".join(refs_lines))
+    else:
+        block.append("_No sources were cited in this answer._")
+    
+    # Add graph trace section if available
     if trace_lines:
-        block.append("\n### Graph Trace (Neo4j)")
+        block.append("\n### Graph Trace")
         block.append("\n".join(trace_lines))
     
+    # Add warnings if any
+    if warnings:
+        block.append("\n### Warnings")
+        block.append("\n".join(warnings))
+    
     return "\n".join(block)
+
+
+def build_citations_from_chunks(
+    answer_text: str,
+    all_sources: List['RetrievedChunk']
+) -> List[Citation]:
+    """Build structured citations from retrieved chunks.
+    
+    Args:
+        answer_text: LLM answer with [n] citations
+        all_sources: All source chunks in order
+        
+    Returns:
+        List of Citation objects with full content
+    """
+    cited = extract_cited_indices(answer_text)
+    citations = []
+    
+    for idx in sorted(cited):
+        if 1 <= idx <= len(all_sources):
+            src = all_sources[idx - 1]
+            citations.append(Citation(
+                citation_id=idx,
+                source_type="chunk",
+                source_id=src.chunk_id,
+                source_title=src.metadata.get("document_name") or src.metadata.get("doc_id", "Unknown"),
+                full_text=src.text,  # Complete, untruncated
+                relevance_score=src.similarity_score,
+                metadata={
+                    "doc_id": src.doc_id,
+                    "entities": src.entities,
+                    "retrieval_method": src.metadata.get("retrieval_method", "vector_search")
+                }
+            ))
+    
+    return citations
+
+
+def build_citations_from_communities(
+    answer_text: str,
+    community_summaries: List[Dict[str, Any]]
+) -> List[Citation]:
+    """Build structured citations from community summaries.
+    
+    Args:
+        answer_text: LLM answer with [n] citations
+        community_summaries: Community summary dicts from Neo4j
+        
+    Returns:
+        List of Citation objects with full content
+    """
+    cited = extract_cited_indices(answer_text)
+    citations = []
+    
+    # If no citations found in answer, include all communities that were used
+    if not cited and community_summaries:
+        cited = set(range(1, min(len(community_summaries), 10) + 1))
+    
+    for idx in sorted(cited):
+        if 1 <= idx <= len(community_summaries):
+            comm = community_summaries[idx - 1]
+            # Use correct key names: 'community' and 'similarity_score'
+            community_id = comm.get("community") or comm.get("community_id", f"community_{idx}")
+            score = comm.get("similarity_score") or comm.get("score", 0.0)
+            
+            citations.append(Citation(
+                citation_id=idx,
+                source_type="community",
+                source_id=f"community_{community_id}",
+                source_title=f"Community {community_id}",
+                full_text=comm.get("summary", ""),  # Complete summary from DB
+                relevance_score=score,
+                metadata={
+                    "entity_count": comm.get("entity_count", 0),
+                    "level": comm.get("level", 0)
+                }
+            ))
+    
+    return citations
+
+
+def build_citations_from_cypher(
+    query_results: List[Dict[str, Any]],
+    metadata: Dict[str, Any]
+) -> List[Citation]:
+    """Build structured citations from Cypher query results.
+    
+    Args:
+        query_results: Results from Cypher queries
+        metadata: Query metadata with strategies
+        
+    Returns:
+        List of Citation objects
+    """
+    citations = []
+    
+    if not query_results:
+        return citations
+    
+    for idx, result in enumerate(query_results[:20], 1):  # Limit to 20
+        # Build full text from result fields
+        full_text_parts = []
+        for k, v in result.items():
+            if k != "_strategy" and v is not None:
+                full_text_parts.append(f"{k}: {v}")
+        
+        citations.append(Citation(
+            citation_id=idx,
+            source_type="cypher_result",
+            source_id=f"result_{idx}",
+            source_title=result.get("entity", result.get("name", f"Result {idx}")),
+            full_text="\n".join(full_text_parts),
+            relevance_score=0.8,  # Default for Cypher results
+            metadata={
+                "strategy": result.get("_strategy", "cypher_query"),
+                "raw_result": result
+            }
+        ))
+    
+    return citations
+
 
 class UnifiedSearchPipeline:
     """
@@ -327,14 +588,22 @@ class UnifiedSearchPipeline:
             
             # Apply explainability for Cypher queries
             if cfg.explainability.enabled:
-                explain_block = ["\n\n---\n## Explainability", f"**Confidence:** {confidence_score:.2f}"]
+                # Calculate citation confidence for the answer
+                coverage, confidence_label = calculate_citation_confidence(answer, len(query_results) if query_results else 0)
+                confidence_detail = f"{confidence_label} – {coverage*100:.0f}% of statements are cited" if coverage > 0 else "Graph query results"
+                
+                explain_block = [
+                    "\n\n---",
+                    "## Explainability",
+                    f"**Confidence:** {confidence_score:.2f} ({confidence_detail})"
+                ]
                 
                 # Show extracted terms and fuzzy matches
                 extracted_terms = metadata.get("extracted_terms", [])
                 fuzzy_matches = metadata.get("fuzzy_matches", {})
                 
                 if extracted_terms:
-                    explain_block.append(f"\n### Terms Extracted")
+                    explain_block.append("\n### Terms Extracted")
                     explain_block.append(f"From your question: **{', '.join(extracted_terms)}**")
                 
                 if fuzzy_matches:
@@ -343,7 +612,7 @@ class UnifiedSearchPipeline:
                         if matches:
                             fuzzy_info.append(f"'{term}' → '{matches[0]}'")
                     if fuzzy_info:
-                        explain_block.append(f"\n### Fuzzy Entity Matching")
+                        explain_block.append("\n### Fuzzy Entity Matching")
                         explain_block.append(", ".join(fuzzy_info))
                 
                 # Show query strategies tried
@@ -355,7 +624,7 @@ class UnifiedSearchPipeline:
                         count = qs.get("result_count", 0)
                         explain_block.append(f"{status} **{qs['type']}**: {qs['description']} ({count} results)")
                 
-                # Show final query
+                # Show final query with improved formatting
                 final_query = metadata.get("final_query", "")
                 if final_query:
                     query_display = final_query[:300] + "..." if len(final_query) > 300 else final_query
@@ -363,7 +632,7 @@ class UnifiedSearchPipeline:
                 
                 explain_block.append(f"\n**Total Results:** {len(query_results) if query_results else 0}")
                 
-                # Show sample of results
+                # Show sample of results with improved formatting
                 if query_results and len(query_results) > 0:
                     explain_block.append("\n### Sample Results")
                     for i, result in enumerate(query_results[:5], 1):
@@ -376,8 +645,12 @@ class UnifiedSearchPipeline:
             end_time = asyncio.get_event_loop().time()
             search_time = end_time - start_time
             
+            # Build structured citations from Cypher results
+            citations = build_citations_from_cypher(query_results, metadata)
+            
             return SearchResult(
                 answer=answer,
+                citations=citations,
                 relevant_chunks=[],  # No chunks for Cypher queries
                 community_summaries=[],
                 entities_found=entities_found[:20],  # Limit entities
@@ -454,26 +727,35 @@ class UnifiedSearchPipeline:
             else:
                 confidence_score = 0.3
             
-            # Apply explainability for broad search (simplified - no graph trace for communities)
+            # Apply explainability for broad search (simplified - detail in citations array)
             if cfg.explainability.enabled and community_summaries:
-                # Build a simplified references block for community summaries
-                explain_block = ["\n\n---\n## Explainability", f"**Confidence:** {confidence_score:.2f}"]
-                explain_block.append("\n### Community Sources")
+                # Get top scores for display
+                top_scores = sorted(
+                    [cs.get("similarity_score", 0.0) for cs in community_summaries[:8]],
+                    reverse=True
+                )[:3]
+                avg_score = sum(top_scores) / len(top_scores) if top_scores else 0.0
                 
-                max_to_show = min(cfg.explainability.max_sources, len(community_summaries))
-                for i, cs in enumerate(community_summaries[:max_to_show], 1):
-                    community_id = cs.get("community", "unknown")
-                    score = cs.get("similarity_score", 0.0)
-                    snippet = cs.get("summary", "")[:cfg.explainability.snippet_chars].replace("\n", " ").strip()
-                    explain_block.append(f"[{i}] Community {community_id} | score={score:.2f}\n  \"{snippet}…\"")
+                explain_block = [
+                    "\n\n---",
+                    "## Explainability",
+                    f"**Confidence:** {confidence_score:.2f}",
+                    f"\n**Sources:** {len(community_summaries)} community summaries analyzed",
+                    f"**Top relevance scores:** {', '.join(f'{s:.2f}' for s in top_scores)}",
+                    "\n_See `citations` array in response for full source content._"
+                ]
                 
                 answer += "\n".join(explain_block)
             
             end_time = asyncio.get_event_loop().time()
             search_time = end_time - start_time
             
+            # Build structured citations from community summaries
+            citations = build_citations_from_communities(answer, community_summaries)
+            
             return SearchResult(
                 answer=answer,
+                citations=citations,
                 relevant_chunks=[],  # No chunks for broad search
                 community_summaries=community_summaries,
                 entities_found=entities_found,
@@ -493,6 +775,7 @@ class UnifiedSearchPipeline:
             end_time = asyncio.get_event_loop().time()
             return SearchResult(
                 answer=f"I encountered an error while processing your broad question: {str(e)}",
+                citations=[],
                 relevant_chunks=[],
                 community_summaries=[],
                 entities_found=[],
@@ -571,8 +854,12 @@ class UnifiedSearchPipeline:
             end_time = asyncio.get_event_loop().time()
             search_time = end_time - start_time
             
+            # Build structured citations from chunks
+            citations = build_citations_from_chunks(answer, final_chunks)
+            
             return SearchResult(
                 answer=answer,
+                citations=citations,
                 relevant_chunks=[chunk.__dict__ for chunk in final_chunks],
                 community_summaries=community_summaries,
                 entities_found=await self._extract_entities_from_chunks(final_chunks),
@@ -594,6 +881,7 @@ class UnifiedSearchPipeline:
             end_time = asyncio.get_event_loop().time()
             return SearchResult(
                 answer=f"I encountered an error while searching: {str(e)}",
+                citations=[],
                 relevant_chunks=[],
                 community_summaries=[],
                 entities_found=[],

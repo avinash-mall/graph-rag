@@ -53,8 +53,19 @@ class SearchRequest(BaseModel):
     scope: Optional[str] = Field("hybrid", description="Search scope: global, local, or hybrid")
     max_chunks: Optional[int] = Field(MAX_CHUNKS_PER_ANSWER, description="Maximum number of chunks to use in answer")
 
+class CitationResponse(BaseModel):
+    """Structured citation in API response"""
+    citation_id: int
+    source_type: str
+    source_id: str
+    source_title: str
+    full_text: str
+    relevance_score: float
+    metadata: dict = {}
+
 class SearchResponse(BaseModel):
     answer: str
+    citations: List[CitationResponse] = []  # Structured citations with full content
     confidence_score: float
     chunks_used: int
     entities_found: List[str]
@@ -163,8 +174,12 @@ async def unified_search(request: SearchRequest):
         # Log search for analytics
         await _log_search_analytics(request, result, normalized_doc_id)
         
+        # Serialize citations
+        citations = [c.to_dict() for c in result.citations] if result.citations else []
+        
         return SearchResponse(
             answer=result.answer,
+            citations=citations,
             confidence_score=result.confidence_score,
             chunks_used=len(result.relevant_chunks),
             entities_found=entity_names,
