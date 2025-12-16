@@ -88,26 +88,11 @@ class GraphManager:
         if self._vector_indexes_created:
             return
         
-        # Use provided dimension, or try to detect from database, or fall back to env variable
+        # Always use dimension from .env configuration - no fallback or detection
         if embedding_dim is None:
             embedding_dim = EMBEDDING_DIMENSION
         
         try:
-            # Try to get actual embedding dimension from existing chunks
-            try:
-                dim_query = """
-                MATCH (c:Chunk)
-                WHERE c.embedding IS NOT NULL
-                RETURN size(c.embedding) AS dim
-                LIMIT 1
-                """
-                dim_result = await run_cypher_query_async(self.driver, dim_query)
-                if dim_result and dim_result[0].get("dim"):
-                    embedding_dim = dim_result[0]["dim"]
-                    self.logger.info(f"Detected embedding dimension: {embedding_dim}")
-            except Exception as dim_e:
-                self.logger.debug(f"Could not detect embedding dimension, using configured value {embedding_dim}: {dim_e}")
-            
             # Create vector index for Chunk embeddings
             chunk_index_query = f"""
             CREATE VECTOR INDEX chunk_embedding_index IF NOT EXISTS
@@ -212,12 +197,19 @@ class GraphManager:
         valid_chunks = valid_chunks_filtered
         valid_metadata = valid_metadata_filtered
         
-        # Ensure vector indexes exist (after we have embeddings to detect dimension)
+        # Ensure vector indexes exist (use configured dimension from .env)
         if chunk_embeddings and len(chunk_embeddings) > 0:
-            embedding_dim = len(chunk_embeddings[0])
-            if embedding_dim == 0:
+            actual_dim = len(chunk_embeddings[0])
+            if actual_dim == 0:
                 raise ValueError("Embedding dimension is 0 - embeddings are empty")
-            await self._ensure_vector_indexes(embedding_dim)
+            # Validate that actual embeddings match configured dimension
+            if actual_dim != EMBEDDING_DIMENSION:
+                raise ValueError(
+                    f"Embedding dimension mismatch: actual={actual_dim}, "
+                    f"configured={EMBEDDING_DIMENSION}. "
+                    f"Update EMBEDDING_DIMENSION in .env to match your embedding model."
+                )
+            await self._ensure_vector_indexes(EMBEDDING_DIMENSION)
         
         # Step 2: Extract entities from all chunks using LLM-based processing
         all_entities_data = []

@@ -49,6 +49,7 @@ MAX_CHUNKS_PER_ANSWER = cfg.search.max_chunks_per_answer
 MAX_COMMUNITY_SUMMARIES = cfg.search.max_community_summaries
 SIMILARITY_THRESHOLD_CHUNKS = cfg.search.similarity_threshold_chunks
 SIMILARITY_THRESHOLD_ENTITIES = cfg.search.similarity_threshold_entities
+EMBEDDING_DIMENSION = cfg.embedding.dimension
 
 # Setup logging using centralized logging config
 logger = get_logger("UnifiedSearch")
@@ -347,7 +348,7 @@ def build_citations_from_chunks(
             citations.append(Citation(
                 citation_id=idx,
                 source_type="chunk",
-                source_id=src.chunk_id,
+                source_id=str(src.chunk_id),  # Ensure source_id is always a string
                 source_title=src.metadata.get("document_name") or src.metadata.get("doc_id", "Unknown"),
                 full_text=src.text,  # Complete, untruncated
                 relevance_score=src.similarity_score,
@@ -1609,8 +1610,17 @@ class UnifiedSearchPipeline:
                 return scored_summaries[:max_summaries]
                 
             except Exception as e:
-                # Fallback to cosine similarity if vector index doesn't exist
-                self.logger.warning(f"Vector index search for community summaries failed, using fallback: {e}")
+                # Fallback to cosine similarity if vector index doesn't exist or other error
+                error_str = str(e).lower()
+                if "dimension" in error_str:
+                    self.logger.warning(
+                        f"Vector dimension mismatch detected (query: {len(question_embedding)} dims, "
+                        f"expected: {EMBEDDING_DIMENSION} dims). "
+                        f"Community summaries may have been created with a different embedding model. "
+                        f"Using fallback method: {e}"
+                    )
+                else:
+                    self.logger.warning(f"Vector index search for community summaries failed, using fallback: {e}")
                 return await self._get_relevant_community_summaries_fallback(question, doc_id, max_summaries)
             
         except Exception as e:
@@ -1649,11 +1659,24 @@ class UnifiedSearchPipeline:
             
             # Calculate similarity scores
             question_embedding = await embedding_client.get_embedding(question)
+            query_dim = len(question_embedding)
+            expected_dim = EMBEDDING_DIMENSION
             scored_summaries = []
             
             for result in results:
                 if result.get("embedding"):
-                    similarity = cosine_similarity(question_embedding, result["embedding"])
+                    stored_embedding = result["embedding"]
+                    stored_dim = len(stored_embedding) if stored_embedding else 0
+                    
+                    # Skip if dimensions don't match the configured dimension
+                    if stored_dim != expected_dim or query_dim != expected_dim:
+                        self.logger.debug(
+                            f"Skipping community summary {result.get('community')} due to dimension mismatch "
+                            f"(query: {query_dim}, stored: {stored_dim}, expected: {expected_dim})"
+                        )
+                        continue
+                    
+                    similarity = cosine_similarity(question_embedding, stored_embedding)
                     if similarity >= RELEVANCE_THRESHOLD:
                         scored_summaries.append({
                             "community": result["community"],
