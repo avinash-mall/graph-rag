@@ -306,12 +306,8 @@ def build_explainability_block(
         f"**Confidence:** {confidence_score:.2f} ({confidence_detail})"
     ]
     
-    # Add references section
-    block.append("\n### References")
-    if refs_lines:
-        block.append("\n".join(refs_lines))
-    else:
-        block.append("_No sources were cited in this answer._")
+    # Note: Full reference details are available in the citations array in the JSON response
+    # Only show summary information here, not the full reference text
     
     # Add graph trace section if available
     if trace_lines:
@@ -1017,8 +1013,26 @@ class UnifiedSearchPipeline:
             return filtered_results[:top_k]
             
         except Exception as e:
-            # Fallback to GDS similarity if vector index doesn't exist
-            logger.warning(f"Vector index search failed, falling back to GDS similarity: {e}")
+            # Check if error is due to dimension mismatch
+            error_str = str(e).lower()
+            is_dimension_mismatch = "dimension" in error_str and (
+                "1536" in error_str or "768" in error_str or 
+                str(EMBEDDING_DIMENSION) in error_str
+            )
+            
+            if is_dimension_mismatch:
+                self.logger.warning(
+                    f"Vector index dimension mismatch detected. "
+                    f"Query embeddings have {len(question_embedding)} dimensions, but indexed vectors have a different dimension. "
+                    f"Configured dimension in .env: {EMBEDDING_DIMENSION}. "
+                    f"To fix: Either recreate vector indexes with dimension {EMBEDDING_DIMENSION}, "
+                    f"or update EMBEDDING_DIMENSION in .env to match existing indexes. "
+                    f"Using fallback method (GDS similarity)."
+                )
+            else:
+                # Fallback to GDS similarity if vector index doesn't exist or other error
+                self.logger.warning(f"Vector index search failed, falling back to GDS similarity: {e}")
+            
             return await self._run_vector_similarity_search_fallback(question_embedding, doc_id, top_k)
     
     async def _run_vector_similarity_search_fallback(
@@ -1610,17 +1624,26 @@ class UnifiedSearchPipeline:
                 return scored_summaries[:max_summaries]
                 
             except Exception as e:
-                # Fallback to cosine similarity if vector index doesn't exist or other error
+                # Check if error is due to dimension mismatch
                 error_str = str(e).lower()
-                if "dimension" in error_str:
+                is_dimension_mismatch = "dimension" in error_str and (
+                    "1536" in error_str or "768" in error_str or 
+                    str(EMBEDDING_DIMENSION) in error_str
+                )
+                
+                if is_dimension_mismatch:
                     self.logger.warning(
-                        f"Vector dimension mismatch detected (query: {len(question_embedding)} dims, "
-                        f"expected: {EMBEDDING_DIMENSION} dims). "
-                        f"Community summaries may have been created with a different embedding model. "
-                        f"Using fallback method: {e}"
+                        f"Vector index dimension mismatch for community summaries. "
+                        f"Query embeddings have {len(question_embedding)} dimensions, but indexed vectors have a different dimension. "
+                        f"Configured dimension in .env: {EMBEDDING_DIMENSION}. "
+                        f"To fix: Either recreate community summaries with dimension {EMBEDDING_DIMENSION}, "
+                        f"or update EMBEDDING_DIMENSION in .env to match existing summaries. "
+                        f"Using fallback method."
                     )
                 else:
+                    # Fallback to cosine similarity if vector index doesn't exist or other error
                     self.logger.warning(f"Vector index search for community summaries failed, using fallback: {e}")
+                
                 return await self._get_relevant_community_summaries_fallback(question, doc_id, max_summaries)
             
         except Exception as e:
