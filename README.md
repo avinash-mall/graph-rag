@@ -7,7 +7,7 @@ Graph RAG (Graph Retrieval-Augmented Generation) is a production-ready FastAPI a
 ### Core Features
 
 - **LLM-based NLP Processing** - Uses configurable LLM models (e.g., Gemini, OpenAI-compatible) for efficient entity extraction and coreference resolution
-- **Intelligent Question Classification** - MCP-based routing that classifies questions as BROAD, CHUNK, or OUT_OF_SCOPE for optimal search strategy
+- **Intelligent Question Classification** - MCP-based routing that classifies questions as BROAD, CHUNK, GRAPH_ANALYTICAL, or OUT_OF_SCOPE for optimal search strategy
 - **Map-Reduce for Broad Questions** - Processes community summaries using map-reduce pattern for comprehensive overview answers
 - **Batch Embedding Optimization** - 10x speed improvement through intelligent batching and caching
 - **Unified Search Pipeline** - Single, flexible endpoint with intelligent routing based on question type
@@ -19,6 +19,8 @@ Graph RAG (Graph Retrieval-Augmented Generation) is a production-ready FastAPI a
 - **Production-Ready Architecture** - Centralized configuration, resilience patterns, and structured logging
 - **Resilience Patterns** - Circuit breakers and automatic retries for all external service calls
 - **Structured Logging** - Consistent, context-rich logging across all modules for better observability
+- **Graph Analytical Queries** - MCP Neo4j Cypher integration for complex graph queries and multi-hop reasoning
+- **Explainability** - Inline citations and source references with full text content for transparency
 
 ## Table of Contents
 
@@ -55,9 +57,13 @@ Graph RAG (Graph Retrieval-Augmented Generation) is a production-ready FastAPI a
 │  │ NLP Processor│  │ Embedding    │  │ LLM Client   │      │
 │  │ (LLM-based)  │  │ Client       │  │              │      │
 │  └──────────────┘  └──────────────┘  └──────────────┘      │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐      │
+│  │ Text         │  │ Graph        │  │ MCP Neo4j    │      │
+│  │ Processor    │  │ Manager      │  │ Cypher Client│      │
+│  └──────────────┘  └──────────────┘  └──────────────┘      │
 │  ┌──────────────┐  ┌──────────────┐                        │
-│  │ Text         │  │ Graph        │                        │
-│  │ Processor    │  │ Manager      │                        │
+│  │ Question     │  │ Map-Reduce   │                        │
+│  │ Classifier   │  │ Processor    │                        │
 │  └──────────────┘  └──────────────┘                        │
 └─────────┬──────────────────┬───────────────────────────────┘
           │                  │
@@ -69,6 +75,9 @@ Graph RAG (Graph Retrieval-Augmented Generation) is a production-ready FastAPI a
 │  │  (with       │  │  (with       │  │  (with       │      │
 │  │  vectors)    │  │  vectors)    │  │  summaries)  │      │
 │  └──────────────┘  └──────────────┘  └──────────────┘      │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │  Relationships: MENTIONED_IN, RELATES_TO, CO_OCCURS│   │
+│  └──────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -131,17 +140,36 @@ Graph RAG (Graph Retrieval-Augmented Generation) is a production-ready FastAPI a
    - MCP-based classification (optional)
    - Heuristic-based classification (fast fallback)
    - LLM-based classification (accurate)
-   - Routes questions to appropriate search strategies
+   - Routes questions to appropriate search strategies (BROAD/CHUNK/GRAPH_ANALYTICAL/OUT_OF_SCOPE)
    - Uses centralized config, resilience, and structured logging
 
-8. **Map-Reduce Processing** (`map_reduce.py`)
+8. **MCP Neo4j Cypher Client** (`mcp_neo4j_cypher.py`)
+
+   - **Graph schema retrieval**: Gets Neo4j schema (labels, relationships, properties) via MCP or direct query
+   - **Term extraction**: Extracts key terms from natural language questions
+   - **Fuzzy entity matching**: Finds entities matching search terms using fuzzy matching (CONTAINS, toLower)
+   - **Multi-strategy query generation**: Generates 5 different Cypher query strategies:
+     - Fuzzy entity search
+     - Relationship exploration
+     - Path finding (1-3 hops)
+     - Related entities via RELATES_TO
+     - Chunk context retrieval
+   - **Parallel query execution**: Executes all strategies in parallel for maximum coverage
+   - **LLM-based query generation**: Fallback to LLM-generated queries when structured queries fail
+   - **Iterative query refinement**: Refines queries based on execution feedback (up to 3 iterations)
+   - **Result combination**: Combines and deduplicates results from multiple queries
+   - **Answer formatting**: Uses LLM to format graph query results into natural language
+   - **Explainability integration**: Provides detailed query strategy and result information
+   - Uses centralized config, resilience, and structured logging
+
+9. **Map-Reduce Processing** (`map_reduce.py`)
 
    - Map step: Extract relevant info from community summaries
    - Reduce step: Synthesize partial answers into comprehensive response
    - Optimized for broad/overview questions
    - Uses resilience patterns for LLM calls
 
-9. **Utilities** (`utils.py`)
+10. **Utilities** (`utils.py`)
 
    - LLM-based NLP processing (NER, coreference resolution)
    - Batch embedding client with caching (TTL-based)
@@ -252,7 +280,7 @@ graph LR
 
 ## Search Pipeline
 
-The unified search pipeline provides intelligent, context-aware answers by combining question classification, intelligent routing, vector search, graph traversal, and advanced reranking.
+The unified search pipeline provides intelligent, context-aware answers by combining question classification, intelligent routing, vector search, graph traversal, Cypher queries, and advanced reranking. The system automatically routes questions to the most appropriate search strategy based on question type.
 
 ### Search Flow
 
@@ -262,6 +290,7 @@ graph TD
     B --> C{Question Type?}
     C -->|BROAD| D[Map-Reduce with Communities]
     C -->|CHUNK| E[Chunk-Level Vector Search]
+    C -->|GRAPH_ANALYTICAL| CY[Cypher Query Processing]
     C -->|OUT_OF_SCOPE| F[Return Polite Fallback]
   
     D --> D1[Retrieve Community Summaries]
@@ -300,9 +329,30 @@ graph TD
     Z --> AA[Calculate Confidence Score]
     AA --> X[Return Response]
   
+    CY --> CY1[Extract Key Terms from Question]
+    CY1 --> CY2[Find Fuzzy Entity Matches]
+    CY2 --> CY3[Get Neo4j Graph Schema]
+    CY3 --> CY4[Generate Multiple Query Strategies]
+    CY4 --> CY5[Execute All Queries in Parallel]
+    CY5 --> CY6{Results Found?}
+    CY6 -->|Yes| CY7[Combine & Deduplicate Results]
+    CY6 -->|No| CY8[Try LLM-Generated Query]
+    CY8 --> CY7
+    CY7 --> CY9[Format Answer with LLM]
+    CY9 --> CY10[Add Explainability Block]
+    CY10 --> X
+  
     style A fill:#e1f5ff
     style B fill:#fff9c4
     style D fill:#f3e5f5
+    style CY fill:#ffeb3b
+    style CY1 fill:#ffeb3b
+    style CY2 fill:#ffeb3b
+    style CY3 fill:#ffeb3b
+    style CY4 fill:#ffeb3b
+    style CY5 fill:#ffeb3b
+    style CY7 fill:#ffeb3b
+    style CY9 fill:#ffeb3b
     style Z fill:#fff9c4
     style X fill:#c8e6c9
     style W fill:#f3e5f5
@@ -315,21 +365,24 @@ graph TD
 The system uses intelligent question classification to route queries to the optimal search strategy:
 
 - **MCP-based Classification** (if enabled): Uses Model Context Protocol server for consistent, accurate classification
-- **Heuristic Classification**: Fast keyword-based fallback
-- **LLM Classification**: Direct LLM-based classification for accuracy
+- **Heuristic Classification**: Fast keyword-based fallback using pattern matching
+- **LLM Classification**: Direct LLM-based classification for accuracy when MCP unavailable
 
 **Question Types:**
 
-- **BROAD**: Questions requiring overview/understanding → Uses map-reduce with community summaries
-- **CHUNK**: Questions requiring specific details → Uses chunk-level vector similarity search
+- **BROAD**: Questions requiring overview/understanding (e.g., "What are the main topics?") → Uses map-reduce with community summaries
+- **CHUNK**: Questions requiring specific details (e.g., "What is the deadline?") → Uses chunk-level vector similarity search
+- **GRAPH_ANALYTICAL**: Questions requiring graph analysis, aggregations, or multi-hop reasoning (e.g., "How are X and Y related?", "Count all entities", "Find paths between entities") → Uses MCP Neo4j Cypher queries with multi-strategy approach
 - **OUT_OF_SCOPE**: Questions not answerable from knowledge base → Returns polite fallback
 
 #### 2. Map-Reduce for Broad Questions
 
 For BROAD questions, the system uses a map-reduce pattern:
 
-- **Map Step**: Extract relevant information from each community summary
-- **Reduce Step**: Synthesize partial answers into a comprehensive final answer
+- **Map Step**: Extract relevant information from each community summary using LLM
+- **Reduce Step**: Synthesize partial answers into a comprehensive final answer using LLM
+- **Batch Processing**: Processes multiple community summaries in parallel batches
+- **Relevance Filtering**: Only includes summaries above minimum relevance threshold
 
 #### 3. Query Preprocessing
 
@@ -343,9 +396,10 @@ else:
 
 #### 4. Vector Similarity Search
 
-- **Native Neo4j Vector Index**: Uses `db.index.vector.queryNodes()` for fast search
+- **Native Neo4j Vector Index**: Uses `db.index.vector.queryNodes()` for fast search (Neo4j 5.11+)
 - **Fallback to GDS**: Uses `gds.similarity.cosine()` if vector indexes unavailable
 - **Threshold Filtering**: Configurable similarity threshold (default 0.4)
+- **Multi-Index Support**: Separate indexes for Chunks, Entities, and CommunitySummaries
 
 #### 5. Graph-Based Context Expansion
 
@@ -375,11 +429,180 @@ graph LR
 - **Formula**: `MMR(doc) = λ × relevance(doc, query) - (1-λ) × max_sim(doc, selected)`
 - **Lambda Parameter**: Default 0.7 (favors relevance over diversity)
 
-#### 7. Answer Generation
+#### 7. Cypher Query Processing (GRAPH_ANALYTICAL Questions)
 
-- **Context Building**: Combines community summaries and relevant chunks
+For GRAPH_ANALYTICAL questions, the system uses a sophisticated multi-strategy Cypher query approach via the MCP Neo4j Cypher client. This enables complex graph analysis, aggregations, path finding, and relationship exploration that goes beyond simple vector similarity search.
+
+**Process Flow:**
+
+1. **Term Extraction**: Extracts key terms from the natural language question
+2. **Fuzzy Entity Matching**: Finds entities in the graph that match extracted terms using fuzzy matching (CONTAINS, toLower)
+3. **Schema Retrieval**: Gets the Neo4j graph schema (node labels, relationship types, properties) via MCP or direct query
+4. **Multi-Strategy Query Generation**: Generates 5 different query strategies:
+   - **Fuzzy Search**: Find entities matching search terms
+   - **Relationship Exploration**: Find connections between matched entities
+   - **Path Finding**: Find paths connecting entities (1-3 hops)
+   - **Related Entities**: Find entities related via RELATES_TO relationships
+   - **Chunk Context**: Find document chunks mentioning the entities
+5. **Parallel Execution**: Executes all query strategies in parallel
+6. **Result Combination**: Combines and deduplicates results from all successful queries
+7. **LLM Fallback**: If no results, generates a custom Cypher query using LLM with schema context
+8. **Answer Formatting**: Uses LLM to format query results into natural language answers
+9. **Explainability**: Adds detailed explainability block showing:
+   - Extracted terms and fuzzy matches
+   - Query strategies attempted and their results
+   - Best query used
+   - Sample results
+
+**Query Patterns Used:**
+
+```cypher
+# Fuzzy entity search
+MATCH (e:Entity)
+WHERE toLower(e.name) CONTAINS toLower('term')
+RETURN e.name, e.type LIMIT 10
+
+# Relationship exploration
+MATCH (e1:Entity)-[r]-(e2:Entity)
+WHERE toLower(e1.name) CONTAINS toLower('term1')
+  AND toLower(e2.name) CONTAINS toLower('term2')
+RETURN e1.name, type(r), e2.name LIMIT 20
+
+# Path finding
+MATCH path = (e1:Entity)-[*1..3]-(e2:Entity)
+WHERE toLower(e1.name) CONTAINS toLower('term1')
+  AND toLower(e2.name) CONTAINS toLower('term2')
+RETURN path LIMIT 10
+
+# Related entities
+MATCH (e1:Entity)-[:RELATES_TO]-(related:Entity)
+WHERE toLower(e1.name) CONTAINS toLower('term')
+RETURN e1.name, related.name, related.type LIMIT 20
+```
+
+**Key Features:**
+- **Fuzzy Matching**: Handles spelling variations and partial matches
+- **Iterative Refinement**: Can refine queries based on execution feedback (up to 3 iterations)
+- **Multi-Strategy Approach**: Tries multiple query patterns to maximize result coverage
+- **MCP Integration**: Uses MCP Neo4j Cypher server for query execution (with direct Neo4j fallback)
+- **Comprehensive Answers**: Combines results from multiple strategies into coherent answers
+
+#### 8. Answer Generation
+
+- **Context Building**: Combines community summaries and relevant chunks (for BROAD/CHUNK questions)
+- **Cypher Results Formatting**: Formats graph query results into natural language using LLM (for GRAPH_ANALYTICAL questions)
 - **LLM Prompting**: Structured prompts with context and conversation history
-- **Confidence Scoring**: Based on chunk similarity, summary availability, and quality
+- **Confidence Scoring**: Based on chunk similarity, summary availability, query results, and quality
+- **Explainability**: Adds inline citations and source references when enabled
+  - For Cypher queries: Shows extracted terms, fuzzy matches, query strategies, and sample results
+  - For chunk-based queries: Shows source chunks with full text and relevance scores
+
+---
+
+### Cypher Query Processing Details
+
+The Cypher query processing system (`mcp_neo4j_cypher.py`) provides a comprehensive solution for answering graph analytical questions. When a question is classified as GRAPH_ANALYTICAL, the system uses a multi-strategy approach to generate and execute Cypher queries.
+
+#### Query Strategy Types
+
+The system generates 5 different query strategies to maximize result coverage:
+
+1. **Fuzzy Entity Search**
+   - Finds entities matching search terms using fuzzy matching (CONTAINS, toLower)
+   - Handles spelling variations and partial matches
+   - Returns entity names and types
+
+2. **Relationship Exploration**
+   - Finds direct relationships between matched entities
+   - Explores MENTIONED_IN, RELATES_TO, and CO_OCCURS relationships
+   - Returns relationship types and connected entities
+
+3. **Path Finding**
+   - Finds paths connecting entities (1-3 hops)
+   - Uses variable-length path matching: `(e1)-[*1..3]-(e2)`
+   - Returns path nodes and path length
+
+4. **Related Entities**
+   - Finds entities related via RELATES_TO relationships
+   - Explores entity neighborhoods
+   - Returns related entity names and types
+
+5. **Chunk Context**
+   - Finds document chunks mentioning the entities
+   - Provides textual context for graph relationships
+   - Returns chunk text and document names
+
+#### Query Execution Flow
+
+```mermaid
+graph TD
+    A[Natural Language Question] --> B[Extract Key Terms]
+    B --> C[Fuzzy Entity Matching]
+    C --> D[Get Graph Schema]
+    D --> E[Generate 5 Query Strategies]
+    E --> F[Execute All Queries in Parallel]
+    F --> G{Any Results?}
+    G -->|Yes| H[Combine & Deduplicate]
+    G -->|No| I[LLM-Generated Query]
+    I --> J[Execute LLM Query]
+    J --> K{Results?}
+    K -->|Yes| H
+    K -->|No| L[Format No-Results Answer]
+    H --> M[Format Comprehensive Answer]
+    M --> N[Add Explainability Block]
+    N --> O[Return Response]
+    L --> O
+    
+    style A fill:#e1f5ff
+    style C fill:#fff9c4
+    style E fill:#f3e5f5
+    style F fill:#ffeb3b
+    style M fill:#c8e6c9
+    style N fill:#c8e6c9
+```
+
+#### Example Cypher Queries Generated
+
+**Example 1: Entity Search**
+```cypher
+MATCH (e:Entity)
+WHERE toLower(e.name) CONTAINS toLower('machine learning')
+RETURN e.name AS entity, e.type AS type
+LIMIT 10
+```
+
+**Example 2: Relationship Exploration**
+```cypher
+MATCH (e1:Entity)-[r]-(e2:Entity)
+WHERE toLower(e1.name) CONTAINS toLower('neural network')
+  AND toLower(e2.name) CONTAINS toLower('deep learning')
+RETURN e1.name AS from_entity, type(r) AS relationship, e2.name AS to_entity
+LIMIT 20
+```
+
+**Example 3: Path Finding**
+```cypher
+MATCH (e1:Entity), (e2:Entity)
+WHERE toLower(e1.name) CONTAINS toLower('AI')
+  AND toLower(e2.name) CONTAINS toLower('robotics')
+MATCH path = (e1)-[*1..3]-(e2)
+RETURN [n IN nodes(path) | CASE WHEN 'Entity' IN labels(n) THEN n.name ELSE 'chunk' END] AS path_nodes,
+       length(path) AS path_length
+LIMIT 10
+```
+
+#### Explainability for Cypher Queries
+
+When explainability is enabled (`EXPLAIN_ENABLED=true`), Cypher query responses include a detailed explainability block showing:
+
+- **Extracted Terms**: Key terms identified from the question
+- **Fuzzy Matches**: How search terms were matched to entities (e.g., "AI" → "Artificial Intelligence")
+- **Query Strategies**: All 5 strategies attempted with success/failure status (✓/✗) and result counts
+- **Best Query**: The most successful Cypher query used (formatted in code block)
+- **Sample Results**: First 5 results from the queries (truncated to snippet length)
+- **Total Results**: Count of all results found across all strategies
+
+This provides full transparency into how graph queries are processed and what data was retrieved, enabling users to understand and trust the answers provided.
 
 ---
 
@@ -574,6 +797,26 @@ MAP_REDUCE_BATCH_SIZE="5"
 MAP_REDUCE_MIN_RELEVANCE="0.3"
 ```
 
+#### MCP Neo4j Configuration
+
+```bash
+# Enable MCP Neo4j Cypher server for graph analytical queries
+USE_MCP_NEO4J="true"
+MCP_NEO4J_URL="http://localhost:8002/mcp"
+MCP_NEO4J_TIMEOUT="30"
+MCP_NEO4J_MAX_REFINEMENT_ITERATIONS="3"
+```
+
+#### Explainability Configuration
+
+```bash
+# Enable inline citations and source references
+EXPLAIN_ENABLED="true"
+EXPLAIN_MAX_SOURCES="8"
+EXPLAIN_SNIPPET_CHARS="320"
+EXPLAIN_ONLY_CITED_SOURCES="true"
+```
+
 #### Resilience Configuration
 
 ```bash
@@ -719,13 +962,24 @@ Content-Type: application/json
 
 - **BROAD questions**: Map-reduce processing with community summaries
 - **CHUNK questions**: Chunk-level vector similarity search
+- **GRAPH_ANALYTICAL questions**: MCP Neo4j Cypher queries for graph analysis and multi-hop reasoning
 - **OUT_OF_SCOPE questions**: Polite fallback response
 
-**Response:**
+**Response (BROAD/CHUNK questions):**
 
 ```json
 {
   "answer": "Detailed answer based on context...",
+  "citations": [
+    {
+      "citation_id": 1,
+      "source_type": "chunk",
+      "source_id": "chunk_123",
+      "source_title": "Document: example.pdf",
+      "full_text": "Complete chunk text...",
+      "relevance_score": 0.85
+    }
+  ],
   "confidence_score": 0.85,
   "chunks_used": 7,
   "entities_found": ["Entity1", "Entity2"],
@@ -733,7 +987,49 @@ Content-Type: application/json
   "metadata": {
     "scope": "hybrid",
     "community_summaries_used": 2,
-    "chunks_retrieved": 14
+    "chunks_retrieved": 14,
+    "question_type": "CHUNK"
+  }
+}
+```
+
+**Response (GRAPH_ANALYTICAL questions):**
+
+```json
+{
+  "answer": "Based on the graph analysis, Entity1 and Entity2 are connected via RELATES_TO relationship...",
+  "citations": [
+    {
+      "citation_id": 1,
+      "source_type": "cypher_result",
+      "source_id": "query_1",
+      "source_title": "Fuzzy Search Strategy",
+      "full_text": "entity1: Entity1, entity2: Entity2, relationship: RELATES_TO",
+      "relevance_score": 0.8
+    }
+  ],
+  "confidence_score": 0.8,
+  "chunks_used": 0,
+  "entities_found": ["Entity1", "Entity2"],
+  "search_time": 3.45,
+  "metadata": {
+    "question_type": "GRAPH_ANALYTICAL",
+    "strategy": "multi_cypher_query",
+    "iterations": 5,
+    "results_count": 12,
+    "extracted_terms": ["entity1", "entity2"],
+    "fuzzy_matches": {
+      "entity1": ["Entity1"],
+      "entity2": ["Entity2"]
+    },
+    "query_strategies": [
+      {"type": "fuzzy_search", "results": 5},
+      {"type": "relationship_exploration", "results": 3},
+      {"type": "path_finding", "results": 2},
+      {"type": "related_entities", "results": 2}
+    ],
+    "final_query": "MATCH (e1:Entity)-[r]-(e2:Entity) WHERE...",
+    "explainability_enabled": true
   }
 }
 ```
@@ -815,7 +1111,7 @@ GET /redoc  # ReDoc
 
 #### Search Capabilities
 
-- ✅ **Intelligent Question Classification** - MCP-based or heuristic/LLM routing
+- ✅ **Intelligent Question Classification** - MCP-based or heuristic/LLM routing (BROAD/CHUNK/GRAPH_ANALYTICAL/OUT_OF_SCOPE)
 - ✅ **Map-Reduce for Broad Questions** - Comprehensive processing of community summaries
 - ✅ **Unified Search Pipeline** - Single endpoint with intelligent routing
 - ✅ **Vector Similarity Search** - Native Neo4j and GDS fallback
@@ -824,6 +1120,8 @@ GET /redoc  # ReDoc
 - ✅ **MMR Diversity Reranking** - Balanced relevance and diversity
 - ✅ **Community Summary Integration** - Automatic topic summaries
 - ✅ **Conversation History Support** - Context-aware query rewriting
+- ✅ **Graph Analytical Queries** - MCP Neo4j Cypher integration for complex graph queries
+- ✅ **Explainability** - Inline citations and source references with full text content
 
 #### Community Detection
 
@@ -951,7 +1249,8 @@ pytest test_system.py::TestUnifiedSearchPipeline -v
 - ✅ **Database Operations** - Neo4j connectivity, queries
 - ✅ **Error Handling** - Edge cases, invalid inputs
 - ✅ **Performance** - Batch vs individual processing
-- ✅ **Question Classification** - Accuracy testing for BROAD/CHUNK/OUT_OF_SCOPE classification
+- ✅ **Question Classification** - Accuracy testing for BROAD/CHUNK/GRAPH_ANALYTICAL/OUT_OF_SCOPE classification
+- ✅ **Cypher Query Processing** - Multi-strategy query generation, fuzzy matching, and result formatting
 - ✅ **Map-Reduce Processing** - Aggregation accuracy and partial failure handling
 - ✅ **Classification Routing** - Integration tests for question classification and routing
 
@@ -978,6 +1277,8 @@ pytest test_system.py::TestUnifiedSearchPipeline -v
 - **Search Response Time**: 1-3 seconds average (varies by question type and classification method)
 - **Embedding Generation**: Batch of 10 in ~0.5 seconds (cached)
 - **Question Classification**: < 0.5 seconds (MCP or heuristic), 1-2 seconds (direct LLM)
+- **Cypher Query Processing**: 2-5 seconds (includes term extraction, fuzzy matching, multi-strategy execution, and answer formatting)
+- **Cypher Query Processing**: 2-5 seconds (includes term extraction, fuzzy matching, multi-strategy execution, and answer formatting)
 
 ---
 
@@ -998,6 +1299,7 @@ graph-rag/
 ├── map_reduce.py           # Map-reduce processing for broad questions
 ├── mcp_classifier_client.py # MCP classifier client
 ├── mcp_classifier_server.py # MCP classifier server
+├── mcp_neo4j_cypher.py     # MCP Neo4j Cypher client for graph analytical queries
 ├── utils.py                # NLP, embeddings, utilities
 ├── test_system.py          # Comprehensive test suite
 ├── requirements.txt        # Python dependencies
@@ -1013,6 +1315,7 @@ graph-rag/
 - `config.py`: Centralized configuration loading, validation, and documentation
 - `resilience.py`: Circuit breakers and retry logic for external service calls
 - `logging_config.py`: Standardized structured logging with context fields
+- `mcp_neo4j_cypher.py`: MCP Neo4j Cypher client for graph analytical queries and iterative query refinement
 
 All modules now use these infrastructure components for consistency and reliability.
 
@@ -1121,6 +1424,7 @@ See LICENSE file for details.
 
 ## Version History
 
+- **v2.2.0** - Graph analytical queries: MCP Neo4j Cypher integration with multi-strategy query generation, fuzzy entity matching, iterative refinement, and comprehensive explainability. Added GRAPH_ANALYTICAL question type for complex graph queries, aggregations, and multi-hop reasoning.
 - **v2.1.0** - Production-ready resilience patterns: centralized configuration (`config.py`), circuit breakers and automatic retries (`resilience.py`), structured logging (`logging_config.py`). All external service calls now use resilience patterns to handle transient failures gracefully without user-facing errors.
 - **v2.0.0** - Unified search pipeline with intelligent question classification, map-reduce for broad questions, MCP classifier integration, graph-aware reranking, MMR diversity, cross-document entity merging
 - **v1.0.0** - Initial release with basic document processing and search

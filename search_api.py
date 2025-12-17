@@ -106,14 +106,16 @@ async def unified_search(request: SearchRequest):
     This endpoint provides intelligent, context-aware search results by:
     
     1. **Question Classification (via MCP)**: Uses MCP (Model Context Protocol) server to classify
-       questions into three types:
+       questions into four types:
        - **BROAD**: Questions requiring overview/understanding → Uses map-reduce with community summaries
        - **CHUNK**: Questions requiring specific details → Uses chunk-level vector similarity search
+       - **GRAPH_ANALYTICAL**: Questions requiring graph analysis, aggregations, or multi-hop reasoning → Uses MCP Neo4j Cypher queries
        - **OUT_OF_SCOPE**: Questions not answerable from knowledge base → Returns polite fallback
     
     2. **Intelligent Routing**: Based on classification, routes to appropriate search strategy:
        - Broad questions: Map-reduce processing across multiple community summaries
        - Specific questions: Vector similarity search with graph-based context expansion
+       - Graph analytical questions: MCP Neo4j Cypher queries with iterative refinement
     
     3. **Advanced Retrieval**:
        - Native Neo4j vector index search for fast similarity matching

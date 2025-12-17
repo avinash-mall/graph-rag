@@ -84,7 +84,20 @@ class GraphManager:
         self._vector_indexes_created = False
     
     async def _ensure_vector_indexes(self, embedding_dim: Optional[int] = None):
-        """Create vector indexes for embeddings if they don't exist"""
+        """
+        Create vector indexes for embeddings if they don't exist.
+        
+        Creates native Neo4j vector indexes for:
+        - Chunk embeddings (chunk_embedding_index)
+        - Entity embeddings (entity_embedding_index)
+        - CommunitySummary embeddings (community_summary_embedding_index)
+        
+        Args:
+            embedding_dim: Embedding dimension (uses configured dimension if not provided)
+        
+        Note:
+            Falls back gracefully if vector indexes are not supported (Neo4j < 5.11)
+        """
         if self._vector_indexes_created:
             return
         
@@ -150,7 +163,25 @@ class GraphManager:
         metadata_list: List[Dict[str, Any]]
     ) -> Dict[str, Any]:
         """
-        Build graph efficiently using batch processing and LLM-based NER
+        Build graph efficiently using batch processing and LLM-based NER.
+        
+        Processing steps:
+        1. Batch generate embeddings for all chunks
+        2. Extract entities from chunks using LLM-based NER
+        3. Batch generate embeddings for unique entities
+        4. Store chunks and entities in Neo4j with relationships
+        5. Create cross-document entity relationships (RELATES_TO)
+        
+        Args:
+            chunks: List of text chunks to process
+            metadata_list: List of metadata dictionaries (one per chunk)
+        
+        Returns:
+            Dictionary with chunks_created, entities_created, processing_time, and doc_id
+        
+        Note:
+            Entities with the same name are merged across documents to enable
+            cross-document connections and relationship traversal.
         """
         start_time = asyncio.get_event_loop().time()
         
@@ -373,8 +404,17 @@ class GraphManager:
         return {"chunks_created": chunks_created, "entities_created": entities_created}
     
     async def _create_entity_relationships(self):
-        """Create RELATES_TO relationships between entities that co-occur in chunks
-        Now works across all documents - entities with same name are merged"""
+        """
+        Create RELATES_TO relationships between entities that co-occur in chunks.
+        
+        Creates bidirectional relationships between entities that appear together
+        in the same chunks. The weight of the relationship is based on the number
+        of chunks where both entities co-occur.
+        
+        Note:
+            Works across all documents since entities with the same name are merged.
+            This enables cross-document relationship traversal during search.
+        """
         
         # Create cross-document RELATES_TO relationships
         # Entities are now merged by name, so relationships connect entities across documents
@@ -453,8 +493,23 @@ class GraphManager:
             return {"communities_created": 0, "error": str(e)}
     
     async def _detect_communities_leiden(self, doc_id: str) -> Dict[str, List[str]]:
-        """Detect communities using Leiden algorithm from Neo4j GDS
-        Now works with merged entities - filters chunks by doc_id but uses cross-document entities"""
+        """
+        Detect communities using Leiden algorithm from Neo4j GDS.
+        
+        Uses the Leiden community detection algorithm to identify groups of
+        related entities based on their co-occurrence patterns. Creates a temporary
+        graph projection for GDS processing.
+        
+        Args:
+            doc_id: Document ID to filter chunks (but uses merged entities across documents)
+        
+        Returns:
+            Dictionary mapping community IDs to lists of entity names
+        
+        Note:
+            Works with merged entities across documents - filters chunks by doc_id
+            but uses cross-document entities for community detection.
+        """
         try:
             graph_name = f"entity-graph-{doc_id.replace('-', '_')}"  # GDS graph names can't have hyphens
             

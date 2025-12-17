@@ -22,7 +22,15 @@ logger = logging.getLogger("Config")
 
 @dataclass
 class DatabaseConfig:
-    """Database configuration settings"""
+    """
+    Database configuration settings for Neo4j connection.
+    
+    Attributes:
+        url: Neo4j connection URL (e.g., "bolt://localhost:7687" or "bolt://neo4j:7687" for Docker)
+        username: Neo4j username
+        password: Neo4j password
+        graph_name: Name of the graph projection (default: "entityGraph")
+    """
     url: str
     username: str
     password: str
@@ -48,7 +56,18 @@ class DatabaseConfig:
 
 @dataclass
 class LLMConfig:
-    """LLM configuration settings"""
+    """
+    LLM configuration settings for answer generation and general LLM tasks.
+    
+    Attributes:
+        provider: LLM provider ("google", "openai", "ollama")
+        api_key: API key for LLM service (optional for some providers)
+        model: Model name (e.g., "gemini-2.5-flash", "gpt-4", "llama3.2")
+        base_url: Base URL for LLM API endpoint
+        temperature: Sampling temperature (0.0 for deterministic, higher for creativity)
+        timeout: Request timeout in seconds
+        stop: Optional list of stop sequences
+    """
     provider: str  # "google", "openai", "ollama"
     api_key: Optional[str]
     model: str
@@ -212,7 +231,15 @@ class MCPClassifierConfig:
 
 @dataclass
 class MCPNeo4jConfig:
-    """MCP Neo4j Cypher server configuration"""
+    """
+    MCP Neo4j Cypher server configuration for graph analytical queries.
+    
+    Attributes:
+        enabled: Whether to use MCP Neo4j Cypher server for GRAPH_ANALYTICAL questions
+        url: MCP Neo4j Cypher server URL (default: "http://localhost:8002/mcp")
+        timeout: Request timeout in seconds
+        max_refinement_iterations: Maximum number of query refinement iterations
+    """
     enabled: bool
     url: str
     timeout: int
@@ -344,7 +371,15 @@ class SearchConfig:
 
 @dataclass
 class ExplainabilityConfig:
-    """Explainability configuration for LLM responses with inline citations and references"""
+    """
+    Explainability configuration for LLM responses with inline citations and references.
+    
+    Attributes:
+        enabled: Feature flag to enable/disable explainability (inline citations)
+        max_sources: Maximum sources to show in references block
+        snippet_chars: Maximum characters per snippet in references
+        only_cited_sources: Only show sources actually cited by the LLM (vs all retrieved sources)
+    """
     enabled: bool                    # Feature flag to enable/disable explainability
     max_sources: int                 # Maximum sources to show in references block
     snippet_chars: int               # Maximum characters per snippet in references

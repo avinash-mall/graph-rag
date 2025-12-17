@@ -222,12 +222,15 @@ async def root():
         "version": APP_VERSION,
         "status": "healthy",
         "features": [
-            "Efficient spaCy-based NLP processing",
+            "LLM-based NLP processing (NER and coreference resolution)",
             "Batch embedding optimization", 
-            "Unified search pipeline",
-            "Vector similarity search",
+            "Unified search pipeline with intelligent routing",
+            "Vector similarity search with native Neo4j indexes",
             "Graph-based context expansion",
-            "Community detection and summarization"
+            "Community detection and summarization",
+            "MCP-based question classification",
+            "Graph analytical queries via MCP Neo4j Cypher",
+            "Explainability with inline citations"
         ],
         "endpoints": {
             "documents": "/api/documents",
@@ -258,7 +261,7 @@ async def health_check():
         with driver.session() as session:
             session.run("RETURN 1")
         
-        # Check NLP processor (LLM-based, not spaCy)
+        # Check NLP processor (LLM-based)
         from utils import nlp_processor
         nlp_status = "loaded" if nlp_processor else "not_loaded"
         
@@ -297,21 +300,31 @@ async def api_info():
             "document_processing": {
                 "supported_formats": ["PDF", "DOCX", "TXT"],
                 "features": [
-                    "Efficient spaCy NER",
-                    "Batch embedding processing",
-                    "Advanced text chunking",
+                    "LLM-based NER (configurable models)",
+                    "LLM-based coreference resolution",
+                    "Batch embedding processing with caching",
+                    "Advanced text chunking with sentence awareness",
+                    "Cross-document entity merging",
                     "Entity relationship extraction",
-                    "Community detection"
+                    "Community detection (Leiden algorithm)",
+                    "Automatic community summarization"
                 ]
             },
             "search": {
-                "methods": ["Vector similarity", "Graph traversal", "Hybrid"],
+                "methods": ["Vector similarity", "Graph traversal", "Hybrid", "Map-reduce", "Cypher queries"],
                 "features": [
+                    "Intelligent question classification (BROAD/CHUNK/GRAPH_ANALYTICAL/OUT_OF_SCOPE)",
+                    "MCP-based classification routing",
                     "Conversation history support",
                     "Document-specific search",
+                    "Graph analytical queries via MCP Neo4j Cypher",
+                    "Map-reduce for broad questions",
                     "Confidence scoring",
                     "Context filtering",
-                    "Entity-based expansion"
+                    "Entity-based expansion",
+                    "Graph-aware reranking",
+                    "MMR diversity reranking",
+                    "Explainability with citations"
                 ]
             }
         }

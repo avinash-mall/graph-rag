@@ -135,7 +135,20 @@ class EfficientNLPProcessor:
     
     async def extract_entities(self, text: str) -> List[Entity]:
         """
-        Extract entities using LLM-based NER with gemma3:1b model
+        Extract entities using LLM-based NER with configurable model.
+        
+        Uses LLM to extract named entities from text. Supports 18+ entity types
+        including PERSON, ORGANIZATION, LOCATION, CONCEPT, etc.
+        
+        Args:
+            text: Input text to extract entities from
+        
+        Returns:
+            List of Entity objects with name, type, confidence, and position
+        
+        Note:
+            All LLM calls are wrapped with circuit breakers and retries for resilience.
+            Uses centralized NER configuration from config.py.
         """
         if not text or not isinstance(text, str) or not text.strip():
             return []

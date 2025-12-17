@@ -62,7 +62,18 @@ class SearchScope(Enum):
 
 @dataclass
 class Citation:
-    """Structured citation for API response - grounded to actual source content"""
+    """
+    Structured citation for API response - grounded to actual source content.
+    
+    Attributes:
+        citation_id: Unique identifier for the citation (used in inline references)
+        source_type: Type of source ("chunk", "community", "cypher_result")
+        source_id: Unique identifier of the source (chunk ID, community ID, etc.)
+        source_title: Human-readable title for the source
+        full_text: Complete, untruncated text from database (for explainability)
+        relevance_score: Relevance score (0.0 to 1.0)
+        metadata: Additional source metadata (doc_id, entities, etc.)
+    """
     citation_id: int
     source_type: str  # "chunk", "community", "cypher_result"
     source_id: str
@@ -85,7 +96,18 @@ class Citation:
 
 @dataclass
 class SearchResult:
-    """Structured search result"""
+    """
+    Structured search result with answer, citations, and metadata.
+    
+    Attributes:
+        answer: Generated answer text (may include inline citations if explainability enabled)
+        citations: List of structured citations with full source content
+        relevant_chunks: List of relevant chunks used in answer generation
+        community_summaries: List of community summaries used (for BROAD questions)
+        entities_found: List of entities found in the search context
+        confidence_score: Confidence score (0.0 to 1.0) based on retrieval quality
+        search_metadata: Additional metadata (search_time, chunks_retrieved, question_type, etc.)
+    """
     answer: str
     citations: List[Citation]  # Structured citations with full content
     relevant_chunks: List[Dict[str, Any]]

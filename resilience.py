@@ -48,7 +48,16 @@ class CircuitBreaker:
     Circuit breaker implementation for external service calls.
     
     Prevents cascading failures by stopping requests to failing services
-    and allowing them to recover.
+    and allowing them to recover. Implements three states:
+    - CLOSED: Normal operation, requests pass through
+    - OPEN: Service is failing, requests are rejected immediately
+    - HALF_OPEN: Testing if service has recovered, allows limited requests
+    
+    Args:
+        failure_threshold: Number of failures before opening circuit
+        success_threshold: Number of successes needed to close circuit
+        timeout: Seconds before transitioning from OPEN to HALF_OPEN
+        name: Name identifier for this circuit breaker
     """
     
     def __init__(
@@ -99,7 +108,15 @@ class CircuitBreaker:
             raise
     
     async def _update_state(self):
-        """Update circuit breaker state based on current conditions"""
+        """
+        Update circuit breaker state based on current conditions.
+        
+        State transitions:
+        - CLOSED → OPEN: When failures >= failure_threshold
+        - OPEN → HALF_OPEN: After timeout period
+        - HALF_OPEN → CLOSED: When successes >= success_threshold
+        - HALF_OPEN → OPEN: When a failure occurs during testing
+        """
         now = datetime.now()
         
         if self.stats.state == CircuitState.OPEN:

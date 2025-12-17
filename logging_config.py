@@ -27,6 +27,12 @@ class StructuredFormatter(logging.Formatter):
     Structured log formatter that adds consistent context fields.
     
     Formats logs as JSON in production, or human-readable in development.
+    Automatically includes context fields like request_id and operation name
+    from context variables for request tracking and correlation.
+    
+    Args:
+        use_json: If True, format logs as JSON (recommended for production)
+        include_context: If True, include request_id and operation from context variables
     """
     
     def __init__(self, use_json: bool = False, include_context: bool = True):
@@ -35,7 +41,18 @@ class StructuredFormatter(logging.Formatter):
         self.include_context = include_context
     
     def format(self, record: logging.LogRecord) -> str:
-        """Format log record with structured fields"""
+        """
+        Format log record with structured fields.
+        
+        Includes:
+        - Standard fields: timestamp, level, logger, message
+        - Context fields: request_id, operation (if available)
+        - Exception info: If exception occurred
+        - Extra fields: Any additional fields from extra= parameter
+        
+        Returns:
+            Formatted log string (JSON or human-readable)
+        """
         # Extract standard fields
         log_data = {
             "timestamp": datetime.now(timezone.utc).isoformat(),

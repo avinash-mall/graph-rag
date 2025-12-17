@@ -59,7 +59,13 @@ class QuestionClassifier:
     Classifies questions to determine the best retrieval strategy:
     - BROAD: Use community summaries with map-reduce
     - CHUNK: Use chunk-level similarity search
+    - GRAPH_ANALYTICAL: Use MCP Neo4j Cypher queries for graph analysis
     - OUT_OF_SCOPE: Polite fallback
+    
+    Classification methods (in order of preference):
+    1. MCP-based classification (if enabled)
+    2. Heuristic classification (fast keyword-based fallback)
+    3. LLM-based classification (accurate but slower)
     """
     
     def __init__(self):
@@ -78,11 +84,20 @@ class QuestionClassifier:
         """
         Classify a question into one of the question types.
         
+        Tries classification methods in order:
+        1. MCP-based classification (if enabled)
+        2. Heuristic classification (if enabled)
+        3. LLM-based classification (if enabled)
+        
         Args:
             question: User's question
-            
+        
         Returns:
-            ClassificationResult with type, reason, and confidence
+            ClassificationResult with type (BROAD/CHUNK/GRAPH_ANALYTICAL/OUT_OF_SCOPE),
+            reason, and confidence score
+        
+        Note:
+            All LLM calls are wrapped with circuit breakers and retries for resilience.
         """
         if not question or not question.strip():
             return {
