@@ -829,17 +829,26 @@ class BatchEmbeddingClient:
     
     async def _fetch_batch_embeddings_openai(self, texts: List[str]) -> List[List[float]]:
         """Fetch embeddings for a batch of texts using OpenAI/Ollama compatible API"""
-        # OpenAI/Ollama API format for embeddings
-        payload = {
-            "model": self.model_name,
-            "input": texts
-        }
+        # Prepare payload - send as array for batch, string for single
+        if len(texts) == 1:
+            # Single text - some APIs prefer string format
+            payload = {
+                "model": self.model_name,
+                "input": texts[0]
+            }
+        else:
+            # Multiple texts - send as array (OpenAI format)
+            payload = {
+                "model": self.model_name,
+                "input": texts
+            }
         
-        # Prepare headers for OpenAI/Ollama API
+        # Prepare headers - only include Authorization if API key is provided
         headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.embedding_api_key}"
+            "Content-Type": "application/json"
         }
+        if self.embedding_api_key and self.embedding_api_key.strip():
+            headers["Authorization"] = f"Bearer {self.embedding_api_key}"
         
         # Ensure OpenAI/Ollama URL ends with /embeddings
         api_url = self.embedding_api_url.rstrip('/')
@@ -855,16 +864,42 @@ class BatchEmbeddingClient:
             response.raise_for_status()
             
             data = response.json()
-            embeddings_data = data.get("data", [])
             
-            # Extract the actual embedding values
+            # Handle different response formats:
+            # OpenAI format: {"data": [{"embedding": [...], "index": 0, "object": "embedding"}, ...]}
+            # Some APIs may return: {"embedding": [...]} for single requests
             embeddings = []
-            for emb_data in embeddings_data:
-                embedding = emb_data.get("embedding", [])
-                embeddings.append(embedding)
             
+            if "data" in data:
+                # OpenAI format - array of embedding objects
+                embeddings_data = data.get("data", [])
+                for emb_data in embeddings_data:
+                    if isinstance(emb_data, dict):
+                        embedding = emb_data.get("embedding", [])
+                    else:
+                        # Fallback if data is already an array of arrays
+                        embedding = emb_data
+                    embeddings.append(embedding)
+            elif isinstance(data, list):
+                # Direct array format
+                for emb_data in data:
+                    if isinstance(emb_data, dict):
+                        embedding = emb_data.get("embedding", [])
+                    else:
+                        embedding = emb_data
+                    embeddings.append(embedding)
+            elif isinstance(data, dict) and "embedding" in data:
+                # Single embedding object (for single text requests)
+                embeddings.append(data.get("embedding", []))
+            else:
+                raise ValueError(f"Unexpected embedding response format. Keys: {list(data.keys()) if isinstance(data, dict) else 'not a dict'}")
+            
+            # Validate we got the right number of embeddings
             if len(embeddings) != len(texts):
-                raise ValueError(f"Invalid embedding response: expected {len(texts)}, got {len(embeddings)}")
+                raise ValueError(
+                    f"Invalid embedding response: expected {len(texts)} embeddings, got {len(embeddings)}. "
+                    f"Response structure: {list(data.keys()) if isinstance(data, dict) else type(data)}"
+                )
             
             return embeddings
     
