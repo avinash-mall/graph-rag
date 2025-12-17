@@ -260,6 +260,19 @@ class GraphManager:
         entity_names = [entity.name for entity in unique_entities.values()]
         entity_embeddings = await embedding_client.get_embeddings(entity_names) if entity_names else []
         
+        # Create mapping from entity name (lowercase) to embedding for efficient lookup
+        entity_embedding_map = {}
+        for entity, embedding in zip(unique_entities.values(), entity_embeddings):
+            if embedding and len(embedding) > 0:
+                entity_embedding_map[entity.name.lower()] = embedding
+            else:
+                self.logger.warning(f"Empty embedding for entity '{entity.name}', will skip vector storage")
+        
+        self.logger.info(
+            f"Generated embeddings for {len(entity_embedding_map)} unique entities "
+            f"(out of {len(unique_entities)} total)"
+        )
+        
         # Step 4: Store chunks and entities in Neo4j
         chunks_created = 0
         entities_created = 0
@@ -274,7 +287,7 @@ class GraphManager:
                 batch_entities = all_entities_data[i:i + batch_size]
                 
                 result = await self._process_chunk_batch(
-                    batch_chunks, batch_metadata, batch_embeddings, batch_entities, i
+                    batch_chunks, batch_metadata, batch_embeddings, batch_entities, i, entity_embedding_map
                 )
                 chunks_created += result["chunks_created"]
                 entities_created += result["entities_created"]
@@ -309,9 +322,20 @@ class GraphManager:
         metadata_list: List[Dict[str, Any]],
         embeddings: List[List[float]],
         entities_list: List[List[Any]],
-        start_index: int
+        start_index: int,
+        entity_embedding_map: Dict[str, List[float]]
     ) -> Dict[str, int]:
-        """Process a batch of chunks efficiently"""
+        """
+        Process a batch of chunks efficiently.
+        
+        Args:
+            chunks: List of text chunks
+            metadata_list: List of metadata dictionaries
+            embeddings: List of chunk embeddings
+            entities_list: List of entity lists (one per chunk)
+            start_index: Starting index for chunk IDs
+            entity_embedding_map: Dictionary mapping entity name (lowercase) to embedding
+        """
         
         chunks_created = 0
         entities_created = 0
@@ -351,12 +375,22 @@ class GraphManager:
                 entity_name = entity.name.lower()
                 entity_type = entity.type
                 
-                # Get entity embedding
-                try:
-                    entity_embedding = await embedding_client.get_embedding(entity.name)
-                except Exception as e:
-                    self.logger.warning(f"Failed to get embedding for entity {entity.name}: {e}")
-                    entity_embedding = []
+                # Get entity embedding from pre-generated map (batch processing optimization)
+                entity_embedding = entity_embedding_map.get(entity_name, [])
+                
+                # If embedding not found in map (shouldn't happen, but handle gracefully)
+                if not entity_embedding or len(entity_embedding) == 0:
+                    self.logger.warning(
+                        f"Entity '{entity.name}' not found in embedding map, "
+                        f"attempting to generate embedding individually"
+                    )
+                    try:
+                        entity_embedding = await embedding_client.get_embedding(entity.name)
+                        # Cache it for potential future use in this batch
+                        entity_embedding_map[entity_name] = entity_embedding
+                    except Exception as e:
+                        self.logger.warning(f"Failed to get embedding for entity {entity.name}: {e}")
+                        entity_embedding = []
                 
                 # Create/update entity node - merge by name only to enable cross-document connections
                 # Track which documents the entity appears in using a documents property

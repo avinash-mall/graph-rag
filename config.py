@@ -239,11 +239,37 @@ class MCPNeo4jConfig:
         url: MCP Neo4j Cypher server URL (default: "http://localhost:8002/mcp")
         timeout: Request timeout in seconds
         max_refinement_iterations: Maximum number of query refinement iterations
+        entity_search_max_terms: Maximum number of search terms to process for entity matching
+        entity_vector_search_top_k: Default top_k for vector similarity search
+        entity_vector_search_candidate_multiplier: Multiplier for getting more candidates before filtering
+        entity_text_match_limit: Maximum results for text-based entity matching fallback
+        entity_result_format_limit: Maximum results to include when formatting answers
+        entity_simple_format_threshold: Threshold for using simple formatting (number of results)
+        schema_sample_limit: Maximum sample relationships to show in schema
+        query_fuzzy_search_limit: Maximum results for fuzzy search query strategy
+        query_relationship_exploration_limit: Maximum results for relationship exploration query strategy
+        query_path_finding_limit: Maximum results for path finding query strategy
+        query_related_entities_limit: Maximum results for related entities query strategy
+        query_chunk_context_limit: Maximum results for chunk context query strategy
+        query_max_terms_for_conditions: Maximum number of terms to use in query WHERE conditions
     """
     enabled: bool
     url: str
     timeout: int
     max_refinement_iterations: int
+    entity_search_max_terms: int
+    entity_vector_search_top_k: int
+    entity_vector_search_candidate_multiplier: int
+    entity_text_match_limit: int
+    entity_result_format_limit: int
+    entity_simple_format_threshold: int
+    schema_sample_limit: int
+    query_fuzzy_search_limit: int
+    query_relationship_exploration_limit: int
+    query_path_finding_limit: int
+    query_related_entities_limit: int
+    query_chunk_context_limit: int
+    query_max_terms_for_conditions: int
     
     @classmethod
     def from_env(cls) -> "MCPNeo4jConfig":
@@ -252,12 +278,38 @@ class MCPNeo4jConfig:
         url = os.getenv("MCP_NEO4J_URL", "http://localhost:8002/mcp")
         timeout = int(os.getenv("MCP_NEO4J_TIMEOUT", "30"))
         max_refinement_iterations = int(os.getenv("MCP_NEO4J_MAX_REFINEMENT_ITERATIONS", "3"))
+        entity_search_max_terms = int(os.getenv("MCP_NEO4J_ENTITY_SEARCH_MAX_TERMS", "5"))
+        entity_vector_search_top_k = int(os.getenv("MCP_NEO4J_ENTITY_VECTOR_SEARCH_TOP_K", "10"))
+        entity_vector_search_candidate_multiplier = int(os.getenv("MCP_NEO4J_ENTITY_VECTOR_SEARCH_CANDIDATE_MULTIPLIER", "2"))
+        entity_text_match_limit = int(os.getenv("MCP_NEO4J_ENTITY_TEXT_MATCH_LIMIT", "5"))
+        entity_result_format_limit = int(os.getenv("MCP_NEO4J_ENTITY_RESULT_FORMAT_LIMIT", "15"))
+        entity_simple_format_threshold = int(os.getenv("MCP_NEO4J_ENTITY_SIMPLE_FORMAT_THRESHOLD", "10"))
+        schema_sample_limit = int(os.getenv("MCP_NEO4J_SCHEMA_SAMPLE_LIMIT", "20"))
+        query_fuzzy_search_limit = int(os.getenv("MCP_NEO4J_QUERY_FUZZY_SEARCH_LIMIT", "10"))
+        query_relationship_exploration_limit = int(os.getenv("MCP_NEO4J_QUERY_RELATIONSHIP_EXPLORATION_LIMIT", "15"))
+        query_path_finding_limit = int(os.getenv("MCP_NEO4J_QUERY_PATH_FINDING_LIMIT", "10"))
+        query_related_entities_limit = int(os.getenv("MCP_NEO4J_QUERY_RELATED_ENTITIES_LIMIT", "20"))
+        query_chunk_context_limit = int(os.getenv("MCP_NEO4J_QUERY_CHUNK_CONTEXT_LIMIT", "5"))
+        query_max_terms_for_conditions = int(os.getenv("MCP_NEO4J_QUERY_MAX_TERMS_FOR_CONDITIONS", "3"))
         
         return cls(
             enabled=enabled,
             url=url,
             timeout=timeout,
-            max_refinement_iterations=max_refinement_iterations
+            max_refinement_iterations=max_refinement_iterations,
+            entity_search_max_terms=entity_search_max_terms,
+            entity_vector_search_top_k=entity_vector_search_top_k,
+            entity_vector_search_candidate_multiplier=entity_vector_search_candidate_multiplier,
+            entity_text_match_limit=entity_text_match_limit,
+            entity_result_format_limit=entity_result_format_limit,
+            entity_simple_format_threshold=entity_simple_format_threshold,
+            schema_sample_limit=schema_sample_limit,
+            query_fuzzy_search_limit=query_fuzzy_search_limit,
+            query_relationship_exploration_limit=query_relationship_exploration_limit,
+            query_path_finding_limit=query_path_finding_limit,
+            query_related_entities_limit=query_related_entities_limit,
+            query_chunk_context_limit=query_chunk_context_limit,
+            query_max_terms_for_conditions=query_max_terms_for_conditions
         )
 
 

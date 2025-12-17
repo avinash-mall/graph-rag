@@ -9,7 +9,8 @@ Graph RAG (Graph Retrieval-Augmented Generation) is a production-ready FastAPI a
 - **LLM-based NLP Processing** - Uses configurable LLM models (e.g., Gemini, OpenAI-compatible) for efficient entity extraction and coreference resolution
 - **Intelligent Question Classification** - MCP-based routing that classifies questions as BROAD, CHUNK, GRAPH_ANALYTICAL, or OUT_OF_SCOPE for optimal search strategy
 - **Map-Reduce for Broad Questions** - Processes community summaries using map-reduce pattern for comprehensive overview answers
-- **Batch Embedding Optimization** - 10x speed improvement through intelligent batching and caching
+- **Batch Embedding Optimization** - 10x speed improvement through intelligent batching and caching for chunks, entities, and search terms
+- **Embedding-Based Entity Matching** - Vector similarity search for fuzzy entity matching in Cypher queries with high similarity thresholds
 - **Unified Search Pipeline** - Single, flexible endpoint with intelligent routing based on question type
 - **Vector Similarity Search** - Native Neo4j vector indexes for fast semantic search
 - **Graph-Based Context Expansion** - Entity relationship traversal for comprehensive answers
@@ -147,7 +148,7 @@ Graph RAG (Graph Retrieval-Augmented Generation) is a production-ready FastAPI a
 
    - **Graph schema retrieval**: Gets Neo4j schema (labels, relationships, properties) via MCP or direct query
    - **Term extraction**: Extracts key terms from natural language questions
-   - **Fuzzy entity matching**: Finds entities matching search terms using fuzzy matching (CONTAINS, toLower)
+   - **Embedding-based fuzzy entity matching**: Finds entities matching search terms using vector similarity search with embeddings (high similarity threshold), with text-based fallback
    - **Multi-strategy query generation**: Generates 5 different Cypher query strategies:
      - Fuzzy entity search
      - Relationship exploration
@@ -244,6 +245,7 @@ graph TD
 - **Entity Types**: Supports 18+ entity types (PERSON, ORGANIZATION, LOCATION, etc.)
 - **Cross-Document Merging**: Entities with same name are merged across documents
 - **Batch Processing**: Processes multiple chunks efficiently
+- **Entity Embeddings**: Batch-generated embeddings for all unique entities, stored in database for vector similarity search
 
 #### 4. Graph Construction
 
@@ -330,17 +332,28 @@ graph TD
     AA --> X[Return Response]
   
     CY --> CY1[Extract Key Terms from Question]
-    CY1 --> CY2[Find Fuzzy Entity Matches]
-    CY2 --> CY3[Get Neo4j Graph Schema]
+    CY1 --> CY2[Generate Term Embeddings]
+    CY2 --> CY3[Vector Search Entities]
+    CY3 --> CY4{High Similarity Matches?}
+    CY4 -->|Yes| CY5[Use Vector Matches]
+    CY4 -->|No| CY6[Fallback to Text Matching]
+    CY6 --> CY5
+    CY5 --> CY7[Get Neo4j Graph Schema]
     CY3 --> CY4[Generate Multiple Query Strategies]
     CY4 --> CY5[Execute All Queries in Parallel]
     CY5 --> CY6{Results Found?}
     CY6 -->|Yes| CY7[Combine & Deduplicate Results]
     CY6 -->|No| CY8[Try LLM-Generated Query]
     CY8 --> CY7
-    CY7 --> CY9[Format Answer with LLM]
-    CY9 --> CY10[Add Explainability Block]
-    CY10 --> X
+    CY7 --> CY8[Generate Multiple Query Strategies]
+    CY8 --> CY9[Execute All Queries in Parallel]
+    CY9 --> CY10{Results Found?}
+    CY10 -->|Yes| CY11[Combine & Deduplicate Results]
+    CY10 -->|No| CY12[Try LLM-Generated Query]
+    CY12 --> CY11
+    CY11 --> CY13[Format Answer with LLM]
+    CY13 --> CY14[Add Explainability Block]
+    CY14 --> X
   
     style A fill:#e1f5ff
     style B fill:#fff9c4
@@ -351,8 +364,15 @@ graph TD
     style CY3 fill:#ffeb3b
     style CY4 fill:#ffeb3b
     style CY5 fill:#ffeb3b
+    style CY6 fill:#fff9c4
     style CY7 fill:#ffeb3b
+    style CY8 fill:#ffeb3b
     style CY9 fill:#ffeb3b
+    style CY10 fill:#ffeb3b
+    style CY11 fill:#ffeb3b
+    style CY12 fill:#ffeb3b
+    style CY13 fill:#ffeb3b
+    style CY14 fill:#ffeb3b
     style Z fill:#fff9c4
     style X fill:#c8e6c9
     style W fill:#f3e5f5
@@ -436,10 +456,14 @@ For GRAPH_ANALYTICAL questions, the system uses a sophisticated multi-strategy C
 **Process Flow:**
 
 1. **Term Extraction**: Extracts key terms from the natural language question
-2. **Fuzzy Entity Matching**: Finds entities in the graph that match extracted terms using fuzzy matching (CONTAINS, toLower)
+2. **Embedding-Based Entity Matching**: 
+   - Generates embeddings for search terms
+   - Uses vector similarity search via Neo4j vector index (`entity_embedding_index`) to find entities with high semantic similarity
+   - Filters results by configurable similarity threshold (default 0.6) to ensure high-quality matches
+   - Falls back to text-based fuzzy matching (CONTAINS, toLower) if vector search fails or returns no results
 3. **Schema Retrieval**: Gets the Neo4j graph schema (node labels, relationship types, properties) via MCP or direct query
 4. **Multi-Strategy Query Generation**: Generates 5 different query strategies:
-   - **Fuzzy Search**: Find entities matching search terms
+   - **Vector-Based Entity Search**: Find entities matching search terms using vector similarity (high similarity threshold)
    - **Relationship Exploration**: Find connections between matched entities
    - **Path Finding**: Find paths connecting entities (1-3 hops)
    - **Related Entities**: Find entities related via RELATES_TO relationships
@@ -481,7 +505,9 @@ RETURN e1.name, related.name, related.type LIMIT 20
 ```
 
 **Key Features:**
-- **Fuzzy Matching**: Handles spelling variations and partial matches
+- **Embedding-Based Vector Search**: Uses semantic similarity for entity matching, providing better accuracy than text-based matching
+- **High Similarity Threshold**: Configurable threshold (default 0.6) ensures only high-quality matches are returned
+- **Intelligent Fallback**: Automatically falls back to text-based fuzzy matching if vector search fails or returns no results
 - **Iterative Refinement**: Can refine queries based on execution feedback (up to 3 iterations)
 - **Multi-Strategy Approach**: Tries multiple query patterns to maximize result coverage
 - **MCP Integration**: Uses MCP Neo4j Cypher server for query execution (with direct Neo4j fallback)
@@ -507,10 +533,12 @@ The Cypher query processing system (`mcp_neo4j_cypher.py`) provides a comprehens
 
 The system generates 5 different query strategies to maximize result coverage:
 
-1. **Fuzzy Entity Search**
-   - Finds entities matching search terms using fuzzy matching (CONTAINS, toLower)
-   - Handles spelling variations and partial matches
-   - Returns entity names and types
+1. **Vector-Based Entity Search**
+   - Generates embeddings for search terms
+   - Uses Neo4j vector index (`entity_embedding_index`) for fast semantic similarity search
+   - Filters by high similarity threshold (configurable, default 0.6) to ensure quality matches
+   - Falls back to text-based fuzzy matching (CONTAINS, toLower) if vector search unavailable
+   - Returns entity names, types, and similarity scores
 
 2. **Relationship Exploration**
    - Finds direct relationships between matched entities
@@ -537,36 +565,48 @@ The system generates 5 different query strategies to maximize result coverage:
 ```mermaid
 graph TD
     A[Natural Language Question] --> B[Extract Key Terms]
-    B --> C[Fuzzy Entity Matching]
-    C --> D[Get Graph Schema]
-    D --> E[Generate 5 Query Strategies]
-    E --> F[Execute All Queries in Parallel]
-    F --> G{Any Results?}
-    G -->|Yes| H[Combine & Deduplicate]
-    G -->|No| I[LLM-Generated Query]
-    I --> J[Execute LLM Query]
-    J --> K{Results?}
-    K -->|Yes| H
-    K -->|No| L[Format No-Results Answer]
-    H --> M[Format Comprehensive Answer]
-    M --> N[Add Explainability Block]
-    N --> O[Return Response]
-    L --> O
+    B --> C[Generate Term Embeddings]
+    C --> D[Vector Search Entities]
+    D --> E{High Similarity Matches?}
+    E -->|Yes| F[Use Vector Matches]
+    E -->|No| G[Fallback: Text-Based Matching]
+    G --> F
+    F --> H[Get Graph Schema]
+    H --> I[Generate 5 Query Strategies]
+    I --> J[Execute All Queries in Parallel]
+    J --> K{Any Results?}
+    K -->|Yes| L[Combine & Deduplicate]
+    K -->|No| M[LLM-Generated Query]
+    M --> N[Execute LLM Query]
+    N --> O{Results?}
+    O -->|Yes| L
+    O -->|No| P[Format No-Results Answer]
+    L --> Q[Format Comprehensive Answer]
+    Q --> R[Add Explainability Block]
+    R --> S[Return Response]
+    P --> S
     
     style A fill:#e1f5ff
     style C fill:#fff9c4
-    style E fill:#f3e5f5
-    style F fill:#ffeb3b
-    style M fill:#c8e6c9
-    style N fill:#c8e6c9
+    style D fill:#ffeb3b
+    style E fill:#fff9c4
+    style F fill:#c8e6c9
+    style G fill:#ffccbc
+    style I fill:#f3e5f5
+    style J fill:#ffeb3b
+    style Q fill:#c8e6c9
+    style R fill:#c8e6c9
 ```
 
 #### Example Cypher Queries Generated
 
-**Example 1: Entity Search**
+**Example 1: Vector-Based Entity Search**
 ```cypher
+# First, vector search finds entities (handled internally via db.index.vector.queryNodes)
+# Then uses matched entity names in queries:
 MATCH (e:Entity)
 WHERE toLower(e.name) CONTAINS toLower('machine learning')
+  OR e.name IN ['Machine Learning', 'ML', 'Artificial Intelligence']  # Vector-matched entities
 RETURN e.name AS entity, e.type AS type
 LIMIT 10
 ```
@@ -596,7 +636,8 @@ LIMIT 10
 When explainability is enabled (`EXPLAIN_ENABLED=true`), Cypher query responses include a detailed explainability block showing:
 
 - **Extracted Terms**: Key terms identified from the question
-- **Fuzzy Matches**: How search terms were matched to entities (e.g., "AI" → "Artificial Intelligence")
+- **Vector Matches**: How search terms were matched to entities using embedding-based vector search with similarity scores (e.g., "AI" → "Artificial Intelligence" with similarity 0.85)
+- **Fallback Matches**: If vector search was unavailable, shows text-based fuzzy matches
 - **Query Strategies**: All 5 strategies attempted with success/failure status (✓/✗) and result counts
 - **Best Query**: The most successful Cypher query used (formatted in code block)
 - **Sample Results**: First 5 results from the queries (truncated to snippet length)
@@ -854,7 +895,7 @@ MAX_CHUNKS_PER_ANSWER="7"
 QUICK_SEARCH_MAX_CHUNKS="5"
 MAX_COMMUNITY_SUMMARIES="3"
 SIMILARITY_THRESHOLD_CHUNKS="0.4"
-SIMILARITY_THRESHOLD_ENTITIES="0.6"
+SIMILARITY_THRESHOLD_ENTITIES="0.6"  # Minimum similarity for entity vector search (0.0-1.0, higher = stricter)
 BROAD_SEARCH_MAX_COMMUNITIES="20"
 
 # Caching
@@ -1105,7 +1146,7 @@ GET /redoc  # ReDoc
 - ✅ **Cross-Document Entity Merging** - Entities with same name merged across documents
 - ✅ **Advanced Text Cleaning** - Boilerplate and navigation text removal
 - ✅ **Intelligent Chunking** - Sentence-aware with overlap
-- ✅ **Batch Embedding Generation** - With TTL-based caching
+- ✅ **Batch Embedding Generation** - With TTL-based caching (for chunks, entities, and search terms)
 - ✅ **Neo4j Graph Storage** - Complete graph schema implementation
 - ✅ **Vector Indexing** - Native Neo4j vector indexes for fast search
 
@@ -1120,7 +1161,7 @@ GET /redoc  # ReDoc
 - ✅ **MMR Diversity Reranking** - Balanced relevance and diversity
 - ✅ **Community Summary Integration** - Automatic topic summaries
 - ✅ **Conversation History Support** - Context-aware query rewriting
-- ✅ **Graph Analytical Queries** - MCP Neo4j Cypher integration for complex graph queries
+- ✅ **Graph Analytical Queries** - MCP Neo4j Cypher integration for complex graph queries with embedding-based entity matching
 - ✅ **Explainability** - Inline citations and source references with full text content
 
 #### Community Detection
@@ -1250,7 +1291,7 @@ pytest test_system.py::TestUnifiedSearchPipeline -v
 - ✅ **Error Handling** - Edge cases, invalid inputs
 - ✅ **Performance** - Batch vs individual processing
 - ✅ **Question Classification** - Accuracy testing for BROAD/CHUNK/GRAPH_ANALYTICAL/OUT_OF_SCOPE classification
-- ✅ **Cypher Query Processing** - Multi-strategy query generation, fuzzy matching, and result formatting
+- ✅ **Cypher Query Processing** - Multi-strategy query generation with embedding-based vector search for entity matching, text-based fallback, and result formatting
 - ✅ **Map-Reduce Processing** - Aggregation accuracy and partial failure handling
 - ✅ **Classification Routing** - Integration tests for question classification and routing
 
@@ -1264,6 +1305,7 @@ pytest test_system.py::TestUnifiedSearchPipeline -v
 | ------------------------------- | ------------------ | ---------------------------------------- |
 | **Batch Embedding**       | 10x faster         | Batch API calls with caching             |
 | **Vector Indexes**        | 100x faster search | Native Neo4j vector indexes              |
+| **Entity Vector Search**  | Better accuracy    | Embedding-based semantic matching for entities |
 | **LLM-based NER**         | Flexible           | Configurable (Gemini, OpenAI-compatible) |
 | **Async Operations**      | Non-blocking       | Full async/await pipeline                |
 | **Intelligent Caching**   | Reduced API calls  | TTL-based embedding cache                |
@@ -1277,8 +1319,7 @@ pytest test_system.py::TestUnifiedSearchPipeline -v
 - **Search Response Time**: 1-3 seconds average (varies by question type and classification method)
 - **Embedding Generation**: Batch of 10 in ~0.5 seconds (cached)
 - **Question Classification**: < 0.5 seconds (MCP or heuristic), 1-2 seconds (direct LLM)
-- **Cypher Query Processing**: 2-5 seconds (includes term extraction, fuzzy matching, multi-strategy execution, and answer formatting)
-- **Cypher Query Processing**: 2-5 seconds (includes term extraction, fuzzy matching, multi-strategy execution, and answer formatting)
+- **Cypher Query Processing**: 2-5 seconds (includes term extraction, embedding generation, vector-based entity matching, multi-strategy execution, and answer formatting)
 
 ---
 
@@ -1424,6 +1465,7 @@ See LICENSE file for details.
 
 ## Version History
 
+- **v2.3.0** - Enhanced entity matching: Embedding-based vector search for fuzzy entity matching in Cypher queries with high similarity thresholds, automatic text-based fallback, and optimized batch embedding generation for entities during document processing.
 - **v2.2.0** - Graph analytical queries: MCP Neo4j Cypher integration with multi-strategy query generation, fuzzy entity matching, iterative refinement, and comprehensive explainability. Added GRAPH_ANALYTICAL question type for complex graph queries, aggregations, and multi-hop reasoning.
 - **v2.1.0** - Production-ready resilience patterns: centralized configuration (`config.py`), circuit breakers and automatic retries (`resilience.py`), structured logging (`logging_config.py`). All external service calls now use resilience patterns to handle transient failures gracefully without user-facing errors.
 - **v2.0.0** - Unified search pipeline with intelligent question classification, map-reduce for broad questions, MCP classifier integration, graph-aware reranking, MMR diversity, cross-document entity merging

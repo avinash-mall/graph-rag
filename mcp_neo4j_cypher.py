@@ -173,7 +173,7 @@ class MCPNeo4jCypherClient:
             WHERE labels(a) <> [] AND labels(b) <> []
             WITH DISTINCT labels(a)[0] AS fromLabel, type(r) AS relType, labels(b)[0] AS toLabel
             RETURN fromLabel, relType, toLabel
-            LIMIT 20
+            LIMIT {cfg.mcp_neo4j.schema_sample_limit}
             """
             sample_result = await run_cypher_query_async(driver, sample_query, {})
             
@@ -436,38 +436,230 @@ CRITICAL RULES:
     
     async def find_similar_entities(self, terms: List[str]) -> Dict[str, List[Dict[str, Any]]]:
         """
-        Find entities with names similar to the given terms using fuzzy matching.
-        Returns a dict mapping each term to matching entities.
+        Find entities with names similar to the given terms using embedding-based vector search.
+        
+        This method:
+        1. Generates embeddings for search terms
+        2. Uses vector similarity search via Neo4j vector index (entity_embedding_index)
+        3. Filters by high similarity threshold (from config)
+        4. Falls back to text-based fuzzy matching if vector search fails
+        
+        Returns a dict mapping each term to matching entities with similarity scores.
         """
         matches: Dict[str, List[Dict[str, Any]]] = {}
         
         try:
-            from utils import run_cypher_query_async
+            from utils import run_cypher_query_async, embedding_client
+            from config import get_config
             
-            for term in terms[:5]:  # Limit to 5 terms
-                # Try fuzzy match with CONTAINS and partial matching
-                query = """
-                MATCH (e:Entity)
-                WHERE toLower(e.name) CONTAINS toLower($term)
-                   OR toLower($term) CONTAINS toLower(e.name)
-                RETURN e.name AS name, e.type AS type, 
-                       CASE WHEN toLower(e.name) = toLower($term) THEN 1.0
-                            WHEN toLower(e.name) CONTAINS toLower($term) THEN 0.8
-                            ELSE 0.6 END AS similarity
-                ORDER BY similarity DESC
-                LIMIT 5
-                """
+            cfg = get_config()
+            similarity_threshold = cfg.search.similarity_threshold_entities
+            
+            max_terms = cfg.mcp_neo4j.entity_search_max_terms
+            for term in terms[:max_terms]:
+                # Step 1: Generate embedding for the search term
+                try:
+                    term_embedding = await embedding_client.get_embedding(term)
+                    if not term_embedding or len(term_embedding) == 0:
+                        raise ValueError("Empty embedding generated")
+                except Exception as e:
+                    self.logger.warning(f"Failed to generate embedding for term '{term}': {e}, falling back to text search")
+                    # Fallback to text-based matching
+                    matches[term] = await self._find_entities_text_match(term)
+                    continue
                 
-                results = await self._execute_direct(query.replace("$term", f"'{term}'"), self.neo4j_driver)
-                if results.success and results.data:
-                    matches[term] = [{"name": r["name"], "type": r.get("type", ""), "similarity": r.get("similarity", 0.5)} for r in results.data]
-                else:
-                    matches[term] = []
+                # Step 2: Try vector similarity search using Neo4j vector index
+                try:
+                    # Use configured top_k for vector search
+                    top_k = cfg.mcp_neo4j.entity_vector_search_top_k
+                    vector_matches = await self._find_entities_vector_search(
+                        term, term_embedding, similarity_threshold, top_k
+                    )
+                    
+                    if vector_matches:
+                        matches[term] = vector_matches
+                        self.logger.info(
+                            f"Vector search found {len(vector_matches)} matches for term '{term}' "
+                            f"(threshold: {similarity_threshold})"
+                        )
+                    else:
+                        # No high-similarity matches from vector search, try text fallback
+                        self.logger.info(
+                            f"No high-similarity vector matches for '{term}' "
+                            f"(threshold: {similarity_threshold}), trying text fallback"
+                        )
+                        matches[term] = await self._find_entities_text_match(term)
+                        
+                except Exception as e:
+                    self.logger.warning(
+                        f"Vector similarity search failed for term '{term}': {e}, "
+                        f"falling back to text search"
+                    )
+                    # Fallback to text-based matching
+                    matches[term] = await self._find_entities_text_match(term)
                     
         except Exception as e:
-            self.logger.warning(f"Fuzzy entity search failed: {e}")
+            self.logger.error(f"Fuzzy entity search failed: {e}")
+            # If everything fails, return empty matches
+            max_terms = cfg.mcp_neo4j.entity_search_max_terms
+            for term in terms[:max_terms]:
+                if term not in matches:
+                    matches[term] = []
             
         return matches
+    
+    async def _find_entities_vector_search(
+        self,
+        term: str,
+        term_embedding: List[float],
+        similarity_threshold: float,
+        top_k: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Find entities using vector similarity search via Neo4j vector index.
+        
+        Args:
+            term: Original search term (for logging)
+            term_embedding: Embedding vector for the search term
+            similarity_threshold: Minimum similarity score (0.0-1.0)
+            top_k: Maximum number of results to return (defaults to config)
+            
+        Returns:
+            List of matching entities with similarity scores
+        """
+        try:
+            from utils import run_cypher_query_async
+            
+            # Use config defaults if not provided
+            if top_k is None:
+                top_k = cfg.mcp_neo4j.entity_vector_search_top_k
+            candidate_multiplier = cfg.mcp_neo4j.entity_vector_search_candidate_multiplier
+            
+            # Use native vector search with db.index.vector.queryNodes
+            # Query the entity_embedding_index for similar entities
+            cypher = """
+            CALL db.index.vector.queryNodes('entity_embedding_index', $top_k, $query_embedding)
+            YIELD node, score
+            WHERE node.name IS NOT NULL AND node.embedding IS NOT NULL
+            RETURN node.name AS name, node.type AS type, score AS similarity
+            ORDER BY similarity DESC
+            LIMIT $limit
+            """
+            
+            params = {
+                "query_embedding": term_embedding,
+                "top_k": top_k * candidate_multiplier,  # Get more candidates for filtering
+                "limit": top_k
+            }
+            
+            results = await run_cypher_query_async(self.neo4j_driver, cypher, params)
+            
+            # Filter by similarity threshold
+            filtered_results = [
+                {
+                    "name": r["name"],
+                    "type": r.get("type", ""),
+                    "similarity": float(r.get("similarity", 0.0))
+                }
+                for r in results
+                if r.get("similarity", 0.0) >= similarity_threshold
+            ]
+            
+            return filtered_results
+            
+        except Exception as e:
+            error_str = str(e).lower()
+            # Check if error is due to vector index not existing or dimension mismatch
+            if "index" in error_str or "vector" in error_str or "dimension" in error_str:
+                self.logger.warning(
+                    f"Vector index search failed for entities: {e}. "
+                    f"This may indicate the entity_embedding_index doesn't exist or has dimension mismatch."
+                )
+            raise
+    
+    async def _find_entities_text_match(self, term: str) -> List[Dict[str, Any]]:
+        """
+        Fallback text-based fuzzy matching for entities.
+        
+        Uses CONTAINS and toLower() for partial matching when vector search is unavailable.
+        
+        Args:
+            term: Search term
+            
+        Returns:
+            List of matching entities with similarity scores
+        """
+        try:
+            from utils import run_cypher_query_async
+            
+            # Text-based fuzzy match with CONTAINS and partial matching
+            text_match_limit = cfg.mcp_neo4j.entity_text_match_limit
+            query = f"""
+            MATCH (e:Entity)
+            WHERE toLower(e.name) CONTAINS toLower($term)
+               OR toLower($term) CONTAINS toLower(e.name)
+            RETURN e.name AS name, e.type AS type, 
+                   CASE WHEN toLower(e.name) = toLower($term) THEN 1.0
+                        WHEN toLower(e.name) CONTAINS toLower($term) THEN 0.8
+                        ELSE 0.6 END AS similarity
+            ORDER BY similarity DESC
+            LIMIT {text_match_limit}
+            """
+            
+            results = await self._execute_direct(
+                query.replace("$term", f"'{term}'"), 
+                self.neo4j_driver
+            )
+            
+            if results.success and results.data:
+                return [
+                    {
+                        "name": r["name"],
+                        "type": r.get("type", ""),
+                        "similarity": float(r.get("similarity", 0.5))
+                    }
+                    for r in results.data
+                ]
+            else:
+                return []
+                
+        except Exception as e:
+            self.logger.warning(f"Text-based entity matching failed for term '{term}': {e}")
+            return []
+    
+    async def _check_entity_has_embedding(self, entity_name: str) -> bool:
+        """
+        Check if an entity has a valid embedding stored in the database.
+        
+        Args:
+            entity_name: Name of the entity to check
+            
+        Returns:
+            True if entity has a valid embedding, False otherwise
+        """
+        try:
+            from utils import run_cypher_query_async
+            
+            query = """
+            MATCH (e:Entity {name: $name})
+            RETURN e.embedding IS NOT NULL 
+               AND size(e.embedding) > 0 AS has_embedding
+            LIMIT 1
+            """
+            
+            results = await run_cypher_query_async(
+                self.neo4j_driver, 
+                query, 
+                {"name": entity_name.lower()}
+            )
+            
+            if results and len(results) > 0:
+                return results[0].get("has_embedding", False)
+            return False
+            
+        except Exception as e:
+            self.logger.warning(f"Failed to check embedding for entity '{entity_name}': {e}")
+            return False
     
     async def generate_multiple_cypher_queries(
         self, 
@@ -494,21 +686,24 @@ CRITICAL RULES:
         
         # Strategy 1: Fuzzy search on all extracted terms
         if terms:
-            term_conditions = " OR ".join([f"toLower(e.name) CONTAINS toLower('{t}')" for t in terms[:3]])
+            max_terms = cfg.mcp_neo4j.query_max_terms_for_conditions
+            limit = cfg.mcp_neo4j.query_fuzzy_search_limit
+            term_conditions = " OR ".join([f"toLower(e.name) CONTAINS toLower('{t}')" for t in terms[:max_terms]])
             queries.append({
                 "type": "fuzzy_search",
-                "description": f"Searching entities matching: {', '.join(terms[:3])}",
+                "description": f"Searching entities matching: {', '.join(terms[:max_terms])}",
                 "query": f"""
                     MATCH (e:Entity)
                     WHERE {term_conditions}
                     RETURN e.name AS entity, e.type AS type
-                    LIMIT 10
+                    LIMIT {limit}
                 """
             })
         
         # Strategy 2: Relationship exploration between matched entities
         if len(search_terms) >= 2:
             e1, e2 = search_terms[0], search_terms[1]
+            limit = cfg.mcp_neo4j.query_relationship_exploration_limit
             queries.append({
                 "type": "relationship_exploration",
                 "description": f"Finding relationships between '{e1}' and '{e2}'",
@@ -517,13 +712,14 @@ CRITICAL RULES:
                     WHERE (toLower(e1.name) CONTAINS toLower('{e1}') OR toLower(e1.name) = toLower('{e1}'))
                       AND (toLower(e2.name) CONTAINS toLower('{e2}') OR toLower(e2.name) = toLower('{e2}'))
                     RETURN e1.name AS from_entity, type(r) AS relationship, e2.name AS to_entity
-                    LIMIT 15
+                    LIMIT {limit}
                 """
             })
         
         # Strategy 3: Path finding via intermediate nodes
         if len(search_terms) >= 2:
             e1, e2 = search_terms[0], search_terms[1]
+            limit = cfg.mcp_neo4j.query_path_finding_limit
             queries.append({
                 "type": "path_finding",
                 "description": f"Finding paths connecting '{e1}' to '{e2}'",
@@ -534,13 +730,14 @@ CRITICAL RULES:
                     MATCH path = (e1)-[*1..3]-(e2)
                     RETURN [n IN nodes(path) | CASE WHEN 'Entity' IN labels(n) THEN n.name ELSE 'chunk' END] AS path_nodes,
                            length(path) AS path_length
-                    LIMIT 10
+                    LIMIT {limit}
                 """
             })
         
         # Strategy 4: Related entities via RELATES_TO for first term
         if search_terms:
             e1 = search_terms[0]
+            limit = cfg.mcp_neo4j.query_related_entities_limit
             queries.append({
                 "type": "related_entities",
                 "description": f"Finding entities related to '{e1}'",
@@ -548,13 +745,15 @@ CRITICAL RULES:
                     MATCH (e1:Entity)-[:RELATES_TO]-(related:Entity)
                     WHERE toLower(e1.name) CONTAINS toLower('{e1}')
                     RETURN e1.name AS source_entity, related.name AS related_entity, related.type AS related_type
-                    LIMIT 20
+                    LIMIT {limit}
                 """
             })
         
         # Strategy 5: Chunks containing the entities (for context)
         if search_terms:
-            term_conditions = " OR ".join([f"toLower(e.name) CONTAINS toLower('{t}')" for t in search_terms[:2]])
+            max_terms = min(2, cfg.mcp_neo4j.query_max_terms_for_conditions)
+            limit = cfg.mcp_neo4j.query_chunk_context_limit
+            term_conditions = " OR ".join([f"toLower(e.name) CONTAINS toLower('{t}')" for t in search_terms[:max_terms]])
             queries.append({
                 "type": "chunk_context",
                 "description": f"Finding document chunks mentioning these entities",
@@ -562,7 +761,7 @@ CRITICAL RULES:
                     MATCH (e:Entity)-[:MENTIONED_IN]->(c:Chunk)
                     WHERE {term_conditions}
                     RETURN e.name AS entity, c.text AS chunk_text, c.document_name AS document
-                    LIMIT 5
+                    LIMIT {limit}
                 """
             })
         
@@ -865,7 +1064,8 @@ ANSWER:"""
         # Use LLM to format results into natural language
         try:
             # Format results as JSON for the LLM
-            results_text = json.dumps(results[:15], indent=2, default=str)  # Limit to 15 results
+            format_limit = cfg.mcp_neo4j.entity_result_format_limit
+            results_text = json.dumps(results[:format_limit], indent=2, default=str)
             
             prompt = f"""Based on the following graph database query results, provide a clear and helpful natural language answer to the user's question.
 
@@ -902,7 +1102,8 @@ Answer:"""
     
     def _simple_format(self, question: str, results: List[Dict[str, Any]]) -> str:
         """Simple fallback formatting without LLM."""
-        if len(results) <= 10:
+        threshold = cfg.mcp_neo4j.entity_simple_format_threshold
+        if len(results) <= threshold:
             answer_parts = ["Here are the results:"]
             for i, result in enumerate(results, 1):
                 formatted = ", ".join([f"{k}: {v}" for k, v in result.items()])
