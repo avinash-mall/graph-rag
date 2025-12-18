@@ -174,7 +174,22 @@ class CorefConfig:
 
 @dataclass
 class EmbeddingConfig:
-    """Embedding service configuration"""
+    """
+    Embedding service configuration.
+    
+    Attributes:
+        api_url: API endpoint URL for embedding service
+        api_key: API key (optional for some providers like Docker Model Runner)
+        model_name: Model name for embeddings
+        dimension: Embedding vector dimension
+        batch_size: Number of texts to process per batch
+        timeout: Request timeout in seconds
+        provider: Embedding provider - "openai", "google", "docker" (Docker Model Runner)
+                  - "openai": OpenAI/Ollama compatible API with batch support
+                  - "google": Google Gemini embedding API
+                  - "docker": Docker Model Runner (no batch support, single requests only)
+        include_bearer_auth: Whether to include Bearer token in Authorization header
+    """
     api_url: str
     api_key: Optional[str]
     model_name: str
@@ -194,11 +209,18 @@ class EmbeddingConfig:
         dimension = int(os.getenv("EMBEDDING_DIMENSION", "768"))
         batch_size = int(os.getenv("EMBEDDING_BATCH_SIZE", "10"))
         timeout = int(os.getenv("API_TIMEOUT", "600"))
-        provider = os.getenv("LLM_PROVIDER", "openai").lower()
+        # EMBEDDING_PROVIDER takes precedence, falls back to LLM_PROVIDER for backward compatibility
+        provider = os.getenv("EMBEDDING_PROVIDER", os.getenv("LLM_PROVIDER", "openai")).lower()
         include_bearer_auth = os.getenv("EMBEDDING_INCLUDE_BEARER_AUTH", "true").lower() == "true"
         
         if not api_url:
             raise ValueError("EMBEDDING_API_URL is required but not set in environment")
+        
+        # Validate provider
+        valid_providers = ["openai", "google", "docker"]
+        if provider not in valid_providers:
+            logger.warning(f"Unknown EMBEDDING_PROVIDER '{provider}', defaulting to 'openai'. Valid: {valid_providers}")
+            provider = "openai"
         
         return cls(
             api_url=api_url,

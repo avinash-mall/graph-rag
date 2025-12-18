@@ -790,10 +790,13 @@ class BatchEmbeddingClient:
                     
                     async def _fetch_batch():
                         # Choose embedding method based on provider
-                        if self.provider in {"openai", "ollama"}:
+                        if self.provider in {"openai", "ollama", "docker"}:
                             return await self._fetch_batch_embeddings_openai(batch_texts)
-                        else:  # gemini
+                        elif self.provider == "google":
                             return await self._fetch_batch_embeddings_gemini(batch_texts)
+                        else:
+                            # Default to OpenAI-compatible API
+                            return await self._fetch_batch_embeddings_openai(batch_texts)
                     
                     # Use resilience for API call
                     batch_embeddings = await call_with_resilience(
@@ -829,7 +832,24 @@ class BatchEmbeddingClient:
     
     async def _fetch_batch_embeddings_openai(self, texts: List[str]) -> List[List[float]]:
         """Fetch embeddings for a batch of texts using OpenAI/Ollama compatible API"""
-        # Prepare payload - send as array for batch, string for single
+        # Prepare headers - only include Authorization if API key is provided
+        headers = {
+            "Content-Type": "application/json"
+        }
+        if self.embedding_api_key and self.embedding_api_key.strip():
+            headers["Authorization"] = f"Bearer {self.embedding_api_key}"
+        
+        # Ensure OpenAI/Ollama URL ends with /embeddings
+        api_url = self.embedding_api_url.rstrip('/')
+        if not api_url.endswith('/embeddings'):
+            api_url = f"{api_url}/embeddings"
+        
+        # Docker Model Runner doesn't support batch (array) inputs
+        # Send individual requests for each text when provider is "docker"
+        if self.provider == "docker":
+            return await self._fetch_embeddings_sequential(texts, api_url, headers)
+        
+        # For APIs that support batch inputs (OpenAI, etc.)
         if len(texts) == 1:
             # Single text - some APIs prefer string format
             payload = {
@@ -842,18 +862,6 @@ class BatchEmbeddingClient:
                 "model": self.model_name,
                 "input": texts
             }
-        
-        # Prepare headers - only include Authorization if API key is provided
-        headers = {
-            "Content-Type": "application/json"
-        }
-        if self.embedding_api_key and self.embedding_api_key.strip():
-            headers["Authorization"] = f"Bearer {self.embedding_api_key}"
-        
-        # Ensure OpenAI/Ollama URL ends with /embeddings
-        api_url = self.embedding_api_url.rstrip('/')
-        if not api_url.endswith('/embeddings'):
-            api_url = f"{api_url}/embeddings"
         
         async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
             response = await client.post(
@@ -902,6 +910,35 @@ class BatchEmbeddingClient:
                 )
             
             return embeddings
+    
+    async def _fetch_embeddings_sequential(self, texts: List[str], api_url: str, headers: Dict[str, str]) -> List[List[float]]:
+        """
+        Fetch embeddings one at a time for APIs that don't support batch inputs.
+        Uses a single HTTP client and processes requests sequentially to avoid overwhelming the server.
+        """
+        embeddings = []
+        
+        async with httpx.AsyncClient(timeout=self.timeout, verify=False) as client:
+            for text in texts:
+                payload = {
+                    "model": self.model_name,
+                    "input": text
+                }
+                response = await client.post(api_url, json=payload, headers=headers)
+                response.raise_for_status()
+                data = response.json()
+                
+                # Handle response format
+                if "data" in data and len(data["data"]) > 0:
+                    embedding = data["data"][0].get("embedding", [])
+                elif "embedding" in data:
+                    embedding = data["embedding"]
+                else:
+                    raise ValueError(f"Unexpected response format: {list(data.keys())}")
+                
+                embeddings.append(embedding)
+        
+        return embeddings
     
     async def _fetch_batch_embeddings_gemini(self, texts: List[str]) -> List[List[float]]:
         """Fetch embeddings for a batch of texts using Gemini API"""
